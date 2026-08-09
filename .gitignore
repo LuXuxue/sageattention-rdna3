@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Build
+build/
+dist/
+*.obj
+*.o
+
+# ROCm cpp_extension hipify 中间产物 (由 attn_gfx11.cu 自动生成)
+csrc/*.hip
+csrc/*_hip.cuh
+sageattention/*.pyd
+
+# Reasonix host state
+.reasonix/
