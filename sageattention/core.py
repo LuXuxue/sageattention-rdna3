@@ -84,32 +84,66 @@ def sageattn(
 
     ops = _get_native_ops()
 
+    # native 写回为 16B 向量写: o_off = b*stride_b + n*stride_n + h*stride_h + d, d 恒为 8 倍数,
+    # 故 q 的 stride_b/n/h 均需为 8 倍数 (o=empty_like(q) 继承 stride)。
+    # contiguous 输入恒满足; 非 contiguous 的 q (permute/slice) 会导致未对齐 16B 写 (UB)。
+    # 注意: 该断言只约束 q (决定 o 的布局), k/v 仅需 head_dim stride==1 (上面已断言)。
+    assert q.stride(0) % 8 == 0 and q.stride(1) % 8 == 0 and q.stride(2) % 8 == 0, (
+        "native backend requires q strides that are multiples of 8 halfs "
+        "(16B aligned write-back). "
+        f"Got strides={q.stride()}. Use contiguous tensors."
+    )
+
     layout_code = 1 if tensor_layout == "HND" else 0
 
     # 实验参数: bm_sel 控制 direct kernel 的 BM (0=默认, 1=32, 2=128)
     bm_sel = int(kwargs.get("bm_sel", 0) or os.getenv("SAGEATTN_BM_SEL", "0"))
 
     o = torch.empty_like(q)
+    # 注: 写回为 16B 向量写, 要求 o 的 head_dim 维连续 (stride 1) 且 o_off 8-half 对齐;
+    #     empty_like(q) 恒 contiguous 满足 (core 断言 q.stride(-1)==1)
 
     if tensor_layout == "HND":
         kv_len_actual = k.size(2)
+        q_len = q.size(2)
     else:
         kv_len_actual = k.size(1)
+        q_len = q.size(1)
 
+    # direct/int8 分发: 本质是"省 quant+mean 辅助(固定 0.4-0.6ms)" vs "i8 WMMA 2x 吞吐(与计算量成正比)"的权衡
+    # 计算量小(causal/cross 短 q)时 direct 胜; 计算量大(self 长序列)时 int8 胜。阈值扫描见 bench_threshold*.py:
+    #   D=64 self 非 causal: kv=3072 direct 优1%, 3456 int8 优1.2%       -> 3072
+    #   D=64 causal:          kv=4096/6144 direct 优8%/2.7%, 8192 int8 优5.5% -> 6144
+    #   D=64 cross (q<kv):    q=3072/kv=4096 仍 direct 优3%              -> 6144
+    #   D=128 self/causal:    kv=2048 direct 优5%, 2560 int8 优5%        -> 2048
+    #   D=128 cross q<<kv:    q=512/1024 vs kv=4096 direct 优25%/8%, q=2048(=kv/2) int8 优5% -> q<kv/2 且 kv<=4096
     if headdim == 64:
-        use_direct = (kv_len_actual <= 1024)
+        thr_d64 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64", "3072") or 3072)
+        if is_causal:
+            use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64_CAUSAL", "6144") or 6144))
+        elif q_len < kv_len_actual:
+            # cross-attn: q 短时 direct 省辅助收益大 (q=3072/kv=4096 仍优 3%)
+            use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64_CROSS", "6144") or 6144))
+        else:
+            use_direct = (kv_len_actual <= thr_d64)
     else:
-        use_direct = (kv_len_actual <= 512)
+        thr_d128 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128", "2048") or 2048)
+        if q_len * 2 < kv_len_actual:
+            # cross 且 q 明显短: direct 优 (q=512/1024 vs kv=4096 优 8-25%; q=2048=kv/2 时 int8 优)
+            use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128_CROSS", "4096") or 4096))
+        else:
+            use_direct = (kv_len_actual <= thr_d128)
 
     if use_direct:
-        if input_dtype == torch.bfloat16:
-            v_attn = v.to(torch.float16)
-        else:
-            v_attn = v
+        # V 直接交给 v_transpose: bf16 输入由 kernel 内部转 fp16 (省 v.to(fp16) 独立 kernel)
+        v_attn = v
         # V 全局转置 (V_T [B,H,D,N]) + out = P @ V: 需配套 -DSAGEATTN_VT_GLOBAL=1 编译 (setup.py 默认)
+        # 注意: V_T 的 n 维 padding 到 64 的倍数 (防 attn kernel 的 v_frag_t 32B 直读越界,
+        # kv_len 非 64 倍数时最后 kv-tile 越界读未初始化内存 -> NaN; padding 区由 v_transpose 填 0)
         kv_heads_n = k.size(1) if tensor_layout == "HND" else k.size(2)
+        padded_n = ((kv_len_actual + 63) // 64) * 64
         v_t = torch.empty(
-            q.size(0), kv_heads_n, headdim, kv_len_actual,
+            q.size(0), kv_heads_n, headdim, padded_n,
             device=q.device, dtype=torch.float16
         )
         ops.v_transpose(v_attn, v_t, layout_code)
@@ -126,17 +160,16 @@ def sageattn(
             )
     else:
         # int8 路径, V/OUT dtype 分离 (方案B):
-        #   V 预先转 fp16 (v.to 是带宽受限的 elementwise kernel, 远快于 kernel 内逐元素转换,
-        #   实测 kernel 内 bf16->fp16 标量转换开销 1.6-5.5%)
+        #   V 转 fp16 并入 v_transpose (读 bf16 直接写 fp16 V_T, 一次 kernel 完成转置+转换,
+        #   省掉 v.to(fp16) 独立 kernel 的一次额外全局读写往返)
         #   输出由 kernel 直接写 bf16 (o 复用, 省 o.to(bf16) 转换 kernel, 且单次舍入精度更好)
-        if input_dtype == torch.bfloat16:
-            v_for_attn = v.to(torch.float16)
-        else:
-            v_for_attn = v
+        v_for_attn = v
         # V 全局转置 (V_T [B,H,D,N]) + 无 LDS PV: 需配套 -DSAGEATTN_VT_GLOBAL=1 编译 (setup.py 默认)
+        # n 维 padding 到 64 倍数, 防 v_frag_t 32B 直读越界 (见 direct 路径注释)
         kv_heads_n = k.size(1) if tensor_layout == "HND" else k.size(2)
+        padded_n = ((kv_len_actual + 63) // 64) * 64
         v_t = torch.empty(
-            q.size(0), kv_heads_n, headdim, kv_len_actual,
+            q.size(0), kv_heads_n, headdim, padded_n,
             device=q.device, dtype=torch.float16
         )
         ops.v_transpose(v_for_attn, v_t, layout_code)
