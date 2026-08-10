@@ -201,6 +201,10 @@ if not SKIP_BUILD:
             "-amdgpu-vgpr-index-mode=1",
             f"--offload-arch={target_arch}",
             f"--rocm-path={rocm_home}",
+            # V 全局转置 PV 方案 (out = P @ V, V_T [B,H,D,N] 行读 B operand):
+            # 消除 v_frag 的 128 次 u16 LDS 列读, 大幅提升 PV 效率
+            # (配合 core.py 的 V 转置; 若需旧路径, 改为 -DSAGEATTN_VT_GLOBAL=0 并关 core 转置)
+            "-DSAGEATTN_VT_GLOBAL=1",
         ] + LIMITED_API_FLAGS
 
         rocm_device_lib_path = os.path.join(

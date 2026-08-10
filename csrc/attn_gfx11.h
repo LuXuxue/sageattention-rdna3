@@ -46,3 +46,6 @@ std::vector<Tensor> quant_qk_int8_gfx11(
     double sm_scale);
 
 Tensor mean_seq_gfx11(Tensor input, int64_t tensor_layout);
+
+// V [B,N,H,D] -> V_T [B,H,D,N] (contiguous), 供无 LDS PV 模式
+Tensor v_transpose_gfx11(Tensor value, Tensor value_t, int64_t tensor_layout);

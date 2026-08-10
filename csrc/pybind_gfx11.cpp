@@ -34,6 +34,7 @@ STABLE_TORCH_LIBRARY(sageattention, m) {
             "float sm_scale"
           ") -> Tensor[]");
     m.def("mean_seq(Tensor input, int tensor_layout) -> Tensor");
+    m.def("v_transpose(Tensor value, Tensor(a!) value_t, int tensor_layout) -> Tensor");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(sageattention, CUDA, m) {
@@ -42,4 +43,5 @@ STABLE_TORCH_LIBRARY_IMPL(sageattention, CUDA, m) {
     m.impl("bf16_attn_t", TORCH_BOX(bf16_attn_gfx11_t));
     m.impl("quant_qk_int8", TORCH_BOX(quant_qk_int8_gfx11));
     m.impl("mean_seq", TORCH_BOX(mean_seq_gfx11));
+    m.impl("v_transpose", TORCH_BOX(v_transpose_gfx11));
 }

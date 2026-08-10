@@ -33,6 +33,13 @@ constexpr int kNHD = 0;
 constexpr int kHND = 1;
 constexpr float kLog2e = 1.4426950408889634f;
 
+// 实验: V 全局转置存储 (V_T [B,H,D,N]) + PV 改 out = P @ V (B operand 行读)
+// 注意: 本宏只应在 host 代码 (dispatch) 使用 #if; 模板 __device__ 函数体内
+//       用 #if 会触发 hipcc 解析 bug (wpe1 undeclared), 故 PV 段为无条件代码
+#ifndef SAGEATTN_VT_GLOBAL
+#define SAGEATTN_VT_GLOBAL 0
+#endif
+
 constexpr int RM = 16;
 constexpr int BK = 16;
 
@@ -254,6 +261,37 @@ __global__ void quant_qk_int8_hnd_kernel(
     }
 }
 
+// V [B, N, H, D] (NHD) / [B, H, N, D] (HND) -> V_T [B, H, D, N] (contiguous, n 连续)
+__global__ void v_transpose_kernel(
+    const __half* __restrict__ v,
+    __half* __restrict__ v_t,
+    const int64_t batch_size,
+    const int64_t seq_len,
+    const int64_t num_heads,
+    const int64_t head_dim,
+    const int64_t v_stride_b,
+    const int64_t v_stride_n,
+    const int64_t v_stride_h,
+    const int tensor_layout) {
+    const int64_t total8 = batch_size * num_heads * seq_len * (head_dim / 8);
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < total8; i += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+        const int64_t d8 = i % (head_dim / 8);
+        const int64_t n = (i / (head_dim / 8)) % seq_len;
+        const int64_t h = (i / (seq_len * head_dim / 8)) % num_heads;
+        const int64_t b = i / (seq_len * head_dim / 8 * num_heads);
+        const int64_t d0 = d8 * 8;
+        const int64_t v_off = (tensor_layout == kHND) ?
+            (b * v_stride_b + h * v_stride_h + n * v_stride_n + d0) :
+            (b * v_stride_b + n * v_stride_n + h * v_stride_h + d0);
+        const int64_t vt_off = ((b * num_heads + h) * head_dim + d0) * seq_len + n;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            v_t[vt_off + j * seq_len] = v[v_off + j];
+        }
+    }
+}
+
 template <int HeadDim, bool IsCausal, int BLOCK_M, int BLOCK_N, typename V_DTYPE = __half,
           typename OUT_DTYPE = V_DTYPE>
 __device__ __forceinline__ void attn_kernel_impl_t(
@@ -367,6 +405,7 @@ __device__ __forceinline__ void attn_kernel_impl_t(
             *reinterpret_cast<uint4*>(&k_tile[n * KStride + d]) = make_uint4(0, 0, 0, 0);
         }
     }
+    if (!SAGEATTN_VT_GLOBAL) {
     for (int i = tid; i < VVecsTotal; i += THREADS) {
         const int n = i / VVecsPerRow;
         const int d = (i - n * VVecsPerRow) * 8;
@@ -389,6 +428,7 @@ __device__ __forceinline__ void attn_kernel_impl_t(
         } else {
             *reinterpret_cast<uint4*>(reinterpret_cast<char*>(v_tile) + (n * VStride + d) * 2) = make_uint4(0, 0, 0, 0);
         }
+    }
     }
     __syncthreads();
 
@@ -417,6 +457,7 @@ __device__ __forceinline__ void attn_kernel_impl_t(
                     }
                 }
             }
+    if (!SAGEATTN_VT_GLOBAL) {
 #pragma unroll
             for (int i = 0; i < VPrefetchPerThread; ++i) {
                 const int vec = tid + i * THREADS;
@@ -434,6 +475,7 @@ __device__ __forceinline__ void attn_kernel_impl_t(
                     }
                 }
             }
+    }
         }
 
         float score_cache[ColTiles][8];
@@ -502,7 +544,28 @@ __device__ __forceinline__ void attn_kernel_impl_t(
         }
         row_l += partial_sm + permlanex16(partial_sm);
 
-        // ---- P fragment 寄存器组装 + 转置 PV (out^T = V^T @ P^T) ----
+        // ---- P fragment 寄存器组装 + PV ----
+        // SAGEATTN_VT_GLOBAL=1: V 已转置为 V_T [B,H,D,N], 用 out = P @ V (B operand 行读 b128)
+        // SAGEATTN_VT_GLOBAL=0: 原转置 PV (out^T = V^T @ P^T, LDS v_frag 列读)
+        // 注意: 用运行时 if (编译器 DCE), 不能用 #if/if constexpr (模板体内会触发 hipcc 解析 bug)
+        if (SAGEATTN_VT_GLOBAL) {
+        // out^T = V^T @ P^T: A = V^T (V_T 行 L&15 的 16 连续 n = 行读 b128), B = P^T (p_frag)
+        // C = out^T: lane L 持 out^T[2e+hw][L&15] = out[L&15][2e+hw] (转置解释, 匹配写回)
+#pragma unroll
+        for (int ct = 0; ct < ColTiles; ++ct) {
+            float p_vals[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) p_vals[e] = score_cache[ct][e];
+            const v16h p_frag = assemble_p_frag(p_vals, hw);
+#pragma unroll
+            for (int dt = 0; dt < DTiles; ++dt) {
+                const int64_t vt_off =
+                    ((b * num_kv_heads + hkv) * HeadDim + (dt * BK + m_row)) * kv_len + (kb_base + ct * BK);
+                const v16h v_frag_t = *reinterpret_cast<const v16h*>(v + vt_off);
+                out_acc[dt] = sageattn_gfx11::wmma_f32_f16(v_frag_t, p_frag, out_acc[dt]);
+            }
+        }
+        } else {
 #pragma unroll
         for (int ct = 0; ct < ColTiles; ++ct) {
             float p_vals[8];
@@ -517,6 +580,7 @@ __device__ __forceinline__ void attn_kernel_impl_t(
                 out_acc[dt] = sageattn_gfx11::wmma_f32_f16(v_frag, p_frag, out_acc[dt]);
             }
         }
+        }
 
         if (has_next) {
             // 写前 barrier: 确保所有 warp 完成当前 tile 的 QK/PV 读,
@@ -530,6 +594,7 @@ __device__ __forceinline__ void attn_kernel_impl_t(
                     *reinterpret_cast<uint4*>(&k_tile[n * KStride + d]) = k_prefetch[i];
                 }
             }
+    if (!SAGEATTN_VT_GLOBAL) {
             for (int i = 0; i < VPrefetchPerThread; ++i) {
                 const int vec = tid + i * THREADS;
                 if (vec < VVecsTotal) {
@@ -547,6 +612,7 @@ __device__ __forceinline__ void attn_kernel_impl_t(
                     }
                 }
             }
+    }
             __syncthreads();
         }
     }
@@ -623,6 +689,50 @@ template <int HeadDim, bool IsCausal, int BLOCK_M, int BLOCK_N, typename V_DTYPE
 __global__ __launch_bounds__(BLOCK_M / 16 * 32, 2)
 __attribute__((amdgpu_waves_per_eu(2, 2)))
 void attn_kernel_wpe2_t(
+    const int8_t* __restrict__ q,
+    const int8_t* __restrict__ k,
+    const V_DTYPE* __restrict__ v,
+    void* __restrict__ output,
+    const float* __restrict__ q_scale,
+    const float* __restrict__ k_scale,
+    const int64_t batch_size,
+    const int64_t qo_len,
+    const int64_t kv_len,
+    const int64_t num_qo_heads,
+    const int64_t num_kv_heads,
+    const int64_t q_stride_b,
+    const int64_t q_stride_n,
+    const int64_t q_stride_h,
+    const int64_t k_stride_b,
+    const int64_t k_stride_n,
+    const int64_t k_stride_h,
+    const int64_t v_stride_b,
+    const int64_t v_stride_n,
+    const int64_t v_stride_h,
+    const int64_t o_stride_b,
+    const int64_t o_stride_n,
+    const int64_t o_stride_h,
+    const int64_t qs_stride_b,
+    const int64_t qs_stride_h,
+    const int64_t ks_stride_b,
+    const int64_t ks_stride_h,
+    const int tensor_layout) {
+    attn_kernel_impl_t<HeadDim, IsCausal, BLOCK_M, BLOCK_N, V_DTYPE, OUT_DTYPE>(
+        q, k, v, output, q_scale, k_scale,
+        batch_size, qo_len, kv_len, num_qo_heads, num_kv_heads,
+        q_stride_b, q_stride_n, q_stride_h,
+        k_stride_b, k_stride_n, k_stride_h,
+        v_stride_b, v_stride_n, v_stride_h,
+        o_stride_b, o_stride_n, o_stride_h,
+        qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h,
+        tensor_layout);
+}
+
+// 转置布局 kernel 的 launch wrapper (wpe4: 高 occupancy 实验)
+template <int HeadDim, bool IsCausal, int BLOCK_M, int BLOCK_N, typename V_DTYPE, typename OUT_DTYPE = V_DTYPE>
+__global__ __launch_bounds__(BLOCK_M / 16 * 32, 2)
+__attribute__((amdgpu_waves_per_eu(4, 4)))
+void attn_kernel_wpe4_t(
     const int8_t* __restrict__ q,
     const int8_t* __restrict__ k,
     const V_DTYPE* __restrict__ v,
@@ -907,7 +1017,25 @@ __device__ __forceinline__ void direct_attn_kernel_impl_t(
         }
         row_l += partial_sm + permlanex16(partial_sm);
 
-        // ---- P fragment 寄存器组装 + 转置 PV (out^T = V^T @ P^T) ----
+        // ---- P fragment 寄存器组装 + PV ----
+        // SAGEATTN_VT_GLOBAL=1: V 已转置为 V_T, 用 out = P @ V (B operand 行读 b128)
+        if (SAGEATTN_VT_GLOBAL) {
+        // out^T = V^T @ P^T: A = V^T (V_T 行读), B = P^T (p_frag), C = out^T (匹配写回)
+#pragma unroll
+        for (int ct = 0; ct < ColTiles; ++ct) {
+            float p_vals[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) p_vals[e] = score_cache[ct][e];
+            const v16h p_frag = assemble_p_frag(p_vals, hw);
+#pragma unroll
+            for (int dt = 0; dt < DTiles; ++dt) {
+                const int64_t vt_off =
+                    ((b * num_kv_heads + hkv) * HeadDim + (dt * BK + m_row)) * kv_len + (kb_base + ct * BK);
+                const v16h v_frag_t = *reinterpret_cast<const v16h*>(v + vt_off);
+                out_acc[dt] = sageattn_gfx11::wmma_f32_f16(v_frag_t, p_frag, out_acc[dt]);
+            }
+        }
+        } else {
 #pragma unroll
         for (int ct = 0; ct < ColTiles; ++ct) {
             float p_vals[8];
@@ -921,6 +1049,7 @@ __device__ __forceinline__ void direct_attn_kernel_impl_t(
                 const v16h v_frag = sageattn_gfx11::load_fp16_col_frag(v_base, d_col, VStride * 2);
                 out_acc[dt] = sageattn_gfx11::wmma_f32_f16(v_frag, p_frag, out_acc[dt]);
             }
+        }
         }
 
         if (has_next) {
@@ -1020,6 +1149,28 @@ void bf16_attn_kernel_wpe2_t(
 }
 
 }  // namespace
+
+// V [B,N,H,D] -> V_T [B,H,D,N] (contiguous)
+Tensor v_transpose_gfx11(Tensor value, Tensor value_t, int64_t tensor_layout) {
+    const int64_t batch = value.size(0);
+    const int64_t heads = (tensor_layout == kHND) ? value.size(1) : value.size(2);
+    const int64_t seq_len = (tensor_layout == kHND) ? value.size(2) : value.size(1);
+    const int64_t head_dim = value.size(3);
+    const int64_t v_stride_b = value.stride(0);
+    const int64_t v_stride_n = (tensor_layout == kHND) ? value.stride(2) : value.stride(1);
+    const int64_t v_stride_h = (tensor_layout == kHND) ? value.stride(1) : value.stride(2);
+    const hipStream_t stream = current_hip_stream(value);
+    const int64_t total8 = batch * heads * seq_len * (head_dim / 8);
+    dim3 block(256);
+    dim3 grid(static_cast<unsigned>((total8 + block.x - 1) / block.x));
+    v_transpose_kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<const __half*>(value.data_ptr()),
+        reinterpret_cast<__half*>(value_t.data_ptr()),
+        batch, seq_len, heads, head_dim,
+        v_stride_b, v_stride_n, v_stride_h,
+        static_cast<int>(tensor_layout));
+    return value_t;
+}
 
 Tensor mean_seq_gfx11(Tensor input, int64_t tensor_layout) {
     const int64_t batch = input.size(0);
@@ -1179,11 +1330,15 @@ Tensor qk_int8_sv_bf16_attn_gfx11_t(
     const int64_t ks_stride_b = k_scale.stride(0);
     const int64_t ks_stride_h = k_scale.stride(1);
 
-    #define LAUNCH_ATTN_T(HD, CAUSAL, BM, BN, VTYPE, OTYPE) \
+    // 实验: SAGEATTN_INT8_WPE 选择 launch wrapper (1=wpe1 默认, 2=wpe2, 4=wpe4)
+    const int wpe_sel = getenv("SAGEATTN_INT8_WPE") ? atoi(getenv("SAGEATTN_INT8_WPE")) : 1;
+
+    #define LAUNCH_ATTN_T(HD, CAUSAL, BM, BN, VTYPE, OTYPE, WPE) \
         do { \
             dim3 block(BM / 16 * 32); \
             dim3 grid((qo_len + BM - 1) / BM, q_heads, batch); \
-            attn_kernel_wpe1_t<HD, CAUSAL, BM, BN, VTYPE, OTYPE><<<grid, block, 0, stream>>>( \
+            if (WPE == 2) { \
+                attn_kernel_wpe2_t<HD, CAUSAL, BM, BN, VTYPE, OTYPE><<<grid, block, 0, stream>>>( \
                 reinterpret_cast<const int8_t*>(query.data_ptr()), \
                 reinterpret_cast<const int8_t*>(key.data_ptr()), \
                 reinterpret_cast<const VTYPE*>(value.data_ptr()), \
@@ -1197,6 +1352,37 @@ Tensor qk_int8_sv_bf16_attn_gfx11_t(
                 o_stride_b, o_stride_n, o_stride_h, \
                 qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
                 static_cast<int>(tensor_layout)); \
+            } else if (WPE == 4) { \
+                attn_kernel_wpe4_t<HD, CAUSAL, BM, BN, VTYPE, OTYPE><<<grid, block, 0, stream>>>( \
+                reinterpret_cast<const int8_t*>(query.data_ptr()), \
+                reinterpret_cast<const int8_t*>(key.data_ptr()), \
+                reinterpret_cast<const VTYPE*>(value.data_ptr()), \
+                output.data_ptr(), \
+                reinterpret_cast<const float*>(q_scale.data_ptr()), \
+                reinterpret_cast<const float*>(k_scale.data_ptr()), \
+                batch, qo_len, kv_len, q_heads, kv_heads, \
+                q_stride_b, q_stride_n, q_stride_h, \
+                k_stride_b, k_stride_n, k_stride_h, \
+                v_stride_b, v_stride_n, v_stride_h, \
+                o_stride_b, o_stride_n, o_stride_h, \
+                qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
+                static_cast<int>(tensor_layout)); \
+            } else { \
+                attn_kernel_wpe1_t<HD, CAUSAL, BM, BN, VTYPE, OTYPE><<<grid, block, 0, stream>>>( \
+                reinterpret_cast<const int8_t*>(query.data_ptr()), \
+                reinterpret_cast<const int8_t*>(key.data_ptr()), \
+                reinterpret_cast<const VTYPE*>(value.data_ptr()), \
+                output.data_ptr(), \
+                reinterpret_cast<const float*>(q_scale.data_ptr()), \
+                reinterpret_cast<const float*>(k_scale.data_ptr()), \
+                batch, qo_len, kv_len, q_heads, kv_heads, \
+                q_stride_b, q_stride_n, q_stride_h, \
+                k_stride_b, k_stride_n, k_stride_h, \
+                v_stride_b, v_stride_n, v_stride_h, \
+                o_stride_b, o_stride_n, o_stride_h, \
+                qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
+                static_cast<int>(tensor_layout)); \
+            } \
         } while(0)
 
     #define LAUNCH_ATTN_WPE2_T(HD, CAUSAL, BM, BN, VTYPE, OTYPE) \
@@ -1231,18 +1417,19 @@ Tensor qk_int8_sv_bf16_attn_gfx11_t(
             if (head_dim == 64) { \
                 const bool is_self_attn = (qo_len == kv_len); \
                 if (is_self_attn) { \
-                    if (is_causal) { LAUNCH_ATTN_T(64, true, 128, 32, VT, OT); } \
-                    else { LAUNCH_ATTN_T(64, false, 128, 32, VT, OT); } \
+                    if (is_causal) { LAUNCH_ATTN_T(64, true, 128, 32, VT, OT, wpe_sel); } \
+                    else { LAUNCH_ATTN_T(64, false, 128, 32, VT, OT, wpe_sel); } \
                 } else if (kv_len <= 77) { \
-                    if (is_causal) { LAUNCH_ATTN_T(64, true, 64, 16, VT, OT); } \
-                    else { LAUNCH_ATTN_T(64, false, 64, 16, VT, OT); } \
+                    if (is_causal) { LAUNCH_ATTN_T(64, true, 64, 16, VT, OT, wpe_sel); } \
+                    else { LAUNCH_ATTN_T(64, false, 64, 16, VT, OT, wpe_sel); } \
                 } else { \
-                    if (is_causal) { LAUNCH_ATTN_T(64, true, 64, 32, VT, OT); } \
-                    else { LAUNCH_ATTN_T(64, false, 64, 32, VT, OT); } \
+                    if (is_causal) { LAUNCH_ATTN_T(64, true, 64, 32, VT, OT, wpe_sel); } \
+                    else { LAUNCH_ATTN_T(64, false, 64, 32, VT, OT, wpe_sel); } \
                 } \
             } else { \
-                if (is_causal) { LAUNCH_ATTN_WPE2_T(128, true, 64, 32, VT, OT); } \
-                else { LAUNCH_ATTN_WPE2_T(128, false, 64, 32, VT, OT); } \
+                const int wpe128 = (wpe_sel == 1) ? 2 : wpe_sel; \
+                if (is_causal) { LAUNCH_ATTN_T(128, true, 64, 32, VT, OT, wpe128); } \
+                else { LAUNCH_ATTN_T(128, false, 64, 32, VT, OT, wpe128); } \
             } \
         } while(0)
 

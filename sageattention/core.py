@@ -103,13 +103,25 @@ def sageattn(
 
     if use_direct:
         if input_dtype == torch.bfloat16:
+            v_attn = v.to(torch.float16)
+        else:
+            v_attn = v
+        # V 全局转置 (V_T [B,H,D,N]) + out = P @ V: 需配套 -DSAGEATTN_VT_GLOBAL=1 编译 (setup.py 默认)
+        kv_heads_n = k.size(1) if tensor_layout == "HND" else k.size(2)
+        v_t = torch.empty(
+            q.size(0), kv_heads_n, headdim, kv_len_actual,
+            device=q.device, dtype=torch.float16
+        )
+        ops.v_transpose(v_attn, v_t, layout_code)
+        v_attn = v_t
+        if input_dtype == torch.bfloat16:
             ops.bf16_attn_t(
-                q, k, v, o,
+                q, k, v_attn, o,
                 layout_code, int(is_causal), sm_scale, bm_sel
             )
         else:
             ops.fp16_attn_t(
-                q, k, v, o,
+                q, k, v_attn, o,
                 layout_code, int(is_causal), sm_scale, bm_sel
             )
     else:
@@ -121,6 +133,14 @@ def sageattn(
             v_for_attn = v.to(torch.float16)
         else:
             v_for_attn = v
+        # V 全局转置 (V_T [B,H,D,N]) + 无 LDS PV: 需配套 -DSAGEATTN_VT_GLOBAL=1 编译 (setup.py 默认)
+        kv_heads_n = k.size(1) if tensor_layout == "HND" else k.size(2)
+        v_t = torch.empty(
+            q.size(0), kv_heads_n, headdim, kv_len_actual,
+            device=q.device, dtype=torch.float16
+        )
+        ops.v_transpose(v_for_attn, v_t, layout_code)
+        v_for_attn = v_t
         o_int8 = o
 
         smooth_k = kwargs.get("smooth_k", True)
