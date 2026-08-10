@@ -111,10 +111,20 @@ set SAGEATTN_BACKEND=native   # HIP native WMMA kernel
 ```
 
 >**说明：**
->Native backend 已重构为转置布局 kernel（permlanex16 归约 + 寄存器 P fragment），
->在全部 24 个 benchmark 用例上与 Triton 匹配（同进程交错轮转测量 ≤1.15x）。
->默认仍采用 triton 以获得与 FlashAttn 生态的最佳兼容性；
->native 可用于无 Triton 依赖的独立部署，性能与 triton 相当。
+>当前native性能：int8 长序列 self-attn 追平（n/t 1.01-1.12），
+>direct 短序列 **native 快 17-36%**。默认仍采用 triton 以获得最佳兼容性；
+>native 可用于无 Triton 依赖的独立部署。
+
+### 环境变量
+
+| 变量 | 作用 | 默认 |
+|------|------|------|
+| `SAGEATTN_BACKEND` | 后端选择（native/triton） | triton |
+| `SAGEATTN_INT8_32` | int8 self 用每 warp 32 行 kernel（0 关闭回退 8 warps） | 1（启用） |
+| `SAGEATTN_INT8_WPE` | int8 实验：launch wrapper waves_per_eu（1/2/4） | 1 |
+| `SAGEATTN_FP16_BM` / `SAGEATTN_FP16_BN` | fp16 direct 实验配置覆盖 | 0 / 0 |
+
+> `SAGEATTN_VT_GLOBAL` 已由 `setup.py` 编译宏固定为 1（V_T 方案默认启用），无需设置。
 
 ### Kernel 模板参数
 
@@ -149,21 +159,16 @@ if head_dim == 64:
 if head_dim == 128:
     kv_len <= 512  -> fp16/bf16 直接运算
     kv_len >  512  -> int8 量化运算
-```
 
-C++ 层的模板配置分发（native 后端采用 Triton 风格**转置布局** kernel：
-`qk^T = k @ q^T` + `v_permlanex16_b32` 归约 + 寄存器 P fragment，
-消除了 `ds_bpermute` butterfly 归约和 P LDS 中转）：
-
-```
 fp16/bf16 直接路径 (转置 kernel, wpe2):
-    D=64,  kv<=128           -> (BM=64, BN=16)
+    D=64,  kv<=128           -> (BM=64, BN=32)
     D=64,  kv>128, self-attn -> (BM=64, BN=64)
-    D=64,  kv>128, cross-attn-> (BM=64, BN=32)
+    D=64,  kv>128, cross-attn-> (BM=128, BN=32)
     D=128                    -> (BM=64, BN=16)
 
-int8 量化路径 (转置 kernel):
-    D=64,  self-attn         -> (BM=128, BN=32)  [wpe1]
+int8 量化路径 (转置 kernel, V_T PV):
+    D=64,  self-attn         -> 每 warp 32 行 kernel (BM=128, BN=32, 4 warps) [默认]
+                               (SAGEATTN_INT8_32=0 回退 8 warps wpe1)
     D=64,  cross, kv<=77     -> (BM=64, BN=16)   [wpe1]
     D=64,  cross, kv>77      -> (BM=64, BN=32)   [wpe1]
     D=128                    -> (BM=64, BN=32)   [wpe2]

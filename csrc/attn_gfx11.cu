@@ -641,6 +641,473 @@ __device__ __forceinline__ void attn_kernel_impl_t(
     }
 }
 
+template <int HeadDim, bool IsCausal, int BLOCK_M, int BLOCK_N, typename V_DTYPE = __half, typename OUT_DTYPE = V_DTYPE>
+__device__ __forceinline__ void attn_kernel_impl_32_t(
+    const int8_t* __restrict__ q,
+    const int8_t* __restrict__ k,
+    const V_DTYPE* __restrict__ v,
+    void* __restrict__ output,
+    const float* __restrict__ q_scale,
+    const float* __restrict__ k_scale,
+    const int64_t batch_size,
+    const int64_t qo_len,
+    const int64_t kv_len,
+    const int64_t num_qo_heads,
+    const int64_t num_kv_heads,
+    const int64_t q_stride_b,
+    const int64_t q_stride_n,
+    const int64_t q_stride_h,
+    const int64_t k_stride_b,
+    const int64_t k_stride_n,
+    const int64_t k_stride_h,
+    const int64_t v_stride_b,
+    const int64_t v_stride_n,
+    const int64_t v_stride_h,
+    const int64_t o_stride_b,
+    const int64_t o_stride_n,
+    const int64_t o_stride_h,
+    const int64_t qs_stride_b,
+    const int64_t qs_stride_h,
+    const int64_t ks_stride_b,
+    const int64_t ks_stride_h,
+    const int tensor_layout) {
+
+    constexpr int WARPS = BLOCK_M / (2 * RM);  // 每 warp 32 行
+    constexpr int THREADS = WARPS * 32;
+    constexpr int DTiles = HeadDim / BK;
+    constexpr int ColTiles = BLOCK_N / BK;
+    constexpr int KStride = HeadDim + LDS_PAD;
+    constexpr int VStride = HeadDim + LDS_PAD;
+
+    __shared__ int8_t k_tile[BLOCK_N * KStride];
+    __shared__ __half v_tile[BLOCK_N * VStride];
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int wave = tid >> 5;
+    const int64_t q_base = static_cast<int64_t>(blockIdx.x) * BLOCK_M;
+    const int64_t hq = blockIdx.y;
+    const int64_t b = blockIdx.z;
+    if (b >= batch_size || hq >= num_qo_heads || q_base >= qo_len) return;
+
+    const int64_t hkv = hq / (num_qo_heads / num_kv_heads);
+    const int64_t q_start = q_base + static_cast<int64_t>(wave) * (2 * RM);  // 每 warp 2 子块
+
+    using namespace sageattn_gfx11;
+
+    // q fragment x2 (转置 QK 的 B operand = q^T): 每 warp 2 个子块, lane L 持 q 行 (L&15) 的 16 i8
+    int32_t_v4 q_frag[2][DTiles];
+    const int q_row = lane & 15;
+#pragma unroll
+    for (int s = 0; s < 2; ++s) {
+#pragma unroll
+        for (int dt = 0; dt < DTiles; ++dt) {
+            const int64_t q_idx = q_start + s * RM + q_row;
+            if (q_idx < qo_len) {
+                const int d_base = dt * BK;
+                const int64_t q_off = (tensor_layout == kHND) ?
+                    (b * q_stride_b + hq * q_stride_h + q_idx * q_stride_n + d_base) :
+                    (b * q_stride_b + q_idx * q_stride_n + hq * q_stride_h + d_base);
+                q_frag[s][dt] = *reinterpret_cast<const int32_t_v4*>(q + q_off);
+            } else {
+                q_frag[s][dt] = int32_t_v4{0, 0, 0, 0};
+            }
+        }
+    }
+
+    // 最后一个 block 的越界 wave (q_start >= qo_len) 不产生输出, 守卫避免 q_scale 越界读
+    float qs[2];
+#pragma unroll
+    for (int s = 0; s < 2; ++s) {
+        const int64_t qs_idx = q_start + s * RM;
+        qs[s] = (qs_idx < qo_len)
+            ? q_scale[b * qs_stride_b + hq * qs_stride_h +
+                      static_cast<int>(qs_idx / MIN_BLK_Q)]
+            : 0.0f;
+    }
+
+    // out_acc x2 (转置 PV 输出 = out^T): lane L 持有 out 行 (L&15) 的 8 D 列 (偶/奇)
+    v8f out_acc[2][DTiles];
+#pragma unroll
+    for (int s = 0; s < 2; ++s) {
+#pragma unroll
+        for (int dt = 0; dt < DTiles; ++dt) {
+            out_acc[s][dt] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
+        }
+    }
+    // per-row 状态 x2: 每 lane 1 行 (行 = L&15), lane L 与 L^16 冗余但一致
+    float row_m[2] = {-FLT_MAX * 0.5f, -FLT_MAX * 0.5f};
+    float row_l[2] = {0.0f, 0.0f};
+
+    const int64_t kv_limit = IsCausal ? min(q_base + BLOCK_M, kv_len) : kv_len;
+    constexpr int KVecsPerRow = HeadDim / 16;
+    constexpr int VVecsPerRow = HeadDim / 8;
+    constexpr int KVecsTotal = BLOCK_N * KVecsPerRow;
+    constexpr int VVecsTotal = BLOCK_N * VVecsPerRow;
+    constexpr int KPrefetchPerThread = (KVecsTotal + THREADS - 1) / THREADS;
+    constexpr int VPrefetchPerThread = (VVecsTotal + THREADS - 1) / THREADS;
+
+    uint4 k_prefetch[KPrefetchPerThread];
+    uint4 v_prefetch[VPrefetchPerThread];
+
+    for (int i = tid; i < KVecsTotal; i += THREADS) {
+        const int n = i / KVecsPerRow;
+        const int d = (i - n * KVecsPerRow) * 16;
+        const int64_t k_idx = n;
+        if (k_idx < kv_len) {
+            const int64_t k_off = (tensor_layout == kHND) ?
+                (b * k_stride_b + hkv * k_stride_h + k_idx * k_stride_n + d) :
+                (b * k_stride_b + k_idx * k_stride_n + hkv * k_stride_h + d);
+            *reinterpret_cast<uint4*>(&k_tile[n * KStride + d]) =
+                *reinterpret_cast<const uint4*>(k + k_off);
+        } else {
+            *reinterpret_cast<uint4*>(&k_tile[n * KStride + d]) = make_uint4(0, 0, 0, 0);
+        }
+    }
+    if (!SAGEATTN_VT_GLOBAL) {
+    for (int i = tid; i < VVecsTotal; i += THREADS) {
+        const int n = i / VVecsPerRow;
+        const int d = (i - n * VVecsPerRow) * 8;
+        const int64_t v_idx = n;
+        if (v_idx < kv_len) {
+            const int64_t v_off = (tensor_layout == kHND) ?
+                (b * v_stride_b + hkv * v_stride_h + v_idx * v_stride_n + d) :
+                (b * v_stride_b + v_idx * v_stride_n + hkv * v_stride_h + d);
+            if constexpr (std::is_same<V_DTYPE, __half>::value) {
+                *reinterpret_cast<uint4*>(reinterpret_cast<char*>(v_tile) + (n * VStride + d) * 2) =
+                    *reinterpret_cast<const uint4*>(v + v_off);
+            } else {
+                const V_DTYPE* vsrc = v + v_off;
+                __half* vdst = reinterpret_cast<__half*>(reinterpret_cast<char*>(v_tile) + (n * VStride + d) * 2);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    vdst[j] = __float2half_rn(__bfloat162float(vsrc[j]));
+                }
+            }
+        } else {
+            *reinterpret_cast<uint4*>(reinterpret_cast<char*>(v_tile) + (n * VStride + d) * 2) = make_uint4(0, 0, 0, 0);
+        }
+    }
+    }
+    __syncthreads();
+
+    const int hw = lane >> 4;
+    const int m_row = lane & 15;
+
+    for (int64_t kb_base = 0; kb_base < kv_limit; kb_base += BLOCK_N) {
+        const int64_t next_base = kb_base + BLOCK_N;
+        const bool has_next = (next_base < kv_limit);
+
+        if (has_next) {
+#pragma unroll
+            for (int i = 0; i < KPrefetchPerThread; ++i) {
+                const int vec = tid + i * THREADS;
+                if (vec < KVecsTotal) {
+                    const int n = vec / KVecsPerRow;
+                    const int d = (vec - n * KVecsPerRow) * 16;
+                    const int64_t k_idx = next_base + n;
+                    if (k_idx < kv_len) {
+                        const int64_t k_off = (tensor_layout == kHND) ?
+                            (b * k_stride_b + hkv * k_stride_h + k_idx * k_stride_n + d) :
+                            (b * k_stride_b + k_idx * k_stride_n + hkv * k_stride_h + d);
+                        k_prefetch[i] = *reinterpret_cast<const uint4*>(k + k_off);
+                    } else {
+                        k_prefetch[i] = make_uint4(0, 0, 0, 0);
+                    }
+                }
+            }
+    if (!SAGEATTN_VT_GLOBAL) {
+#pragma unroll
+            for (int i = 0; i < VPrefetchPerThread; ++i) {
+                const int vec = tid + i * THREADS;
+                if (vec < VVecsTotal) {
+                    const int n = vec / VVecsPerRow;
+                    const int d = (vec - n * VVecsPerRow) * 8;
+                    const int64_t v_idx = next_base + n;
+                    if (v_idx < kv_len) {
+                        const int64_t v_off = (tensor_layout == kHND) ?
+                            (b * v_stride_b + hkv * v_stride_h + v_idx * v_stride_n + d) :
+                            (b * v_stride_b + v_idx * v_stride_n + hkv * v_stride_h + d);
+                        v_prefetch[i] = *reinterpret_cast<const uint4*>(v + v_off);
+                    } else {
+                        v_prefetch[i] = make_uint4(0, 0, 0, 0);
+                    }
+                }
+            }
+    }
+        }
+
+        float score_cache[2][ColTiles][8];
+
+#pragma unroll
+        for (int ct = 0; ct < ColTiles; ++ct) {
+            // 2 子块共享 k_frag: 每迭代 2 个独立 WMMA (ILP 提升)
+            v8i score_acc0 = v8i{0, 0, 0, 0, 0, 0, 0, 0};
+            v8i score_acc1 = v8i{0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+            for (int dt = 0; dt < DTiles; ++dt) {
+                // 转置 QK: A = k (行 = BLOCK_N 维), B = q^T
+                const int32_t_v4 k_frag = load_i8_frag(
+                    k_tile + ct * BK * KStride, m_row, dt * BK, KStride);
+                score_acc0 = wmma_i32_iu8(k_frag, q_frag[0][dt], score_acc0);
+                score_acc1 = wmma_i32_iu8(k_frag, q_frag[1][dt], score_acc1);
+            }
+
+            const int64_t k_col_start = kb_base + ct * BK;
+            const int k_scale_idx = static_cast<int>(k_col_start / MIN_BLK_K);
+            const float ks_val = k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+
+#pragma unroll
+            for (int s = 0; s < 2; ++s) {
+                const v8i score_acc = (s == 0) ? score_acc0 : score_acc1;
+                const float score_scale = qs[s] * ks_val;
+                const int q_row_idx = static_cast<int>(q_start) + s * RM + m_row;
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const int col = static_cast<int>(k_col_start) + 2 * e + hw;
+                    float sv = static_cast<float>(score_acc[e]) * score_scale;
+                    if constexpr (IsCausal) {
+                        if (col > q_row_idx) sv = -FLT_MAX * 0.5f;
+                    }
+                    if (col >= kv_len) sv = -FLT_MAX * 0.5f;
+                    score_cache[s][ct][e] = sv;
+                }
+            }
+        }
+
+        // ---- per-row max/exp/sum (online softmax) x2 子块 ----
+#pragma unroll
+        for (int s = 0; s < 2; ++s) {
+        float local_mx = score_cache[s][0][0];
+#pragma unroll
+        for (int ct = 0; ct < ColTiles; ++ct) {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                local_mx = fmaxf(local_mx, score_cache[s][ct][e]);
+            }
+        }
+        float gm = fmaxf(row_m[s], local_mx);
+        gm = fmaxf(gm, permlanex16(gm));
+        const float alpha = (row_l[s] == 0.0f) ? 0.0f : fast_exp2(row_m[s] - gm);
+        row_m[s] = gm;
+        row_l[s] *= alpha;
+#pragma unroll
+        for (int dt = 0; dt < DTiles; ++dt) out_acc[s][dt] *= alpha;
+#pragma unroll
+        for (int ct = 0; ct < ColTiles; ++ct) {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                score_cache[s][ct][e] = fast_exp2(score_cache[s][ct][e] - gm);
+            }
+        }
+
+        // ---- per-row sum: 局部累加 -> permlanex16 合并 ----
+        float partial_sm = 0.0f;
+#pragma unroll
+        for (int ct = 0; ct < ColTiles; ++ct) {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                partial_sm += score_cache[s][ct][e];
+            }
+        }
+        row_l[s] += partial_sm + permlanex16(partial_sm);
+        }
+
+        // ---- P fragment 寄存器组装 + PV ----
+        // SAGEATTN_VT_GLOBAL=1: V 已转置为 V_T [B,H,D,N], 用 out = P @ V (B operand 行读 b128)
+        // SAGEATTN_VT_GLOBAL=0: 原转置 PV (out^T = V^T @ P^T, LDS v_frag 列读)
+        // 注意: 用运行时 if (编译器 DCE), 不能用 #if/if constexpr (模板体内会触发 hipcc 解析 bug)
+        // ---- PV x2 子块 (2 个独立 WMMA, ILP 提升) ----
+        if (SAGEATTN_VT_GLOBAL) {
+        // out^T = V^T @ P^T: A = V^T (V_T 行读), B = P^T (p_frag)
+#pragma unroll
+        for (int s = 0; s < 2; ++s) {
+#pragma unroll
+            for (int ct = 0; ct < ColTiles; ++ct) {
+                float p_vals[8];
+#pragma unroll
+                for (int e = 0; e < 8; ++e) p_vals[e] = score_cache[s][ct][e];
+                const v16h p_frag = assemble_p_frag(p_vals, hw);
+#pragma unroll
+                for (int dt = 0; dt < DTiles; ++dt) {
+                    const int64_t vt_off =
+                        ((b * num_kv_heads + hkv) * HeadDim + (dt * BK + m_row)) * kv_len + (kb_base + ct * BK);
+                    const v16h v_frag_t = *reinterpret_cast<const v16h*>(v + vt_off);
+                    out_acc[s][dt] = sageattn_gfx11::wmma_f32_f16(v_frag_t, p_frag, out_acc[s][dt]);
+                }
+            }
+        }
+        } else {
+#pragma unroll
+        for (int s = 0; s < 2; ++s) {
+#pragma unroll
+            for (int ct = 0; ct < ColTiles; ++ct) {
+                float p_vals[8];
+#pragma unroll
+                for (int e = 0; e < 8; ++e) p_vals[e] = score_cache[s][ct][e];
+                const v16h p_frag = assemble_p_frag(p_vals, hw);
+#pragma unroll
+                for (int dt = 0; dt < DTiles; ++dt) {
+                    const int d_col = dt * BK + m_row;
+                    const char* v_base = reinterpret_cast<const char*>(v_tile) + ct * BK * VStride * 2;
+                    const v16h v_frag = sageattn_gfx11::load_fp16_col_frag(v_base, d_col, VStride * 2);
+                    out_acc[s][dt] = sageattn_gfx11::wmma_f32_f16(v_frag, p_frag, out_acc[s][dt]);
+                }
+            }
+        }
+        }
+
+        if (has_next) {
+            // 写前 barrier: 确保所有 warp 完成当前 tile 的 QK/PV 读,
+            // 否则快 warp 覆盖慢 warp 正在读的 k_tile/v_tile (race)
+            __syncthreads();
+            for (int i = 0; i < KPrefetchPerThread; ++i) {
+                const int vec = tid + i * THREADS;
+                if (vec < KVecsTotal) {
+                    const int n = vec / KVecsPerRow;
+                    const int d = (vec - n * KVecsPerRow) * 16;
+                    *reinterpret_cast<uint4*>(&k_tile[n * KStride + d]) = k_prefetch[i];
+                }
+            }
+    if (!SAGEATTN_VT_GLOBAL) {
+            for (int i = 0; i < VPrefetchPerThread; ++i) {
+                const int vec = tid + i * THREADS;
+                if (vec < VVecsTotal) {
+                    const int n = vec / VVecsPerRow;
+                    const int d = (vec - n * VVecsPerRow) * 8;
+                    if constexpr (std::is_same<V_DTYPE, __half>::value) {
+                        *reinterpret_cast<uint4*>(reinterpret_cast<char*>(v_tile) + (n * VStride + d) * 2) = v_prefetch[i];
+                    } else {
+                        const V_DTYPE* vsrc = reinterpret_cast<const V_DTYPE*>(&v_prefetch[i]);
+                        __half* vdst = reinterpret_cast<__half*>(reinterpret_cast<char*>(v_tile) + (n * VStride + d) * 2);
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            vdst[j] = __float2half_rn(__bfloat162float(vsrc[j]));
+                        }
+                    }
+                }
+            }
+    }
+            __syncthreads();
+        }
+    }
+
+    // ---- 写回 x2 子块: out 行 (L&15) 的 D 列 {dt*16 + 2e + hw} ----
+#pragma unroll
+    for (int s = 0; s < 2; ++s) {
+    const int64_t q_idx = q_start + s * RM + m_row;
+    if (q_idx < qo_len) {
+        const float inv_l = (row_l[s] > 0.0f) ? (1.0f / row_l[s]) : 0.0f;
+#pragma unroll
+        for (int dt = 0; dt < DTiles; ++dt) {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int d = dt * BK + 2 * e + hw;
+                const int64_t o_off = (tensor_layout == kHND) ?
+                    (b * o_stride_b + hq * o_stride_h + q_idx * o_stride_n + d) :
+                    (b * o_stride_b + q_idx * o_stride_n + hq * o_stride_h + d);
+                // 输出 dtype 与 V 输入 dtype 可分离 (V 可预转 fp16, 输出直接写 bf16)
+                if constexpr (std::is_same<OUT_DTYPE, __half>::value) {
+                    reinterpret_cast<__half*>(output)[o_off] = __float2half_rn(out_acc[s][dt][e] * inv_l);
+                } else {
+                    reinterpret_cast<__hip_bfloat16*>(output)[o_off] =
+                        from_float_bf16(out_acc[s][dt][e] * inv_l);
+                }
+            }
+        }
+    }
+    }
+    }
+
+// ===== 每 warp 32 行版本 (BM=128, 4 warps; 2 子块共享 k_frag, ILP 提升) =====
+// launch wrapper (wpe1)
+template <int HeadDim, bool IsCausal, int BLOCK_M, int BLOCK_N, typename V_DTYPE, typename OUT_DTYPE = V_DTYPE>
+__global__ __launch_bounds__(BLOCK_M / 32 * 32, 1)
+__attribute__((amdgpu_waves_per_eu(1, 1)))
+void attn_kernel_wpe1_32_t(
+    const int8_t* __restrict__ q,
+    const int8_t* __restrict__ k,
+    const V_DTYPE* __restrict__ v,
+    void* __restrict__ output,
+    const float* __restrict__ q_scale,
+    const float* __restrict__ k_scale,
+    const int64_t batch_size,
+    const int64_t qo_len,
+    const int64_t kv_len,
+    const int64_t num_qo_heads,
+    const int64_t num_kv_heads,
+    const int64_t q_stride_b,
+    const int64_t q_stride_n,
+    const int64_t q_stride_h,
+    const int64_t k_stride_b,
+    const int64_t k_stride_n,
+    const int64_t k_stride_h,
+    const int64_t v_stride_b,
+    const int64_t v_stride_n,
+    const int64_t v_stride_h,
+    const int64_t o_stride_b,
+    const int64_t o_stride_n,
+    const int64_t o_stride_h,
+    const int64_t qs_stride_b,
+    const int64_t qs_stride_h,
+    const int64_t ks_stride_b,
+    const int64_t ks_stride_h,
+    const int tensor_layout) {
+    attn_kernel_impl_32_t<HeadDim, IsCausal, BLOCK_M, BLOCK_N, V_DTYPE, OUT_DTYPE>(
+        q, k, v, output, q_scale, k_scale,
+        batch_size, qo_len, kv_len, num_qo_heads, num_kv_heads,
+        q_stride_b, q_stride_n, q_stride_h,
+        k_stride_b, k_stride_n, k_stride_h,
+        v_stride_b, v_stride_n, v_stride_h,
+        o_stride_b, o_stride_n, o_stride_h,
+        qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h,
+        tensor_layout);
+}
+
+// launch wrapper (wpe4 高 occupancy)
+template <int HeadDim, bool IsCausal, int BLOCK_M, int BLOCK_N, typename V_DTYPE, typename OUT_DTYPE = V_DTYPE>
+__global__ __launch_bounds__(BLOCK_M / 32 * 32, 4)
+__attribute__((amdgpu_waves_per_eu(4, 4)))
+void attn_kernel_wpe4_32_t(
+    const int8_t* __restrict__ q,
+    const int8_t* __restrict__ k,
+    const V_DTYPE* __restrict__ v,
+    void* __restrict__ output,
+    const float* __restrict__ q_scale,
+    const float* __restrict__ k_scale,
+    const int64_t batch_size,
+    const int64_t qo_len,
+    const int64_t kv_len,
+    const int64_t num_qo_heads,
+    const int64_t num_kv_heads,
+    const int64_t q_stride_b,
+    const int64_t q_stride_n,
+    const int64_t q_stride_h,
+    const int64_t k_stride_b,
+    const int64_t k_stride_n,
+    const int64_t k_stride_h,
+    const int64_t v_stride_b,
+    const int64_t v_stride_n,
+    const int64_t v_stride_h,
+    const int64_t o_stride_b,
+    const int64_t o_stride_n,
+    const int64_t o_stride_h,
+    const int64_t qs_stride_b,
+    const int64_t qs_stride_h,
+    const int64_t ks_stride_b,
+    const int64_t ks_stride_h,
+    const int tensor_layout) {
+    attn_kernel_impl_32_t<HeadDim, IsCausal, BLOCK_M, BLOCK_N, V_DTYPE, OUT_DTYPE>(
+        q, k, v, output, q_scale, k_scale,
+        batch_size, qo_len, kv_len, num_qo_heads, num_kv_heads,
+        q_stride_b, q_stride_n, q_stride_h,
+        k_stride_b, k_stride_n, k_stride_h,
+        v_stride_b, v_stride_n, v_stride_h,
+        o_stride_b, o_stride_n, o_stride_h,
+        qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h,
+        tensor_layout);
+}
+
 template <int HeadDim, bool IsCausal, int BLOCK_M, int BLOCK_N, typename V_DTYPE, typename OUT_DTYPE = V_DTYPE>
 __global__ __launch_bounds__(BLOCK_M / 16 * 32, 1)
 __attribute__((amdgpu_waves_per_eu(1, 1)))
@@ -1332,6 +1799,11 @@ Tensor qk_int8_sv_bf16_attn_gfx11_t(
 
     // 实验: SAGEATTN_INT8_WPE 选择 launch wrapper (1=wpe1 默认, 2=wpe2, 4=wpe4)
     const int wpe_sel = getenv("SAGEATTN_INT8_WPE") ? atoi(getenv("SAGEATTN_INT8_WPE")) : 1;
+    // 实验: SAGEATTN_INT8_32 用每 warp 32 行 kernel (BM 恒 128, 4 warps)
+    // 每 warp 32 行 kernel (BM 128, 4 warps, 2 子块共享 k_frag): D=64 self 默认启用 (实测快 7-10%)
+    // SAGEATTN_INT8_32=0 可关闭
+    const bool use_32w = getenv("SAGEATTN_INT8_32") ? atoi(getenv("SAGEATTN_INT8_32")) != 0 : true;
+    constexpr int BLOCK_M_32 = 128;
 
     #define LAUNCH_ATTN_T(HD, CAUSAL, BM, BN, VTYPE, OTYPE, WPE) \
         do { \
@@ -1417,7 +1889,41 @@ Tensor qk_int8_sv_bf16_attn_gfx11_t(
             if (head_dim == 64) { \
                 const bool is_self_attn = (qo_len == kv_len); \
                 if (is_self_attn) { \
-                    if (is_causal) { LAUNCH_ATTN_T(64, true, 128, 32, VT, OT, wpe_sel); } \
+                    if (use_32w) { \
+                        dim3 block_32(BLOCK_M_32); \
+                        dim3 grid_32((qo_len + 128 - 1) / 128, q_heads, batch); \
+                        if (is_causal) { \
+                            attn_kernel_wpe1_32_t<64, true, 128, 32, VT, OT><<<grid_32, block_32, 0, stream>>>( \
+                                reinterpret_cast<const int8_t*>(query.data_ptr()), \
+                                reinterpret_cast<const int8_t*>(key.data_ptr()), \
+                                reinterpret_cast<const VT*>(value.data_ptr()), \
+                                output.data_ptr(), \
+                                reinterpret_cast<const float*>(q_scale.data_ptr()), \
+                                reinterpret_cast<const float*>(k_scale.data_ptr()), \
+                                batch, qo_len, kv_len, q_heads, kv_heads, \
+                                q_stride_b, q_stride_n, q_stride_h, \
+                                k_stride_b, k_stride_n, k_stride_h, \
+                                v_stride_b, v_stride_n, v_stride_h, \
+                                o_stride_b, o_stride_n, o_stride_h, \
+                                qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
+                                static_cast<int>(tensor_layout)); \
+                        } else { \
+                            attn_kernel_wpe1_32_t<64, false, 128, 32, VT, OT><<<grid_32, block_32, 0, stream>>>( \
+                                reinterpret_cast<const int8_t*>(query.data_ptr()), \
+                                reinterpret_cast<const int8_t*>(key.data_ptr()), \
+                                reinterpret_cast<const VT*>(value.data_ptr()), \
+                                output.data_ptr(), \
+                                reinterpret_cast<const float*>(q_scale.data_ptr()), \
+                                reinterpret_cast<const float*>(k_scale.data_ptr()), \
+                                batch, qo_len, kv_len, q_heads, kv_heads, \
+                                q_stride_b, q_stride_n, q_stride_h, \
+                                k_stride_b, k_stride_n, k_stride_h, \
+                                v_stride_b, v_stride_n, v_stride_h, \
+                                o_stride_b, o_stride_n, o_stride_h, \
+                                qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
+                                static_cast<int>(tensor_layout)); \
+                        } \
+                    } else if (is_causal) { LAUNCH_ATTN_T(64, true, 128, 32, VT, OT, wpe_sel); } \
                     else { LAUNCH_ATTN_T(64, false, 128, 32, VT, OT, wpe_sel); } \
                 } else if (kv_len <= 77) { \
                     if (is_causal) { LAUNCH_ATTN_T(64, true, 64, 16, VT, OT, wpe_sel); } \
