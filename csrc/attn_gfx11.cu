@@ -163,24 +163,30 @@ __global__ void quant_qk_int8_hnd_kernel(
     const int64_t q_in_stride_h,
     const int64_t k_in_stride_b,
     const int64_t k_in_stride_n,
-    const int64_t k_in_stride_h) {
+    const int64_t k_in_stride_h,
+    const int groups_per_block) {
     constexpr int Threads = 256;
     __shared__ float shared_amax;
     // pass1 读入的原始数据缓存在 LDS (Q 32行=512 uint4=8KB, K 16行=256), pass2 从 LDS 读,
     // 省掉 pass2 的全局重读 (DRAM/L2 流量减半)
     __shared__ uint4 shared_data[512];
 
-    const int group = blockIdx.x;
     const int head = blockIdx.y;
     const int b = blockIdx.z;
     const int tid = threadIdx.x;
+    // 多 group 合并: 每 block 顺序处理 groups_per_block 个连续 group (行连续 ->
+    // DRAM 行切换/block 调度开销减少), 保持每 thread 少量 packs (fmax 依赖链不变)
+    for (int gi = 0; gi < groups_per_block; ++gi) {
+    const int group = blockIdx.x * groups_per_block + gi;
+    if (group >= q_groups + k_groups) break;
     const bool is_q = group < q_groups;
     const int local_group = is_q ? group : group - q_groups;
     const int rows_per_group = is_q ? MIN_BLK_Q : MIN_BLK_K;
     const int64_t seq_len = is_q ? q_len : kv_len;
     const int64_t base_row = static_cast<int64_t>(local_group) * rows_per_group;
     const int active_heads = is_q ? static_cast<int>(q_heads) : static_cast<int>(kv_heads);
-    if (b >= batch || head >= active_heads || base_row >= seq_len) return;
+    if (b >= batch || head >= active_heads) return;
+    if (base_row >= seq_len) continue;
 
     const T* in = is_q ? query : key;
     int8_t* out = is_q ? query_out : key_out;
@@ -303,6 +309,8 @@ __global__ void quant_qk_int8_hnd_kernel(
             *reinterpret_cast<char4*>(out + out_off + 8) = out2;
             *reinterpret_cast<char4*>(out + out_off + 12) = out3;
         }
+    }
+    __syncthreads();  // 防下轮 group 的 pass1 覆盖 shared_data (上轮 pass2 未读完)
     }
 }
 
@@ -432,7 +440,12 @@ __device__ __forceinline__ void attn_kernel_impl_t(
     constexpr int VStride = HeadDim + LDS_PAD;
 
     __shared__ int8_t k_tile[BLOCK_N * KStride];
-    __shared__ __half v_tile[BLOCK_N * VStride];
+    // V_T tile 拷贝到 LDS (布局 [D][N], 行 = D 维, n 连续 16 half 行读):
+    // PV 的 v_frag 从 LDS 读而非全局 (消除每 lane 32 次冗余全局行读, 与 triton LDS 缓存对齐)
+    // VT_GLOBAL: 需 HeadDim 行 x VTileStride(80) 列; 非 VT_GLOBAL: 原 [BLOCK_N][VStride] 列读布局
+    constexpr int VTileStride = 80;  // 行间 8 bank 偏移 (同 VStride 冲突模式), 20KB/128 行
+    __shared__ __align__(32) __half v_tile[
+        (SAGEATTN_VT_GLOBAL) ? (HeadDim * VTileStride) : (BLOCK_N * VStride)];
 
     const int tid = threadIdx.x;
     const int lane = tid & 31;
@@ -492,7 +505,9 @@ __device__ __forceinline__ void attn_kernel_impl_t(
     constexpr int VPrefetchPerThread = (VVecsTotal + THREADS - 1) / THREADS;
 
     uint4 k_prefetch[KPrefetchPerThread];
-    uint4 v_prefetch[VPrefetchPerThread];
+    // VT_GLOBAL=1 时 V 从全局 V_T 行读 (无 LDS), v_prefetch 完全不用:
+    // 缩为 1 元素省 (VPrefetchPerThread-1)*4 个 VGPR (编译期常量三元)
+    uint4 v_prefetch[(SAGEATTN_VT_GLOBAL) ? 1 : VPrefetchPerThread];
 
     for (int i = tid; i < KVecsTotal; i += THREADS) {
         const int n = i / KVecsPerRow;
@@ -612,6 +627,26 @@ __device__ __forceinline__ void attn_kernel_impl_t(
             }
         }
 
+        // ---- V_T 当前 tile (kb_base) 拷入 LDS (仅 VT_GLOBAL) ----
+        // v_tile 布局 [D][N]: 行 = D 维 (HeadDim), 列 = n (BLOCK_N), 行 stride VStride half。
+        // PV 的 v_frag 从 LDS 行读 (b128), 消除"每 lane 每 dt 一次 32B 全局行读"的
+        // L1/L2 带宽冗余 (128 lanes x 32 次/迭代 -> 128KB, 实际 tile 仅 16KB)。
+        // 512 个 v16h (128 D 行 x 4 个 16 列组), 128 threads -> 4/thread, 全局行读 32B 对齐。
+        if (SAGEATTN_VT_GLOBAL) {
+            constexpr int VVecsPerTile = (HeadDim * BLOCK_N) / 16;
+#pragma unroll
+            for (int i = tid; i < VVecsPerTile; i += THREADS) {
+                const int d = i / (BLOCK_N / BK);   // D 行 0..127
+                const int c16 = i % (BLOCK_N / BK); // 16 列组 0..3
+                const int64_t v_off =
+                    ((b * num_kv_heads + hkv) * HeadDim + d) * v_t_n + (kb_base + c16 * BK);
+                const v16h src = *reinterpret_cast<const v16h*>(v + v_off);
+                *reinterpret_cast<v16h*>(
+                    reinterpret_cast<char*>(v_tile) + (d * VTileStride + c16 * BK) * 2) = src;
+            }
+            __syncthreads();  // v_tile 写完后 PV 才可读
+        }
+
         // ---- per-row max: 局部归约 (同行偶/奇列) -> permlanex16 合并 ----
         float local_mx = score_cache[0][0];
 #pragma unroll
@@ -652,7 +687,8 @@ __device__ __forceinline__ void attn_kernel_impl_t(
         // SAGEATTN_VT_GLOBAL=0: 原转置 PV (out^T = V^T @ P^T, LDS v_frag 列读)
         // 注意: 用运行时 if (编译器 DCE), 不能用 #if/if constexpr (模板体内会触发 hipcc 解析 bug)
         if (SAGEATTN_VT_GLOBAL) {
-        // out^T = V^T @ P^T: A = V^T (V_T 行 L&15 的 16 连续 n = 行读 b128), B = P^T (p_frag)
+        // out^T = V^T @ P^T: A = V^T (v_tile 行 (L&15) 的 16 连续 n = LDS 行读 b128),
+        // B = P^T (p_frag). V_T tile 已由主循环拷入 v_tile [D][N] (见主循环 V 拷贝段)
         // C = out^T: lane L 持 out^T[2e+hw][L&15] = out[L&15][2e+hw] (转置解释, 匹配写回)
 #pragma unroll
         for (int ct = 0; ct < ColTiles; ++ct) {
@@ -662,9 +698,10 @@ __device__ __forceinline__ void attn_kernel_impl_t(
             const v16h p_frag = assemble_p_frag(p_vals, hw);
 #pragma unroll
             for (int dt = 0; dt < DTiles; ++dt) {
-                const int64_t vt_off =
-                    ((b * num_kv_heads + hkv) * HeadDim + (dt * BK + m_row)) * v_t_n + (kb_base + ct * BK);
-                const v16h v_frag_t = *reinterpret_cast<const v16h*>(v + vt_off);
+                const int d_row = dt * BK + m_row;  // v_tile 的 D 维行 (与 V_T 同)
+                const v16h* vp = reinterpret_cast<const v16h*>(
+                    reinterpret_cast<const char*>(v_tile) + (d_row * VTileStride + ct * BK) * 2);
+                const v16h v_frag_t = *vp;
                 out_acc[dt] = sageattn_gfx11::wmma_f32_f16(v_frag_t, p_frag, out_acc[dt]);
             }
         }
@@ -820,7 +857,8 @@ __device__ __forceinline__ void attn_kernel_impl_32_t(
     constexpr int VStride = HeadDim + LDS_PAD;
 
     __shared__ int8_t k_tile[BLOCK_N * KStride];
-    __shared__ __half v_tile[BLOCK_N * VStride];
+    // VT_GLOBAL=1 时 V 直接从全局 V_T 行读, LDS v_tile 完全不用 (见 impl_t 注释)
+    __shared__ __half v_tile[(SAGEATTN_VT_GLOBAL) ? 1 : (BLOCK_N * VStride)];
 
     const int tid = threadIdx.x;
     const int lane = tid & 31;
@@ -890,7 +928,9 @@ __device__ __forceinline__ void attn_kernel_impl_32_t(
     constexpr int VPrefetchPerThread = (VVecsTotal + THREADS - 1) / THREADS;
 
     uint4 k_prefetch[KPrefetchPerThread];
-    uint4 v_prefetch[VPrefetchPerThread];
+    // VT_GLOBAL=1 时 V 从全局 V_T 行读 (无 LDS), v_prefetch 完全不用:
+    // 缩为 1 元素省 (VPrefetchPerThread-1)*4 个 VGPR (编译期常量三元)
+    uint4 v_prefetch[(SAGEATTN_VT_GLOBAL) ? 1 : VPrefetchPerThread];
 
     for (int i = tid; i < KVecsTotal; i += THREADS) {
         const int n = i / KVecsPerRow;
@@ -1454,7 +1494,8 @@ __device__ __forceinline__ void direct_attn_kernel_impl_t(
     constexpr int VStride = HeadDim + LDS_PAD;
 
     __shared__ QK_DTYPE k_tile[BLOCK_N * KStride];
-    __shared__ __half v_tile[BLOCK_N * VStride];
+    // VT_GLOBAL=1 时 V 直接从全局 V_T 行读, LDS v_tile 完全不用 (见 impl_t 注释)
+    __shared__ __half v_tile[(SAGEATTN_VT_GLOBAL) ? 1 : (BLOCK_N * VStride)];
 
     const int tid = threadIdx.x;
     const int lane = tid & 31;
@@ -1510,7 +1551,9 @@ __device__ __forceinline__ void direct_attn_kernel_impl_t(
     constexpr int VPrefetchPerThread = (VVecsTotal + THREADS - 1) / THREADS;
 
     uint4 k_prefetch[KPrefetchPerThread];
-    uint4 v_prefetch[VPrefetchPerThread];
+    // VT_GLOBAL=1 时 V 从全局 V_T 行读 (无 LDS), v_prefetch 完全不用:
+    // 缩为 1 元素省 (VPrefetchPerThread-1)*4 个 VGPR (编译期常量三元)
+    uint4 v_prefetch[(SAGEATTN_VT_GLOBAL) ? 1 : VPrefetchPerThread];
 
     for (int i = tid; i < KVecsTotal; i += THREADS) {
         const int n = i / KVecsPerRow;
@@ -1937,7 +1980,11 @@ std::vector<Tensor> quant_qk_int8_gfx11(
     const int64_t k_sh = (tensor_layout == kHND) ? key.stride(1) : key.stride(2);
 
     dim3 block(256);
-    dim3 grid(q_groups + k_groups, max(q_heads, kv_heads), batch);
+    // quant 多 group 合并: 每 block 顺序处理 q_gpb 个连续 group (实验选项, 实测对
+    // 带宽无改善, 默认 1 保持原逻辑). SAGEATTN_QUANT_GPB=1/2/4/8
+    int q_gpb = getenv("SAGEATTN_QUANT_GPB") ? atoi(getenv("SAGEATTN_QUANT_GPB")) : 1;
+    if (q_gpb < 1) q_gpb = 1;
+    dim3 grid((q_groups + k_groups + q_gpb - 1) / q_gpb, max(q_heads, kv_heads), batch);
 
     if (query.scalar_type() == ScalarType::Half) {
         if (head_dim == 64) {
@@ -1951,7 +1998,7 @@ std::vector<Tensor> quant_qk_int8_gfx11(
                 reinterpret_cast<float*>(k_scale.data_ptr()),
                 batch, q_heads, kv_heads, q_len, kv_len,
                 q_groups, k_groups, sm_scale_log2e,
-                q_sb, q_sn, q_sh, k_sb, k_sn, k_sh);
+                q_sb, q_sn, q_sh, k_sb, k_sn, k_sh, q_gpb);
         } else {
             quant_qk_int8_hnd_kernel<__half, 128><<<grid, block, 0, stream>>>(
                 reinterpret_cast<const __half*>(query.data_ptr()),
@@ -1963,7 +2010,7 @@ std::vector<Tensor> quant_qk_int8_gfx11(
                 reinterpret_cast<float*>(k_scale.data_ptr()),
                 batch, q_heads, kv_heads, q_len, kv_len,
                 q_groups, k_groups, sm_scale_log2e,
-                q_sb, q_sn, q_sh, k_sb, k_sn, k_sh);
+                q_sb, q_sn, q_sh, k_sb, k_sn, k_sh, q_gpb);
         }
     } else {
         if (head_dim == 64) {
@@ -1977,7 +2024,7 @@ std::vector<Tensor> quant_qk_int8_gfx11(
                 reinterpret_cast<float*>(k_scale.data_ptr()),
                 batch, q_heads, kv_heads, q_len, kv_len,
                 q_groups, k_groups, sm_scale_log2e,
-                q_sb, q_sn, q_sh, k_sb, k_sn, k_sh);
+                q_sb, q_sn, q_sh, k_sb, k_sn, k_sh, q_gpb);
         } else {
             quant_qk_int8_hnd_kernel<__hip_bfloat16, 128><<<grid, block, 0, stream>>>(
                 reinterpret_cast<const __hip_bfloat16*>(query.data_ptr()),
@@ -1989,7 +2036,7 @@ std::vector<Tensor> quant_qk_int8_gfx11(
                 reinterpret_cast<float*>(k_scale.data_ptr()),
                 batch, q_heads, kv_heads, q_len, kv_len,
                 q_groups, k_groups, sm_scale_log2e,
-                q_sb, q_sn, q_sh, k_sb, k_sn, k_sh);
+                q_sb, q_sn, q_sh, k_sb, k_sn, k_sh, q_gpb);
         }
     }
     return {q_int8, q_scale, k_int8, k_scale};
@@ -2036,6 +2083,11 @@ Tensor qk_int8_sv_bf16_attn_gfx11_t(
     // BN=64 实测相对 triton 更优 (Anima01 1.038->1.02, Anima03 1.051->0.99, Anima05 1.045->1.02):
     // kv-tile 数减半 -> barrier/ k_tile 填充减半
     const int bn128_ov = getenv("SAGEATTN_INT8_BN128") ? atoi(getenv("SAGEATTN_INT8_BN128")) : 0;
+    // VAE 超长 self-attn (新增用例): LDS PV 优化后 BM=64 实测全面优于 BM=128
+    // (v_tile 20KB + 8 warps barrier 开销, -6%), 故默认走 BM=64 原逻辑;
+    // SAGEATTN_INT8_BM128=1 可强制 BM=128 实验 (0/-1 均禁用)
+    const int bm128_sel = getenv("SAGEATTN_INT8_BM128") ? atoi(getenv("SAGEATTN_INT8_BM128")) : -1;
+    const bool use_bm128_d128 = (bm128_sel == 1);
     constexpr int BLOCK_M_32 = 128;
 
     #define LAUNCH_ATTN_T(HD, CAUSAL, BM, BN, VTYPE, OTYPE, WPE) \
@@ -2167,7 +2219,15 @@ Tensor qk_int8_sv_bf16_attn_gfx11_t(
                 } \
             } else { \
                 const int wpe128 = (wpe_sel == 1) ? 2 : wpe_sel; \
-                if (bn128_ov == 16) { \
+                if (use_bm128_d128) { \
+                    /* VAE 超长 self-attn: BM=128/8 warps, K/V 重读减半 (dispatch, 旧用例不受影响) */ \
+                    if (is_causal) { LAUNCH_ATTN_T(128, true, 128, 64, VT, OT, wpe128); } \
+                    else { LAUNCH_ATTN_T(128, false, 128, 64, VT, OT, wpe128); } \
+                } else if (bn128_ov == 128) { \
+                    /* 实验: BN=128 (迭代/softmax 次数减半, LDS k_tile 18KB) */ \
+                    if (is_causal) { LAUNCH_ATTN_T(128, true, 64, 128, VT, OT, wpe128); } \
+                    else { LAUNCH_ATTN_T(128, false, 64, 128, VT, OT, wpe128); } \
+                } else if (bn128_ov == 16) { \
                     if (is_causal) { LAUNCH_ATTN_T(128, true, 64, 16, VT, OT, wpe128); } \
                     else { LAUNCH_ATTN_T(128, false, 64, 16, VT, OT, wpe128); } \
                 } else if (bn128_ov == 32) { \

@@ -6,6 +6,7 @@ from typing import Optional
 
 # 默认后端为 native (本项目核心); 用户可显式设 SAGEATTN_BACKEND=triton 覆盖
 # setdefault 尊重已有环境变量, 与 core.py 的 triton 默认值解耦
+os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
 os.environ.setdefault("SAGEATTN_BACKEND", "native")
 _IS_TRITON_BACKEND = os.getenv("SAGEATTN_BACKEND").lower() == "triton"
 

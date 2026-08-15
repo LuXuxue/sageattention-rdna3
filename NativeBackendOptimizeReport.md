@@ -7,29 +7,40 @@
 Native backend 的核心优化链（按收益排序）：
 1. **V 全局转置 PV（`SAGEATTN_VT_GLOBAL=1`）**：V 一次性转置为 `V_T [B,H,D,N]`，PV 的
    A=V^T 从 128 次 u16 LDS 列读变为 1 条行读 → direct 路径真实提升 17-36%
-2. **每 warp 32 行 QK kernel**：D=64 int8 self 用 BM=128/4 warps，2 子块共享 k_frag
+2. **V_T tile LDS 缓存 PV（VAE 超长 self-attn，新增）**：PV 的 v_frag 从 LDS 行读而非
+   全局——消除每 lane 每 dt 一次 32B 全局行读的 L1/L2 带宽冗余（128 lanes×32 次/迭代
+   = 128KB，实际 tile 仅 16KB）→ D=128 int8 超长序列 attn 提升 ~35%（SDXLVAE01
+   94.7→62ms），与 triton 追平并反超
+3. **每 warp 32 行 QK kernel**：D=64 int8 self 用 BM=128/4 warps，2 子块共享 k_frag
    （ILP）→ int8 self 从慢 7-13% 追平
-3. **bf16→fp16 转换融合进 v_transpose**：省掉 `v.to(fp16)` 独立 kernel（Anima01 的 5%）
-4. **D=128 int8 BN=32→64**：kv-tile 数减半（barrier/k_tile 填充减半）
-5. **quant pass1→LDS 缓存**：pass2 从 LDS 读，省一半全局读流量（2.28→2.15ms）
-6. **差异化 direct/int8 分发**（按 kv_len/q_len/is_causal 选择路径）
-7. **写回向量化**（permlanex16 + 16B 连续写，全部 kernel 一致）
+4. **bf16→fp16 转换融合进 v_transpose**：省掉 `v.to(fp16)` 独立 kernel（Anima01 的 5%）
+5. **D=128 int8 BN=32→64**：kv-tile 数减半（barrier/k_tile 填充减半）
+6. **quant pass1→LDS 缓存**：pass2 从 LDS 读，省一半全局读流量（2.28→2.15ms）
+7. **差异化 direct/int8 分发**（按 kv_len/q_len/is_causal 选择路径）
+8. **写回向量化**（permlanex16 + 16B 连续写，全部 kernel 一致）
 
-**当前 benchmark 状态（24 用例全 OK，Radeon 780M）**：
+**当前 benchmark 状态（Radeon 780M）**：
 
-| 类别 | native/triton | native/FA | 说明 |
-|------|--------------|-----------|------|
-| Anima D=128 int8 self（4096/6144/9216） | 0.976/0.955/1.000 | 0.949/0.939/0.965 | **全面超 triton 和 FA** |
-| Anima D=128 direct cross（kv=512） | 0.89-0.91 | 0.82-0.88 | **超 triton 9-11%** |
-| SDXL direct cross（kv<=2048） | 0.95-1.0 | 0.86-1.2 | 持平/超 |
-| SDXL01/07/13（D=64 int8 self, kv>=4096） | 1.03-1.06 | 1.00-1.07 | 慢 3-6%（辅助占比高） |
-| SDXL10/16（D=64 direct, kv=1536/2304） | 1.07-1.13 | 1.07-1.13 | 慢 7-13%（架构性） |
+| 类别 | native/triton | 说明 |
+|------|--------------|------|
+| Anima D=128 int8 self（4096/6144/9216） | 0.976/0.955/1.000 | 持平 triton（历史 0.949/0.939/0.965 vs FA） |
+| Anima D=128 direct cross（kv=512） | 0.89-0.91 | **超 triton 9-11%** |
+| SDXL direct cross（kv<=2048） | 0.95-1.0 | 持平/超 |
+| SDXL01/07/13（D=64 int8 self, kv>=4096） | 0.92-1.03 | **01/07 反超 8-9%**（v_tile/v_prefetch 三元省 LDS/VGPR 收益） |
+| SDXL10/16（D=64 direct, kv=1536/2304） | 1.07-1.13 | 慢 7-13%（架构性） |
+| **SDXLVAE01/02（D=128 int8 self, 16384/24576）** | **0.92-0.97** | **超 triton 3-8%**（LDS PV 优化后；优化前慢 16-23%） |
+| **AnimaVAE01/02（D=128 int8 self bf16, 16384/24576）** | **0.98-1.03** | 持平±3%（attn 主 kernel 已持平，差距=bf16 输入需 v_transpose 转换） |
+
+> 注：VAE 用例的 03/04（36864/55296）因 iGPU 长时间运行死机已从 benchmark_attn.py 注释，
+> 优化结论由 01/02（16384/24576）外推。
 
 **关键结论**：
 - i8 WMMA 在 RDNA3 为 fp16 的 2 倍吞吐（QK 占一半计算量）→ int8 在长 self-attn 占优；
   direct 省 quant+mean 辅助（固定 0.4-0.6ms）→ 在计算量小（causal/cross 短 q）时占优
 - WMMA 硬件吞吐是 int8 的剩余上限（D=128 attn 达 ~10.9 TFLOP）
-- **默认编译配置（无 env）即为各用例最优配置**
+- **VAE 超长 self-attn 的瓶颈是 PV 的 WMMA + L1/L2 带宽冗余**（非 K/V 重读、非
+  occupancy、非 LDS 容量）；LDS 缓存 V_T tile 是唯一有效结构优化（-35%）
+- **默认编译配置（无 env）即为各用例最优配置**（BM=128/BN=128 等实验项均默认禁用）
 
 ---
 
@@ -169,6 +180,45 @@ u16 标量 LDS 读（低效且 bank 冲突）。
 恰好覆盖 D=128 Q 的 512 packs），pass2 从 LDS 读 → quant 2.28→2.15ms。
 同时 pass1 读粒度 16B→32B（2 连续 pack 合并）。
 
+### 3.8 V_T tile LDS 缓存 PV（VAE 超长 self-attn，2026-08 新增）
+
+**背景**：benchmark_attn.py 新增 SDXLVAE/AnimaVAE 用例（D=128 int8 self，
+kv=16384~55296, h=3/4）。同进程轮转显示 native 在 16384 用例比 triton 慢 52-72%
+（SDXLVAE01 94.7 vs 62ms），24576+ 持平。分阶段 profiling 确认 attn 主 kernel 占
+96-98%，辅助（mean/quant/v_transpose）仅 2-5%。
+
+**瓶颈定位**（逐个排除）：
+- BM=128/8 warps（K/V 重读减半）：±1% 无效 → 非 DRAM 带宽/重读受限
+- BN=16/32/128、wpe=1/2/4、occupancy（v_tile 缩为 1 元素省 18KB LDS）：全部无效
+  → 非 occupancy/LDS 容量受限，WMMA 计算本身接近吞吐上限
+- **真正的结构性差距：PV 的 v_frag 每 lane 每 dt 从全局 V_T 行读 32B（b128）**。
+  每迭代 4ct×8dt = 32 次/ lane，128 lanes × 32 × 32B = 128KB 全局读，而实际 tile
+  数据仅 64n×128D×2B = 16KB —— **8 倍冗余，L1/L2 读带宽被 WMMA operand 布局放大**
+- triton 的 V 走软件流水线（num_stages=2）缓存到 LDS，无此冗余 → 快
+
+**解法**：V_T 当前 tile（64n×128D）每迭代一次拷入 LDS（布局 `[D][N]`，行 = D 维、
+n 连续 16 half 行读），PV 的 v_frag 改从 LDS 行读：
+- 全局读从 128KB/迭代（冗余）降到 16KB/迭代（每 thread 4 个 v16h 行读 32B）
+- `VTileStride=80`（行间 8 bank 偏移，与 VStride 冲突模式相同；20KB/128 行）
+- `__align__(32)` 保证 v16h 32B 对齐
+- 每迭代 +1 次 `__syncthreads()`（V 拷贝后）
+
+**结果**（同进程轮转）：SDXLVAE01 attn 94.7→62ms（**-35%**），SDXLVAE02 反超 triton
+4%，AnimaVAE01 -36%（69.6→44.8ms）。LDS PV 优化后 BM=64 全面优于 BM=128（-6%，
+v_tile 20KB + 8 warps barrier 开销），BM=128 仅保留 env 实验开关。
+
+**踩坑**：初版 v_tile 大小沿用 `BLOCK_N*VStride`（64×144），而 [D][N] 布局需要
+`HeadDim` 行 → 越界写 2 倍污染 LDS，4096+ 序列输出错误（err=0.13）；必须
+`(SAGEATTN_VT_GLOBAL) ? (HeadDim*VTileStride) : (BLOCK_N*VStride)` 三元区分布局。
+
+### 3.9 v_tile / v_prefetch 条件声明（省 LDS/VGPR）
+
+`VT_GLOBAL=1` 时 LDS `v_tile` 与寄存器 `v_prefetch` 完全未使用（V 直接全局行读），
+但声明无条件占用 18KB LDS + 8×uint4 VGPR。改为编译期常量三元
+（`? 1 : N`，死分支被 DCE），三个 kernel（impl_t / impl_32_t / direct）一致：
+- D=128（impl_t）：LDS PV 优化前无性能变化（occupancy 非瓶颈）；D=64 的 32 行
+  kernel（SDXL01/07/13）实测反超 triton 8-9%（省 LDS/VGPR 的调度收益）
+
 ---
 
 ## 四、测量方法论
@@ -233,6 +283,10 @@ D=64  cross, kv>77  -> (BM=64, BN=32) [wpe1]
 D=128               -> (BM=64, BN=64) [wpe2]   (BN=64 实测优于 BN=32; BN=16 全面变差)
 ```
 
+**VAE 超长 self-attn（kv≥16384）**：同样走 `(BM=64, BN=64) [wpe2]`，但 PV 走 3.8 的
+LDS 缓存路径（`v_tile [D][N]` 布局，`VTileStride=80`）。LDS PV 优化后 BM=64 全面
+优于 BM=128（-6%），BM=128/BN=128 仅保留 env 实验开关（默认禁用）。
+
 ### 5.3 fp16/bf16 direct 路径 kernel 选择
 
 ```
@@ -249,7 +303,9 @@ D=128                -> (BM=64, BN=16)    (BN=16 实测最优; BN=32/64 均更�
 | `SAGEATTN_BACKEND` | 后端选择（native/triton） | triton |
 | `SAGEATTN_INT8_32` | int8 self 用每 warp 32 行 kernel | 1（启用） |
 | `SAGEATTN_INT8_WPE` | int8 实验：waves_per_eu（1/2/4） | 1 |
-| `SAGEATTN_INT8_BN128` | D=128 int8 的 BN 覆盖（0 默认 64, 16/32） | 0（=64） |
+| `SAGEATTN_INT8_BN128` | D=128 int8 的 BN 覆盖（0 默认 64, 16/32/128） | 0（=64） |
+| `SAGEATTN_INT8_BM128` | D=128 int8 强制 BM=128/8 warps（1 启用；实测 BM=64 更优） | 0（=64） |
+| `SAGEATTN_QUANT_GPB` | quant 多 group 合并实验（1/2/4/8；实测无改善） | 1 |
 | `SAGEATTN_FP16_BM` / `SAGEATTN_FP16_BN` | fp16 direct 实验配置覆盖 | 0 / 0 |
 | `SAGEATTN_BF16_BM` / `SAGEATTN_BF16_BN` | bf16 direct 实验配置覆盖 | 0 / 0 |
 | `SAGEATTN_DIRECT_THRESHOLD_D64` | D=64 self 的 direct/int8 阈值 | 3072 |
@@ -295,6 +351,11 @@ D=128                -> (BM=64, BN=16)    (BN=16 实测最优; BN=32/64 均更�
     （core.py 有断言）；非 contiguous 输入会触发未对齐写（UB）
 12. **"性能提升"必须先验证正确性再谈性能**：早期 V_T/32 行实现的部分"性能提升"
     来自错误输出（layout 错或只处理前 32 key）
+13. **LDS 数组大小必须匹配实际布局**：V_T tile LDS 缓存（3.8）初版沿用
+    `BLOCK_N*VStride`（64×144），而 `[D][N]` 布局需 `HeadDim` 行 → 越界写 2 倍污染
+    相邻 LDS，短序列（2048）恰好无感、4096+ 输出 err=0.13。定位方法：先小序列
+    （2048）对 reference 验证，再逐步放大；LDS 数组尺寸用三元表达式按布局区分
+    （`(SAGEATTN_VT_GLOBAL) ? (HeadDim*VTileStride) : (BLOCK_N*VStride)`）
 
 ---
 
@@ -316,9 +377,16 @@ D=128                -> (BM=64, BN=16)    (BN=16 实测最优; BN=32/64 均更�
 | K 直读 global（消 LDS+barrier） | +8%（gather 的 L2 利用率低） |
 | QK 用 fp16 WMMA（i8 转 fp16） | +33%（转换开销超 WMMA 提速） |
 | fast_exp2 位近似 / v_max3 / permlanex16→shfl / 双缓冲 | 全部失败 |
+| BM=128/8 warps（VAE 超长 self, K/V 重读减半） | ±1% 无效 → 非 DRAM 带宽/重读受限 |
+| BN=16/32/128（D=128 int8, VAE） | BN=16/32 慢 4-14%；BN=128 持平 → 保持 BN=64 |
+| v_tile 缩为 1 元素（occupancy 4→6 blocks/CU） | 无性能变化 → occupancy 非瓶颈（省 LDS 仍有益, 3.9） |
+| quant 多 group 合并（GPB=2/4/8 串行循环） | 无改善 → quant 瓶颈非 block 调度/DRAM 行切换 |
+| triton PV_ACCUM fp16（VAE） | 无收益（ROCm triton 未受益） |
+| triton BLOCK_M=128/64×8 warps（VAE） | autotune 未选中（BM=64/BN=32 更优） |
 
 **规律**：指令级微优化全部失败；有效的优化是**结构性**的（V_T 消除 LDS 列读、
-32 行共享 k_frag 提升 ILP、LDS 缓存省全局重读、bf16 融合省 kernel、差异化分发省辅助）。
+32 行共享 k_frag 提升 ILP、LDS 缓存省全局重读、bf16 融合省 kernel、差异化分发省辅助、
+**V_T tile LDS 缓存消除 PV 冗余全局读**）。
 
 ---
 
@@ -333,11 +401,19 @@ D=128                -> (BM=64, BN=16)    (BN=16 实测最优; BN=32/64 均更�
    - mean_seq 融合进 quant（跨 block 归约需原子或二次 kernel）
    - v_transpose 的 30GB/s 上限（转置类带宽瓶颈）——若 DDR5 带宽更高可重测
 3. **quant 的 32MB 读仅 20GB/s**：与 torch sum 的 75GB/s 差 3.6 倍，根因未完全定位
-   （非读粒度/归约/计算；疑为 6144 个小 block 的调度与 DRAM 行切换）——可尝试
-   block 级循环合并多个 group（保持每 thread 少量 packs）
-4. **GQA 场景**（h_q≠h_kv）：当前按 head 分组处理，kv_heads 共享可进一步优化
+   （非读粒度/归约/计算；2026-08 实测 block 级多 group 合并（GPB=2/4/8）无改善，
+   排除 block 调度/DRAM 行切换假设；疑为 LDS 双缓冲/延迟隐藏不足，可试 pass1 与
+   pass2 软件流水（pass1 预读下组数据到寄存器））
+4. **AnimaVAE（bf16）仍慢 triton 2-3%**（VAE 优化后）：attn 主 kernel 已持平，
+   差距=bf16 输入需 v_transpose 转 fp16（triton 直接读 bf16 原布局）：
+   - V_T 保持 bf16（v_transpose 免转换）+ PV 用 bf16 WMMA（v_wmma_f32_16x16x16_bf16，
+     吞吐与 fp16 相同）——省 v_transpose 转换开销
+   - 或 v_transpose 与 attn 融合（分块转置+计算，消除 V_T 全局往返）——大工程
+5. **GQA 场景**（h_q≠h_kv）：当前按 head 分组处理，kv_heads 共享可进一步优化
    （benchmark 未覆盖 GQA 性能；D=128 GQA 下 int8 优势更大，阈值需按 hq/hkv 比调整）
-5. **D=128 direct 的 BM 探索**：当前 BM=64/BN=16，可测 BM=32/128（direct 路径
+6. **D=128 direct 的 BM 探索**：当前 BM=64/BN=16，可测 BM=32/128（direct 路径
    未做 BM 全扫描）
-6. **causal D=64 kv>8192 边界**：8192 时 int8 已优 5.5%，但 7168 附近未测，
+7. **causal D=64 kv>8192 边界**：8192 时 int8 已优 5.5%，但 7168 附近未测，
    阈值 6144 可能略保守
+8. **VAE 03/04（36864/55296）未实测**：因 iGPU 长时间运行死机已从 benchmark 注释；
+   优化结论由 16384/24576 外推（LDS PV 收益在更大序列应更显著）

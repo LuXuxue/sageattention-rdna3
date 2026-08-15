@@ -31,6 +31,7 @@ elif arch == "gfx1103":
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'waves_per_eu': 0}, num_warps=4, num_stages=2),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'waves_per_eu': 4}, num_warps=4, num_stages=1),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'waves_per_eu': 2}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'waves_per_eu': 0}, num_warps=4, num_stages=1),
     ]
     fp16_configs = [
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 16, 'waves_per_eu': 0}, num_warps=4, num_stages=1),

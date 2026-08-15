@@ -119,7 +119,9 @@ set SAGEATTN_BACKEND=native   # HIP native WMMA kernel
 | `SAGEATTN_BACKEND` | 后端选择（native/triton） | triton |
 | `SAGEATTN_INT8_32` | int8 self 用每 warp 32 行 kernel（0 关闭回退 8 warps） | 1（启用） |
 | `SAGEATTN_INT8_WPE` | int8 实验：launch wrapper waves_per_eu（1/2/4） | 1 |
-| `SAGEATTN_INT8_BN128` | D=128 int8 的 BN 覆盖（0 默认 64, 16/32） | 0（=64） |
+| `SAGEATTN_INT8_BN128` | D=128 int8 的 BN 覆盖（0 默认 64, 16/32/128） | 0（=64） |
+| `SAGEATTN_INT8_BM128` | D=128 int8 强制 BM=128/8 warps（1 启用; 实测 BM=64 更优, 默认禁用） | 0（=64） |
+| `SAGEATTN_QUANT_GPB` | quant 多 group 合并实验（1/2/4/8; 实测无改善） | 1 |
 | `SAGEATTN_FP16_BM` / `SAGEATTN_FP16_BN` | fp16 direct 实验配置覆盖 | 0 / 0 |
 | `SAGEATTN_BF16_BM` / `SAGEATTN_BF16_BN` | bf16 direct 实验配置覆盖 | 0 / 0 |
 | `SAGEATTN_BM_SEL` | direct kernel 的 BM 强制覆盖（0 默认, 1=32, 2=128, 3=64） | 0 |
