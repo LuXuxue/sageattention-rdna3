@@ -383,10 +383,40 @@ D=128                -> (BM=64, BN=16)    (BN=16 实测最优; BN=32/64 均更�
 | quant 多 group 合并（GPB=2/4/8 串行循环） | 无改善 → quant 瓶颈非 block 调度/DRAM 行切换 |
 | triton PV_ACCUM fp16（VAE） | 无收益（ROCm triton 未受益） |
 | triton BLOCK_M=128/64×8 warps（VAE） | autotune 未选中（BM=64/BN=32 更优） |
+| **fp8e5m2 V_T 存储 + fp16 WMMA（FeatherOps 思路, 2026-08, 见八之附）** | **整体无提升**（13 用例仅 1 个快 7%，多数慢 0-24%） |
 
 **规律**：指令级微优化全部失败；有效的优化是**结构性**的（V_T 消除 LDS 列读、
 32 行共享 k_frag 提升 ILP、LDS 缓存省全局重读、bf16 融合省 kernel、差异化分发省辅助、
 **V_T tile LDS 缓存消除 PV 冗余全局读**）。
+
+---
+
+## 八之附、fp8e5m2 存储方案实验总结（2026-08, ComfyUI-FeatherOps 思路移植）
+
+**动机**：`ComfyUI-FeatherOps` 用 fp8e5m2 存 matmul 的 B 矩阵（LDS/全局），加载时
+2 条 V_PERM_B32 快速 upcast 到 fp16（两者指数 bias 相同），省加载带宽/LDS 占用。
+在 Strix Halo 上 fp16@fp8e5m2 matmul 达 43 TFLOPS vs Tensile fp16 36 TFLOPS（+20%）。
+
+**移植方案**（详细实验过程见仓库 `fp8e5m2存储优化实验记录.md`）：
+- V_T 以 fp8e5m2 存（v_transpose 融合量化, per-token scale），PV 的 v_frag 读 16B +
+  perm upcast，P 列乘 scale（数学等价 out=(P·scale)@V_fp8）。direct 与 int8 路径共用。
+- 正确性：fp8 路径 cos≈0.998（pytest 28/36 过, 8 个失败为 mae 0.36-0.51 超 0.35 阈值,
+  2bit 尾数固有误差）；fp16 路径零破坏（36/36 过）。
+- 性能（同进程轮转, 13 用例）：仅 SDXL10（direct self 1536）快 6.7%；VAE 慢 24%、
+  Anima02 慢 32%、Anima01 慢 13%、短 kv cross 慢 8-19%。
+
+**失败根因**（与 FeatherOps matmul 的本质差异）：
+- FeatherOps 收益前提是**长 K-loop**（K=4096），加载指令占 K-loop 比例大；
+  attention 的 QK/PV 的 **K 维只有 head_dim（64/128）**，WMMA 计算主导，
+  v_frag 加载（32B→16B）占比小。
+- fp8 引入的 perm upcast（8 条/v16h）+ P×scale（8 float mul）+ 额外 v_scale kernel
+  （读 V 全量）无法被省下的加载带宽覆盖。
+- LDS 中转路径（int8 D=128/VAE）更差：V_T tile 每迭代从 L2 读（2MB L2 覆盖，
+  带宽本不稀缺），perm 是纯开销 → +13~24%。
+- 唯一正收益用例的 L2 稀缺带宽场景收益不稳定（同形状 2304 反而慢 4.6%）。
+
+**状态**：**代码已回退**（性能无改善，按项目决策仅保留文档记录；完整实验过程见
+`fp8e5m2存储优化实验记录.md`，实验脚本与数据均可复现）。
 
 ---
 
