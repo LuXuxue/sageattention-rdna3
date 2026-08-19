@@ -112,13 +112,17 @@ def sageattn(
 
     # direct/int8 分发: 本质是"省 quant+mean 辅助(固定 0.4-0.6ms)" vs "i8 WMMA 2x 吞吐(与计算量成正比)"的权衡
     # 计算量小(causal/cross 短 q)时 direct 胜; 计算量大(self 长序列)时 int8 胜。阈值扫描见 bench_threshold*.py:
-    #   D=64 self 非 causal: kv=3072 direct 优1%, 3456 int8 优1.2%       -> 3072
-    #   D=64 causal:          kv=4096/6144 direct 优8%/2.7%, 8192 int8 优5.5% -> 6144
+    #   D=64 self 非 causal: NHD kv=2560 direct 优0.4%, 3072 int8 优3.8% -> 3072;
+    #                        HND 平衡点降至 2048 (布局影响 stride/缓存, int8 更有利) -> 2048
+    #   D=64 causal:          kv=3072/4096 direct 优5%/2%, 6144 持平, 8192 int8 优5.5% -> 6144
     #   D=64 cross (q<kv):    q=3072/kv=4096 仍 direct 优3%              -> 6144
     #   D=128 self/causal:    kv=2048 direct 优5%, 2560 int8 优5%        -> 2048
     #   D=128 cross q<<kv:    q=512/1024 vs kv=4096 direct 优25%/8%, q=2048(=kv/2) int8 优5% -> q<kv/2 且 kv<=4096
     if headdim == 64:
-        thr_d64 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64", "3072") or 3072)
+        # HND 布局 D=64 self 的 int8 平衡点降至 ~2048 (HND 扫描: 2048 direct 优3.7%,
+        # 2304 int8 优0.4%), NHD (benchmark/实际应用) 保持 3072; env 可覆盖
+        d64_default = 2048 if tensor_layout == "HND" else 3072
+        thr_d64 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64", str(d64_default)) or d64_default)
         if is_causal:
             use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64_CAUSAL", "6144") or 6144))
         elif q_len < kv_len_actual:
@@ -176,7 +180,10 @@ def sageattn(
         v_for_attn = v_t
         o_int8 = o
 
-        smooth_k = kwargs.get("smooth_k", True)
+        # 默认 smooth_k=False (跳过 mean kernel): 实测 randn 下精度不降反升 (减 mean
+        # 反而引入 mean 值自身的 fp16/bf16 舍入误差), 端到端省 0.5-3.5% (见 try.md §9.3);
+        # 仅在 K 有明显非零 DC 偏置时减 mean 才有价值, 此时可显式传 smooth_k=True。
+        smooth_k = kwargs.get("smooth_k", False)
         if smooth_k:
             k_mean = ops.mean_seq(k, layout_code)
         else:

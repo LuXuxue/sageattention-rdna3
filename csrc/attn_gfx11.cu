@@ -101,216 +101,222 @@ __global__ void mean_hnd_kernel(
     const int64_t in_stride_b,
     const int64_t in_stride_n,
     const int64_t in_stride_h) {
+    // v2: 32B 向量读 (16 half 连续 d 列), 消除原 2B 标量读 (实测原版仅 ~38GB/s,
+    // torch mean 40-71GB/s; 对齐 quant 的 32B 读粒度经验)
     constexpr int TileD = 16;
-    __shared__ float partial_sum[256];
+    constexpr int Threads = 256;
+    __shared__ float partial_sum[16][256];
 
     const int tid = threadIdx.x;
-    const int d_local = tid & (TileD - 1);
-    const int s_lane = tid >> 4;
     const int64_t d_base = static_cast<int64_t>(blockIdx.x) * TileD;
     const int64_t h = blockIdx.y;
     const int64_t b = blockIdx.z;
-    const int64_t d = d_base + d_local;
+    if (d_base + TileD > head_dim) return;
 
-    float local_sum = 0.0f;
-    if (d < head_dim) {
-        for (int64_t s = s_lane; s < seq_len; s += 16) {
-            const int64_t offset = b * in_stride_b + s * in_stride_n + h * in_stride_h + d;
-            local_sum += to_float(input[offset]);
-        }
+    // 每 thread 每迭代读行 s 的 16 个连续 half (32B, 对齐: d_base 为 16 倍数), 
+    // 累加进 16 个列累加器; s 按 256 threads 步进
+    float acc[16];
+#pragma unroll
+    for (int c = 0; c < 16; ++c) acc[c] = 0.0f;
+    for (int64_t s = tid; s < seq_len; s += Threads) {
+        const int64_t offset = b * in_stride_b + s * in_stride_n + h * in_stride_h + d_base;
+        const uint4* p4 = reinterpret_cast<const uint4*>(input + offset);
+        const T* v = reinterpret_cast<const T*>(p4);
+#pragma unroll
+        for (int c = 0; c < 16; ++c) acc[c] += to_float(v[c]);
     }
-    partial_sum[tid] = local_sum;
+#pragma unroll
+    for (int c = 0; c < 16; ++c) partial_sum[c][tid] = acc[c];
     __syncthreads();
-
     if (tid < TileD) {
         float sum = 0.0f;
-        for (int i = 0; i < 16; ++i) {
-            sum += partial_sum[i * TileD + tid];
-        }
+#pragma unroll
+        for (int i = 0; i < Threads; ++i) sum += partial_sum[tid][i];
         const int64_t mean_d = d_base + tid;
-        if (mean_d < head_dim) {
-            const float value = sum / static_cast<float>(seq_len);
-            if constexpr (std::is_same<T, __half>::value) {
-                mean_out[(b * heads + h) * head_dim + mean_d] = from_float_f16(value);
-            } else if constexpr (std::is_same<T, __hip_bfloat16>::value) {
-                mean_out[(b * heads + h) * head_dim + mean_d] = from_float_bf16(value);
-            } else {
-                mean_out[(b * heads + h) * head_dim + mean_d] = value;
-            }
+        const float value = sum / static_cast<float>(seq_len);
+        if constexpr (std::is_same<T, __half>::value) {
+            mean_out[(b * heads + h) * head_dim + mean_d] = from_float_f16(value);
+        } else if constexpr (std::is_same<T, __hip_bfloat16>::value) {
+            mean_out[(b * heads + h) * head_dim + mean_d] = from_float_bf16(value);
+        } else {
+            mean_out[(b * heads + h) * head_dim + mean_d] = value;
         }
     }
 }
 
-template <typename T, int HeadDim>
+template <typename T, int HeadDim, int BLK, int MIN_BLK>
 __global__ void quant_qk_int8_hnd_kernel(
-    const T* __restrict__ query,
-    const T* __restrict__ key,
+    const T* __restrict__ input,
+    int8_t* __restrict__ output,
     const T* __restrict__ key_mean,
-    int8_t* __restrict__ query_out,
-    int8_t* __restrict__ key_out,
-    float* __restrict__ query_scale,
-    float* __restrict__ key_scale,
+    float* __restrict__ scale_out,
     const int64_t batch,
-    const int64_t q_heads,
-    const int64_t kv_heads,
-    const int64_t q_len,
-    const int64_t kv_len,
-    const int q_groups,
-    const int k_groups,
+    const int64_t heads,
+    const int64_t seq_len,
+    const int scale_groups,
+    const int is_q,
     const float sm_scale_log2e,
-    const int64_t q_in_stride_b,
-    const int64_t q_in_stride_n,
-    const int64_t q_in_stride_h,
-    const int64_t k_in_stride_b,
-    const int64_t k_in_stride_n,
-    const int64_t k_in_stride_h,
+    const int64_t in_stride_b,
+    const int64_t in_stride_n,
+    const int64_t in_stride_h,
     const int groups_per_block) {
     constexpr int Threads = 256;
-    __shared__ float shared_amax;
-    // pass1 读入的原始数据缓存在 LDS (Q 32行=512 uint4=8KB, K 16行=256), pass2 从 LDS 读,
-    // 省掉 pass2 的全局重读 (DRAM/L2 流量减半)
-    __shared__ uint4 shared_data[512];
+    // 大 block (BLK 行) + MIN_BLK 粒度 scale: block 处理 BLK 行, 每 MIN_BLK 行一组
+    // 独立 amax (RATIO 组), 用 RATIO 个 fmax 累加器 ILP —— 避免大 block 的串行 fmax 链
+    // (报告 §八: MIN_BLK 调大触发 fmax 串行依赖链 +37-45%; 此处 MIN_BLK 不变, 只放大
+    // 每 block 的吞吐/减少 block 调度开销, 对齐 triton 的 BLK=128 大 block quant)
+    constexpr int RATIO = BLK / MIN_BLK;
+    constexpr int PackElems = 8;
+    // pass1 读入的原始数据缓存在 LDS (Q 128 行 D=128 = 32KB, K 64 行 = 16KB), pass2 从 LDS 读
+    __shared__ float shared_amax[RATIO];
+    __shared__ uint4 shared_data[(BLK * HeadDim) / 8];
 
     const int head = blockIdx.y;
     const int b = blockIdx.z;
-    const int tid = threadIdx.x;
-    // 多 group 合并: 每 block 顺序处理 groups_per_block 个连续 group (行连续 ->
-    // DRAM 行切换/block 调度开销减少), 保持每 thread 少量 packs (fmax 依赖链不变)
-    for (int gi = 0; gi < groups_per_block; ++gi) {
-    const int group = blockIdx.x * groups_per_block + gi;
-    if (group >= q_groups + k_groups) break;
-    const bool is_q = group < q_groups;
-    const int local_group = is_q ? group : group - q_groups;
-    const int rows_per_group = is_q ? MIN_BLK_Q : MIN_BLK_K;
-    const int64_t seq_len = is_q ? q_len : kv_len;
-    const int64_t base_row = static_cast<int64_t>(local_group) * rows_per_group;
-    const int active_heads = is_q ? static_cast<int>(q_heads) : static_cast<int>(kv_heads);
-    if (b >= batch || head >= active_heads) return;
-    if (base_row >= seq_len) continue;
-
-    const T* in = is_q ? query : key;
-    int8_t* out = is_q ? query_out : key_out;
-    float* scale_out = is_q ? query_scale : key_scale;
-    const int64_t heads = is_q ? q_heads : kv_heads;
-    const int scale_groups = is_q ? q_groups : k_groups;
-    const int64_t in_stride_b = is_q ? q_in_stride_b : k_in_stride_b;
-    const int64_t in_stride_n = is_q ? q_in_stride_n : k_in_stride_n;
-    const int64_t in_stride_h = is_q ? q_in_stride_h : k_in_stride_h;
-    constexpr int PackElems = 8;
-    const int packs = (rows_per_group * HeadDim) / PackElems;
-
-    const float pass1_scale = is_q ? sm_scale_log2e : 1.0f;
-    float local_amax = 1e-7f;
+    if (b >= batch || head >= heads) return;
+    const int total_blocks = static_cast<int>((seq_len + BLK - 1) / BLK);
     // 每 thread 一次读 32B (2 个连续 pack): 读粒度 16B->32B, 与带宽上限对齐
-    // (实测 16B/thread 读仅 20GB/s, torch 大向量读 75GB/s; 32B 显著改善 DRAM/L1 效率)
-    for (int p = tid; p < packs / 2; p += Threads) {
-        const int pack = p * 2;
-        const int elem_base = pack * PackElems;
-        const int row = elem_base / HeadDim;
-        const int d = elem_base - row * HeadDim;
-        const int64_t seq = base_row + row;
-        if (seq < seq_len) {
-            const int64_t in_off = static_cast<int64_t>(b) * in_stride_b + seq * in_stride_n + head * in_stride_h + d;
-            const uint4 raw0 = *reinterpret_cast<const uint4*>(in + in_off);
-            const uint4 raw1 = *reinterpret_cast<const uint4*>(in + in_off + 8);
-            shared_data[pack] = raw0;
-            shared_data[pack + 1] = raw1;
-            const T* v0 = reinterpret_cast<const T*>(&raw0);
-            const T* v1 = reinterpret_cast<const T*>(&raw1);
-#pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                float v = to_float(v0[i]);
-                if (!is_q && key_mean != nullptr) {
-                    v -= to_float(key_mean[(b * heads + head) * HeadDim + d + i]);
-                }
-                local_amax = fmaxf(local_amax, fabsf(v * pass1_scale));
-            }
-#pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                float v = to_float(v1[i]);
-                if (!is_q && key_mean != nullptr) {
-                    v -= to_float(key_mean[(b * heads + head) * HeadDim + d + 8 + i]);
-                }
-                local_amax = fmaxf(local_amax, fabsf(v * pass1_scale));
-            }
-        } else {
-            shared_data[pack] = make_uint4(0, 0, 0, 0);
-            shared_data[pack + 1] = make_uint4(0, 0, 0, 0);
-        }
-    }
-    const float block_amax = vllm::blockReduceMax(local_amax);
-    if (tid == 0) {
-        shared_amax = block_amax;
-        scale_out[(static_cast<int64_t>(b) * active_heads + head) * scale_groups + local_group] =
-            shared_amax / 127.0f;
-    }
-    __syncthreads();
-    const float inv_scale = 127.0f / shared_amax;
+    const float pass1_scale = is_q ? sm_scale_log2e : 1.0f;
+    const float extra_scale = is_q ? sm_scale_log2e : 1.0f;
 
-    for (int p = tid; p < packs / 2; p += Threads) {
-        const int pack = p * 2;
-        const int elem_base = pack * PackElems;
-        const int row = elem_base / HeadDim;
-        const int d = elem_base - row * HeadDim;
-        const int64_t seq = base_row + row;
-        if (seq < seq_len) {
-            const int64_t out_off = (static_cast<int64_t>(b) * active_heads + head) * seq_len * HeadDim + seq * HeadDim + d;
-            const uint4 raw0 = shared_data[pack];      // pass1 缓存在 LDS, 省全局重读
-            const uint4 raw1 = shared_data[pack + 1];
-            const T* values = reinterpret_cast<const T*>(&raw0);
-            const T* values1 = reinterpret_cast<const T*>(&raw1);
-            char4 out0, out1, out2, out3;
-            float v0 = to_float(values[0]), v1 = to_float(values[1]);
-            float v2 = to_float(values[2]), v3 = to_float(values[3]);
-            float v4 = to_float(values[4]), v5 = to_float(values[5]);
-            float v6 = to_float(values[6]), v7 = to_float(values[7]);
-            float w0 = to_float(values1[0]), w1 = to_float(values1[1]);
-            float w2 = to_float(values1[2]), w3 = to_float(values1[3]);
-            float w4 = to_float(values1[4]), w5 = to_float(values1[5]);
-            float w6 = to_float(values1[6]), w7 = to_float(values1[7]);
-            if (!is_q && key_mean != nullptr) {
-                const int64_t mean_base = (b * heads + head) * HeadDim + d;
-                v0 -= to_float(key_mean[mean_base + 0]);
-                v1 -= to_float(key_mean[mean_base + 1]);
-                v2 -= to_float(key_mean[mean_base + 2]);
-                v3 -= to_float(key_mean[mean_base + 3]);
-                v4 -= to_float(key_mean[mean_base + 4]);
-                v5 -= to_float(key_mean[mean_base + 5]);
-                v6 -= to_float(key_mean[mean_base + 6]);
-                v7 -= to_float(key_mean[mean_base + 7]);
-                w0 -= to_float(key_mean[mean_base + 8]);
-                w1 -= to_float(key_mean[mean_base + 9]);
-                w2 -= to_float(key_mean[mean_base + 10]);
-                w3 -= to_float(key_mean[mean_base + 11]);
-                w4 -= to_float(key_mean[mean_base + 12]);
-                w5 -= to_float(key_mean[mean_base + 13]);
-                w6 -= to_float(key_mean[mean_base + 14]);
-                w7 -= to_float(key_mean[mean_base + 15]);
+    for (int gi = 0; gi < groups_per_block; ++gi) {
+        const int blk = blockIdx.x * groups_per_block + gi;
+        if (blk >= total_blocks) break;
+        const int64_t base_row = static_cast<int64_t>(blk) * BLK;
+        const int tid = threadIdx.x;
+        constexpr int Packs = (BLK * HeadDim) / 8;
+
+        // ---- pass1: 读全局 (32B/thread) -> shared_data + 分组 amax (RATIO 累加器 ILP) ----
+        float local_amax[RATIO];
+#pragma unroll
+        for (int r = 0; r < RATIO; ++r) local_amax[r] = 1e-7f;
+        for (int p = tid; p < Packs / 2; p += Threads) {
+            const int pack = p * 2;
+            const int elem_base = pack * PackElems;
+            const int row = elem_base / HeadDim;
+            const int d = elem_base - row * HeadDim;
+            const int64_t seq = base_row + row;
+            if (seq < seq_len) {
+                const int64_t in_off = static_cast<int64_t>(b) * in_stride_b + seq * in_stride_n + head * in_stride_h + d;
+                const uint4 raw0 = *reinterpret_cast<const uint4*>(input + in_off);
+                const uint4 raw1 = *reinterpret_cast<const uint4*>(input + in_off + 8);
+                shared_data[pack] = raw0;
+                shared_data[pack + 1] = raw1;
+                const int r = row / MIN_BLK;
+                const T* v0 = reinterpret_cast<const T*>(&raw0);
+                const T* v1 = reinterpret_cast<const T*>(&raw1);
+                float am = local_amax[r];
+                if (!is_q && key_mean != nullptr) {
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        float v = to_float(v0[i]) - to_float(key_mean[(b * heads + head) * HeadDim + d + i]);
+                        am = fmaxf(am, fabsf(v * pass1_scale));
+                    }
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        float v = to_float(v1[i]) - to_float(key_mean[(b * heads + head) * HeadDim + d + 8 + i]);
+                        am = fmaxf(am, fabsf(v * pass1_scale));
+                    }
+                } else {
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        float v = to_float(v0[i]);
+                        am = fmaxf(am, fabsf(v * pass1_scale));
+                    }
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        float v = to_float(v1[i]);
+                        am = fmaxf(am, fabsf(v * pass1_scale));
+                    }
+                }
+                local_amax[r] = am;
+            } else {
+                shared_data[pack] = make_uint4(0, 0, 0, 0);
+                shared_data[pack + 1] = make_uint4(0, 0, 0, 0);
             }
-            const float extra_scale = is_q ? sm_scale_log2e : 1.0f;
-            out0.x = float_to_int8(v0 * inv_scale * extra_scale);
-            out0.y = float_to_int8(v1 * inv_scale * extra_scale);
-            out0.z = float_to_int8(v2 * inv_scale * extra_scale);
-            out0.w = float_to_int8(v3 * inv_scale * extra_scale);
-            out1.x = float_to_int8(v4 * inv_scale * extra_scale);
-            out1.y = float_to_int8(v5 * inv_scale * extra_scale);
-            out1.z = float_to_int8(v6 * inv_scale * extra_scale);
-            out1.w = float_to_int8(v7 * inv_scale * extra_scale);
-            out2.x = float_to_int8(w0 * inv_scale * extra_scale);
-            out2.y = float_to_int8(w1 * inv_scale * extra_scale);
-            out2.z = float_to_int8(w2 * inv_scale * extra_scale);
-            out2.w = float_to_int8(w3 * inv_scale * extra_scale);
-            out3.x = float_to_int8(w4 * inv_scale * extra_scale);
-            out3.y = float_to_int8(w5 * inv_scale * extra_scale);
-            out3.z = float_to_int8(w6 * inv_scale * extra_scale);
-            out3.w = float_to_int8(w7 * inv_scale * extra_scale);
-            *reinterpret_cast<char4*>(out + out_off) = out0;
-            *reinterpret_cast<char4*>(out + out_off + 4) = out1;
-            *reinterpret_cast<char4*>(out + out_off + 8) = out2;
-            *reinterpret_cast<char4*>(out + out_off + 12) = out3;
         }
-    }
-    __syncthreads();  // 防下轮 group 的 pass1 覆盖 shared_data (上轮 pass2 未读完)
+        // 归约 RATIO 个 amax (blockReduceMax 内部有 barrier, 尾部子块写 scale 需守卫防越界)
+        for (int r = 0; r < RATIO; ++r) {
+            const float block_amax = vllm::blockReduceMax(local_amax[r]);
+            if (tid == 0) {
+                shared_amax[r] = block_amax;
+                if (base_row + static_cast<int64_t>(r) * MIN_BLK < seq_len) {
+                    scale_out[(static_cast<int64_t>(b) * heads + head) * scale_groups + blk * RATIO + r] =
+                        block_amax / 127.0f;
+                }
+            }
+        }
+        __syncthreads();
+        float inv_scale[RATIO];
+#pragma unroll
+        for (int r = 0; r < RATIO; ++r) inv_scale[r] = 127.0f / shared_amax[r];
+
+        // ---- pass2: 从 LDS 读 -> 量化 (按子块 r 选 scale) -> 写回 ----
+        for (int p = tid; p < Packs / 2; p += Threads) {
+            const int pack = p * 2;
+            const int elem_base = pack * PackElems;
+            const int row = elem_base / HeadDim;
+            const int d = elem_base - row * HeadDim;
+            const int64_t seq = base_row + row;
+            if (seq < seq_len) {
+                const int r = row / MIN_BLK;
+                const int64_t out_off = (static_cast<int64_t>(b) * heads + head) * seq_len * HeadDim + seq * HeadDim + d;
+                const uint4 raw0 = shared_data[pack];      // pass1 缓存在 LDS, 省全局重读
+                const uint4 raw1 = shared_data[pack + 1];
+                const T* values = reinterpret_cast<const T*>(&raw0);
+                const T* values1 = reinterpret_cast<const T*>(&raw1);
+                char4 out0, out1, out2, out3;
+                float v0 = to_float(values[0]), v1 = to_float(values[1]);
+                float v2 = to_float(values[2]), v3 = to_float(values[3]);
+                float v4 = to_float(values[4]), v5 = to_float(values[5]);
+                float v6 = to_float(values[6]), v7 = to_float(values[7]);
+                float w0 = to_float(values1[0]), w1 = to_float(values1[1]);
+                float w2 = to_float(values1[2]), w3 = to_float(values1[3]);
+                float w4 = to_float(values1[4]), w5 = to_float(values1[5]);
+                float w6 = to_float(values1[6]), w7 = to_float(values1[7]);
+                if (!is_q && key_mean != nullptr) {
+                    const int64_t mean_base = (b * heads + head) * HeadDim + d;
+                    v0 -= to_float(key_mean[mean_base + 0]);
+                    v1 -= to_float(key_mean[mean_base + 1]);
+                    v2 -= to_float(key_mean[mean_base + 2]);
+                    v3 -= to_float(key_mean[mean_base + 3]);
+                    v4 -= to_float(key_mean[mean_base + 4]);
+                    v5 -= to_float(key_mean[mean_base + 5]);
+                    v6 -= to_float(key_mean[mean_base + 6]);
+                    v7 -= to_float(key_mean[mean_base + 7]);
+                    w0 -= to_float(key_mean[mean_base + 8]);
+                    w1 -= to_float(key_mean[mean_base + 9]);
+                    w2 -= to_float(key_mean[mean_base + 10]);
+                    w3 -= to_float(key_mean[mean_base + 11]);
+                    w4 -= to_float(key_mean[mean_base + 12]);
+                    w5 -= to_float(key_mean[mean_base + 13]);
+                    w6 -= to_float(key_mean[mean_base + 14]);
+                    w7 -= to_float(key_mean[mean_base + 15]);
+                }
+                const float iscale = inv_scale[r] * extra_scale;
+                out0.x = float_to_int8(v0 * iscale);
+                out0.y = float_to_int8(v1 * iscale);
+                out0.z = float_to_int8(v2 * iscale);
+                out0.w = float_to_int8(v3 * iscale);
+                out1.x = float_to_int8(v4 * iscale);
+                out1.y = float_to_int8(v5 * iscale);
+                out1.z = float_to_int8(v6 * iscale);
+                out1.w = float_to_int8(v7 * iscale);
+                out2.x = float_to_int8(w0 * iscale);
+                out2.y = float_to_int8(w1 * iscale);
+                out2.z = float_to_int8(w2 * iscale);
+                out2.w = float_to_int8(w3 * iscale);
+                out3.x = float_to_int8(w4 * iscale);
+                out3.y = float_to_int8(w5 * iscale);
+                out3.z = float_to_int8(w6 * iscale);
+                out3.w = float_to_int8(w7 * iscale);
+                *reinterpret_cast<char4*>(output + out_off) = out0;
+                *reinterpret_cast<char4*>(output + out_off + 4) = out1;
+                *reinterpret_cast<char4*>(output + out_off + 8) = out2;
+                *reinterpret_cast<char4*>(output + out_off + 12) = out3;
+            }
+        }
+        __syncthreads();  // 防下轮 blk 的 pass1 覆盖 shared_data (上轮 pass2 未读完)
     }
 }
 
@@ -1494,7 +1500,9 @@ __device__ __forceinline__ void direct_attn_kernel_impl_t(
     constexpr int VStride = HeadDim + LDS_PAD;
 
     __shared__ QK_DTYPE k_tile[BLOCK_N * KStride];
-    // VT_GLOBAL=1 时 V 直接从全局 V_T 行读, LDS v_tile 完全不用 (见 impl_t 注释)
+    // VT_GLOBAL=1 时 V 直接从全局 V_T 行读 (LDS v_tile 缓存经实测为负优化:
+    // D=64 短序列 kv-tile 少, 原 PV 冗余读多命中 L2, V 拷贝+barrier 是纯开销,
+    // SDXL10 +24% 慢; 与 VAE (D=128 超长, L2 带宽饱和) 相反)
     __shared__ __half v_tile[(SAGEATTN_VT_GLOBAL) ? 1 : (BLOCK_N * VStride)];
 
     const int tid = threadIdx.x;
@@ -1619,6 +1627,7 @@ __device__ __forceinline__ void direct_attn_kernel_impl_t(
                     }
                 }
             }
+    if (!SAGEATTN_VT_GLOBAL) {
 #pragma unroll
             for (int i = 0; i < VPrefetchPerThread; ++i) {
                 const int vec = tid + i * THREADS;
@@ -1636,6 +1645,7 @@ __device__ __forceinline__ void direct_attn_kernel_impl_t(
                     }
                 }
             }
+    }
         }
 
         float score_cache[ColTiles][8];
@@ -1752,6 +1762,7 @@ __device__ __forceinline__ void direct_attn_kernel_impl_t(
                     *reinterpret_cast<uint4*>(&k_tile[n * KStride + d]) = k_prefetch[i];
                 }
             }
+    if (!SAGEATTN_VT_GLOBAL) {
             for (int i = 0; i < VPrefetchPerThread; ++i) {
                 const int vec = tid + i * THREADS;
                 if (vec < VVecsTotal) {
@@ -1769,6 +1780,7 @@ __device__ __forceinline__ void direct_attn_kernel_impl_t(
                     }
                 }
             }
+    }
             __syncthreads();
         }
     }
@@ -1890,8 +1902,19 @@ Tensor v_transpose_gfx11(Tensor value, Tensor value_t, int64_t tensor_layout) {
     const int64_t dtiles = (head_dim + 31) / 32;
     const int64_t total_tiles = batch * heads * ntiles * dtiles;
     dim3 block(256);
-    // grid 钳制: kernel 用 grid-stride loop, grid 小无害; 避免极端 batch*heads*kv 时 1D grid 溢出 int32
-    const int64_t grid_cap = (int64_t{1} << 20);
+    // grid 分派: 小数据量 (total_tiles <= 4096) 用 grid=192 (每 block 多 tile),
+    // 实测 SDXL10 (1920 tiles) v_transpose 0.237→0.147ms (-38%, 固定开销占比大);
+    // 大数据量保持每 block 1 tile (Anima01 8192 tiles grid 减小反而 +5-10%, barrier
+    // 串行 + L2 局部性损失)。SAGEATTN_VT_GRID: 0=auto, N=强制固定 grid
+    int64_t grid_cap;
+    const char* vt_grid_env = getenv("SAGEATTN_VT_GRID");
+    if (vt_grid_env && atoi(vt_grid_env) > 0) {
+        grid_cap = atoi(vt_grid_env);
+    } else if (total_tiles <= 4096) {
+        grid_cap = 192;
+    } else {
+        grid_cap = total_tiles;
+    }
     dim3 grid(static_cast<unsigned>(std::min(total_tiles, grid_cap)));
     if (value.scalar_type() == ScalarType::BFloat16) {
         v_transpose_kernel<__hip_bfloat16><<<grid, block, 0, stream>>>(
@@ -1980,65 +2003,66 @@ std::vector<Tensor> quant_qk_int8_gfx11(
     const int64_t k_sh = (tensor_layout == kHND) ? key.stride(1) : key.stride(2);
 
     dim3 block(256);
-    // quant 多 group 合并: 每 block 顺序处理 q_gpb 个连续 group (实验选项, 实测对
-    // 带宽无改善, 默认 1 保持原逻辑). SAGEATTN_QUANT_GPB=1/2/4/8
+    // 大 block quant (对齐 triton BLK): 每 block 处理 BLK 行, 每 MIN_BLK 行一组
+    // 独立 scale (RATIO 组) + 多累加器 ILP —— MIN_BLK 粒度 (scale 语义) 不变
+    // 实测 (同进程 A/B): D=64 用 BLK_Q=128/BLK_K=64 最优 (SDXL07 -19%, SDXL13 -18%);
+    // D=128 旧逻辑已达 ~100GB/s (接近带宽上限), 大 block (128/64 或 64/32) 均 +1~3%
+    // (32KB LDS / 额外 blockReduce barrier), 故 D=128 保持旧逻辑 (BLK=MIN_BLK)
+    // SAGEATTN_QUANT_BLK: 1=auto (按 head_dim), 128=强制 128/64, 64=强制 64/32, 0=旧逻辑
+    const int blk_sel = getenv("SAGEATTN_QUANT_BLK") ? atoi(getenv("SAGEATTN_QUANT_BLK")) : 1;
+    constexpr int BLK_Q64 = 128;
+    constexpr int BLK_K64 = 64;
+    constexpr int BLK_Q128 = 64;
+    constexpr int BLK_K128 = 32;
+    int blk_q, blk_k;
+    if (blk_sel == 128) { blk_q = BLK_Q64; blk_k = BLK_K64; }
+    else if (blk_sel == 64) { blk_q = BLK_Q128; blk_k = BLK_K128; }
+    else if (blk_sel == 0) { blk_q = MIN_BLK_Q; blk_k = MIN_BLK_K; }
+    else if (head_dim == 64) { blk_q = BLK_Q64; blk_k = BLK_K64; }
+    else { blk_q = MIN_BLK_Q; blk_k = MIN_BLK_K; }
+    const int q_blocks = (q_len + blk_q - 1) / blk_q;
+    const int k_blocks = (kv_len + blk_k - 1) / blk_k;
+    // 多 group 合并: 每 block 顺序处理 groups_per_block 个连续大 block (实验选项, 默认 1)
     int q_gpb = getenv("SAGEATTN_QUANT_GPB") ? atoi(getenv("SAGEATTN_QUANT_GPB")) : 1;
     if (q_gpb < 1) q_gpb = 1;
-    dim3 grid((q_groups + k_groups + q_gpb - 1) / q_gpb, max(q_heads, kv_heads), batch);
+    dim3 grid_q((q_blocks + q_gpb - 1) / q_gpb, q_heads, batch);
+    dim3 grid_k((k_blocks + q_gpb - 1) / q_gpb, kv_heads, batch);
+
+    // 模板参数须为编译期常量: 按 blk_q/blk_k 分派
+    #define LAUNCH_QUANT(HD, T, BQ, BK) \
+        do { \
+            quant_qk_int8_hnd_kernel<T, HD, BQ, MIN_BLK_Q><<<grid_q, block, 0, stream>>>( \
+                reinterpret_cast<const T*>(query.data_ptr()), \
+                reinterpret_cast<int8_t*>(q_int8.data_ptr()), \
+                nullptr, \
+                reinterpret_cast<float*>(q_scale.data_ptr()), \
+                batch, q_heads, q_len, q_groups, 1, sm_scale_log2e, \
+                q_sb, q_sn, q_sh, q_gpb); \
+            quant_qk_int8_hnd_kernel<T, HD, BK, MIN_BLK_K><<<grid_k, block, 0, stream>>>( \
+                reinterpret_cast<const T*>(key.data_ptr()), \
+                reinterpret_cast<int8_t*>(k_int8.data_ptr()), \
+                has_mean ? reinterpret_cast<const T*>(key_mean.data_ptr()) : nullptr, \
+                reinterpret_cast<float*>(k_scale.data_ptr()), \
+                batch, kv_heads, kv_len, k_groups, 0, 1.0f, \
+                k_sb, k_sn, k_sh, q_gpb); \
+        } while(0)
+
+    #define LAUNCH_QUANT_DISPATCH(HD, T) \
+        do { \
+            if (blk_q == BLK_Q64) { LAUNCH_QUANT(HD, T, 128, 64); } \
+            else if (blk_q == BLK_Q128) { LAUNCH_QUANT(HD, T, 64, 32); } \
+            else { LAUNCH_QUANT(HD, T, MIN_BLK_Q, MIN_BLK_K); } \
+        } while(0)
 
     if (query.scalar_type() == ScalarType::Half) {
-        if (head_dim == 64) {
-            quant_qk_int8_hnd_kernel<__half, 64><<<grid, block, 0, stream>>>(
-                reinterpret_cast<const __half*>(query.data_ptr()),
-                reinterpret_cast<const __half*>(key.data_ptr()),
-                has_mean ? reinterpret_cast<const __half*>(key_mean.data_ptr()) : nullptr,
-                reinterpret_cast<int8_t*>(q_int8.data_ptr()),
-                reinterpret_cast<int8_t*>(k_int8.data_ptr()),
-                reinterpret_cast<float*>(q_scale.data_ptr()),
-                reinterpret_cast<float*>(k_scale.data_ptr()),
-                batch, q_heads, kv_heads, q_len, kv_len,
-                q_groups, k_groups, sm_scale_log2e,
-                q_sb, q_sn, q_sh, k_sb, k_sn, k_sh, q_gpb);
-        } else {
-            quant_qk_int8_hnd_kernel<__half, 128><<<grid, block, 0, stream>>>(
-                reinterpret_cast<const __half*>(query.data_ptr()),
-                reinterpret_cast<const __half*>(key.data_ptr()),
-                has_mean ? reinterpret_cast<const __half*>(key_mean.data_ptr()) : nullptr,
-                reinterpret_cast<int8_t*>(q_int8.data_ptr()),
-                reinterpret_cast<int8_t*>(k_int8.data_ptr()),
-                reinterpret_cast<float*>(q_scale.data_ptr()),
-                reinterpret_cast<float*>(k_scale.data_ptr()),
-                batch, q_heads, kv_heads, q_len, kv_len,
-                q_groups, k_groups, sm_scale_log2e,
-                q_sb, q_sn, q_sh, k_sb, k_sn, k_sh, q_gpb);
-        }
+        if (head_dim == 64) { LAUNCH_QUANT_DISPATCH(64, __half); }
+        else { LAUNCH_QUANT_DISPATCH(128, __half); }
     } else {
-        if (head_dim == 64) {
-            quant_qk_int8_hnd_kernel<__hip_bfloat16, 64><<<grid, block, 0, stream>>>(
-                reinterpret_cast<const __hip_bfloat16*>(query.data_ptr()),
-                reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
-                has_mean ? reinterpret_cast<const __hip_bfloat16*>(key_mean.data_ptr()) : nullptr,
-                reinterpret_cast<int8_t*>(q_int8.data_ptr()),
-                reinterpret_cast<int8_t*>(k_int8.data_ptr()),
-                reinterpret_cast<float*>(q_scale.data_ptr()),
-                reinterpret_cast<float*>(k_scale.data_ptr()),
-                batch, q_heads, kv_heads, q_len, kv_len,
-                q_groups, k_groups, sm_scale_log2e,
-                q_sb, q_sn, q_sh, k_sb, k_sn, k_sh, q_gpb);
-        } else {
-            quant_qk_int8_hnd_kernel<__hip_bfloat16, 128><<<grid, block, 0, stream>>>(
-                reinterpret_cast<const __hip_bfloat16*>(query.data_ptr()),
-                reinterpret_cast<const __hip_bfloat16*>(key.data_ptr()),
-                has_mean ? reinterpret_cast<const __hip_bfloat16*>(key_mean.data_ptr()) : nullptr,
-                reinterpret_cast<int8_t*>(q_int8.data_ptr()),
-                reinterpret_cast<int8_t*>(k_int8.data_ptr()),
-                reinterpret_cast<float*>(q_scale.data_ptr()),
-                reinterpret_cast<float*>(k_scale.data_ptr()),
-                batch, q_heads, kv_heads, q_len, kv_len,
-                q_groups, k_groups, sm_scale_log2e,
-                q_sb, q_sn, q_sh, k_sb, k_sn, k_sh, q_gpb);
-        }
+        if (head_dim == 64) { LAUNCH_QUANT_DISPATCH(64, __hip_bfloat16); }
+        else { LAUNCH_QUANT_DISPATCH(128, __hip_bfloat16); }
     }
+    #undef LAUNCH_QUANT_DISPATCH
+    #undef LAUNCH_QUANT
     return {q_int8, q_scale, k_int8, k_scale};
 }
 
