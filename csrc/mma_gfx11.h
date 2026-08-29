@@ -71,6 +71,7 @@ __device__ __forceinline__ v16h load_fp16_col_frag(
     return r;
 }
 
+#if defined(__GFX11__)
 __device__ __forceinline__ v8i wmma_i32_iu8(int32_t_v4 a, int32_t_v4 b, v8i c) {
     return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, false);
 }
@@ -82,6 +83,23 @@ __device__ __forceinline__ v8f wmma_f32_bf16(v16bf a, v16bf b, v8f c) {
 __device__ __forceinline__ v8f wmma_f32_f16(v16h a, v16h b, v8f c) {
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
 }
+#else
+// gfx10 (RDNA2) 无 WMMA 张量核: fallback 返回零值。
+// WMMA kernel 在 gfx10 不会运行 (host 运行时 is_gfx10 选择 gfx10 独立 kernel),
+// 这里仅需可编译 + 提供 host stub, 运行逻辑无关紧要。
+__device__ __forceinline__ v8i wmma_i32_iu8(int32_t_v4, int32_t_v4, v8i c) {
+    v8i r = {};
+    return r;
+}
+__device__ __forceinline__ v8f wmma_f32_bf16(v16bf, v16bf, v8f c) {
+    v8f r = {};
+    return r;
+}
+__device__ __forceinline__ v8f wmma_f32_f16(v16h, v16h, v8f c) {
+    v8f r = {};
+    return r;
+}
+#endif  // __GFX11__
 
 // ===== 转置布局 (Triton 风格) helpers =====
 // 转置 QK: qk^T = k @ q^T (WMMA operand 交换)。输出布局:

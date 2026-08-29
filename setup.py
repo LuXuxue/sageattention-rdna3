@@ -131,15 +131,23 @@ def _get_msvc_lib_dirs():
     return [d for d in dirs if os.path.isdir(d)]
 
 
-def get_target_arch():
-    """Get target gfx11 architecture."""
-    arch_env = os.getenv("GPU_ARCHS") or os.getenv("PYTORCH_ROCM_ARCH")
-    if arch_env:
-        for arch in arch_env.replace(";", " ").replace(",", " ").split():
+def get_target_archs():
+    """Get target AMD GPU architectures.
+
+    Supports gfx1103 (RDNA3, WMMA) and gfx1035 (RDNA2, MFMA/V_DOT4) so a single
+    built wheel can run on both. Select via env GPU_ARCHS / PYTORCH_ROCM_ARCH
+    (e.g. "gfx1035;gfx1103"), else defaults to both installed device wheels.
+    """
+    env_archs = os.getenv("GPU_ARCHS") or os.getenv("PYTORCH_ROCM_ARCH")
+    if env_archs:
+        out = []
+        for arch in env_archs.replace(";", " ").replace(",", " ").split():
             arch = arch.strip().split(":", 1)[0]
-            if arch.startswith("gfx11"):
-                return arch
-    return "gfx1103"
+            if arch:
+                out.append(arch)
+        if out:
+            return out
+    return ["gfx1103", "gfx1035"]
 
 
 if not SKIP_BUILD:
@@ -153,16 +161,14 @@ if not SKIP_BUILD:
     if torch.version.hip is not None:
         rocm_home = configure_rocm(ROCM_HOME)
         cpp_extension.ROCM_HOME = rocm_home
-        target_arch = get_target_arch()
-        print(f"Target AMD GPU architecture: {target_arch}")
+        target_archs = get_target_archs()
+        print(f"Target AMD GPU architectures: {target_archs}")
 
-        if not target_arch.startswith("gfx11"):
+        if not any(a.startswith("gfx11") for a in target_archs):
             warnings.warn(
-                f"Target architecture {target_arch} is not gfx11xx. "
-                "This extension is designed for RDNA3 (gfx11xx)."
+                f"Target architectures {target_archs} contain no gfx11xx. "
+                "The extension also supports gfx10xx (RDNA2, MFMA/V_DOT4)."
             )
-
-        if os.name == "nt":
             CXX_FLAGS = [
                 "/O2",
                 "/std:c++17",
@@ -199,13 +205,23 @@ if not SKIP_BUILD:
             "-amdgpu-max-memory-clause=32",
             "-mllvm",
             "-amdgpu-vgpr-index-mode=1",
-            f"--offload-arch={target_arch}",
             f"--rocm-path={rocm_home}",
             # V 全局转置 PV 方案 (out = P @ V, V_T [B,H,D,N] 行读 B operand):
             # 消除 v_frag 的 128 次 u16 LDS 列读, 大幅提升 PV 效率
             # (配合 core.py 的 V 转置; 若需旧路径, 改为 -DSAGEATTN_VT_GLOBAL=0 并关 core 转置)
             "-DSAGEATTN_VT_GLOBAL=1",
         ] + LIMITED_API_FLAGS
+
+        # Emit device code for each target arch. gfx1035 (RDNA2) uses V_DOT4_I32_I8
+        # for the int8 QK and V_DOT2_F32_F16 for the fp16 PV — both are SIMD dot
+        # instructions that need NO extra target feature (gfx1035 enables them by
+        # default; verified by probe). Do NOT pass "+mai-insts" here: it is only
+        # needed for MFMA (unavailable on RDNA2 consumer gfx1035 per gfx1035.md
+        # §0.12) and it is a global clang flag that, when combined in the same
+        # multi-arch hipcc invocation, also reaches gfx1103 and crashes the LLVM
+        # AMDGPU backend during WMMA codegen (Branch relaxation pass segfault).
+        for arch in target_archs:
+            HIP_FLAGS.append(f"--offload-arch={arch}")
 
         rocm_device_lib_path = os.path.join(
             rocm_home, "lib", "llvm", "amdgcn", "bitcode"

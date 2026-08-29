@@ -48,6 +48,10 @@ constexpr int MIN_BLK_K = 16;
 
 constexpr int LDS_PAD = 16;
 
+// gfx10 (RDNA2) 独立实现: kernel 依赖上方 MIN_BLK_Q/MIN_BLK_K/kLog2e 常量,
+// 故在此处 (常量定义之后) include。mma_gfx10.h 自带 #pragma once。
+#include "mma_gfx10.h"
+
 Tensor new_empty_like(const Tensor& like, std::initializer_list<int64_t> sizes, ScalarType dtype) {
     return torch::stable::new_empty(like, std::vector<int64_t>(sizes), std::make_optional(dtype));
 }
@@ -2071,6 +2075,86 @@ Tensor qk_int8_sv_bf16_attn_gfx11_t(
     Tensor q_scale, Tensor k_scale,
     int64_t tensor_layout, int64_t is_causal, double sm_scale) {
 
+    // ---- gfx10 (RDNA2) 分支: 运行时检测设备 gfxMajor, 走独立 kernel (无 MFMA/WMMA).
+    //      gfx1035 用 V_DOT4 int8 QK + 标量 fp16 PV (per-lane-row)。
+    //      gfx11 走下方原有 WMMA 路径 (零改动)。
+    {
+        int dev = query.get_device_index();
+        hipDeviceProp_t prop;
+        hipGetDeviceProperties(&prop, dev);
+        const bool is_gfx10 = (prop.major == 10);
+        if (is_gfx10) {
+            // q_int8/k_int8 are ALWAYS laid out as [B, H, S, D] (quant writes HND-style
+            // regardless of the input tensor_layout), so the int8 tensors always use
+            // HND-style sizes/strides. V_T is [B,H,D,N] always. Output follows input layout.
+            const int64_t batch = query.size(0);
+            const int64_t q_heads = query.size(1);
+            const int64_t kv_heads = key.size(1);
+            const int64_t qo_len = query.size(2);
+            const int64_t kv_len = key.size(2);
+            const int64_t head_dim = query.size(3);
+            const int64_t q_stride_b = query.stride(0);
+            const int64_t q_stride_n = query.stride(2);   // seq stride (HND int8 tensor)
+            const int64_t q_stride_h = query.stride(1);   // head stride
+            const int64_t k_stride_b = key.stride(0);
+            const int64_t k_stride_n = key.stride(2);
+            const int64_t k_stride_h = key.stride(1);
+            // value is V_T [B,H,D,N] (always, regardless of input layout) -- n-dim contiguous.
+            const int64_t v_stride_b = value.stride(0);
+            const int64_t v_stride_n = value.stride(1);   // H stride
+            const int64_t v_stride_h = value.stride(2);   // D stride
+            const int64_t o_stride_b = output.stride(0);
+            const int64_t o_stride_n = (tensor_layout == kHND) ? output.stride(2) : output.stride(1);
+            const int64_t o_stride_h = (tensor_layout == kHND) ? output.stride(1) : output.stride(2);
+            const int64_t qs_stride_b = q_scale.stride(0), qs_stride_h = q_scale.stride(1);
+            const int64_t ks_stride_b = k_scale.stride(0), ks_stride_h = k_scale.stride(1);
+            const hipStream_t stream = current_hip_stream(query);
+
+            // V_T 恒 fp16 (v_transpose 已转), VDT 恒 __half。ODT 由 output dtype 决定。
+            const bool out_bf = (output.scalar_type() == ScalarType::BFloat16);
+            #define L10(HD, C, BN, ODT) \
+                do { \
+                    dim3 b10(128); \
+                    dim3 g10((qo_len + 31) / 32, q_heads, batch); \
+                    sageattn_gfx10::attn_kernel_gfx10_i8_t<HD, C, BN, ODT><<<g10, b10, 0, stream>>>( \
+                        reinterpret_cast<const int8_t*>(query.data_ptr()), \
+                        reinterpret_cast<const int8_t*>(key.data_ptr()), \
+                        reinterpret_cast<const __half*>(value.data_ptr()), \
+                        reinterpret_cast<ODT*>(output.data_ptr()), \
+                        reinterpret_cast<const float*>(q_scale.data_ptr()), \
+                        reinterpret_cast<const float*>(k_scale.data_ptr()), \
+                        batch, qo_len, kv_len, q_heads, kv_heads, \
+                        q_stride_b, q_stride_n, q_stride_h, \
+                        k_stride_b, k_stride_n, k_stride_h, \
+                        v_stride_b, v_stride_n, v_stride_h, \
+                        o_stride_b, o_stride_n, o_stride_h, \
+                        qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
+                        static_cast<int>(tensor_layout)); \
+                } while (0)
+            if (head_dim == 64) {
+                const int bn = (qo_len == kv_len) ? ((kv_len <= 77) ? 16 : 32) : 32;
+                if (bn == 16) {
+                    if (is_causal) { if (out_bf) L10(64, true, 16, __hip_bfloat16); else L10(64, true, 16, __half); }
+                    else { if (out_bf) L10(64, false, 16, __hip_bfloat16); else L10(64, false, 16, __half); }
+                } else {
+                    if (is_causal) { if (out_bf) L10(64, true, 32, __hip_bfloat16); else L10(64, true, 32, __half); }
+                    else { if (out_bf) L10(64, false, 32, __hip_bfloat16); else L10(64, false, 32, __half); }
+                }
+            } else {
+                const int bn = (kv_len <= 77) ? 16 : 32;
+                if (bn == 16) {
+                    if (is_causal) { if (out_bf) L10(128, true, 16, __hip_bfloat16); else L10(128, true, 16, __half); }
+                    else { if (out_bf) L10(128, false, 16, __hip_bfloat16); else L10(128, false, 16, __half); }
+                } else {
+                    if (is_causal) { if (out_bf) L10(128, true, 32, __hip_bfloat16); else L10(128, true, 32, __half); }
+                    else { if (out_bf) L10(128, false, 32, __hip_bfloat16); else L10(128, false, 32, __half); }
+                }
+            }
+            #undef L10
+            return output;
+        }
+    }
+
     const int64_t batch = query.size(0);
     const int64_t q_heads = query.size(1);
     const int64_t kv_heads = key.size(1);
@@ -2275,6 +2359,58 @@ Tensor qk_int8_sv_bf16_attn_gfx11_t(
 Tensor fp16_attn_gfx11_t(
     Tensor query, Tensor key, Tensor value, Tensor output,
     int64_t tensor_layout, int64_t is_causal, double sm_scale, int64_t bm_sel) {
+    // ---- gfx10 (RDNA2) branch: no WMMA, use the SIMD V_DOT2 direct kernel ----
+    {
+        int dev = query.get_device_index();
+        hipDeviceProp_t prop;
+        hipGetDeviceProperties(&prop, dev);
+        if (prop.major == 10) {
+            const int64_t batch = query.size(0);
+            const int64_t q_heads = (tensor_layout == kHND) ? query.size(1) : query.size(2);
+            const int64_t kv_heads = (tensor_layout == kHND) ? key.size(1) : key.size(2);
+            const int64_t qo_len = (tensor_layout == kHND) ? query.size(2) : query.size(1);
+            const int64_t kv_len = (tensor_layout == kHND) ? key.size(2) : key.size(1);
+            const int64_t head_dim = query.size(3);
+            const int64_t q_stride_b = query.stride(0);
+            const int64_t q_stride_n = (tensor_layout == kHND) ? query.stride(2) : query.stride(1);
+            const int64_t q_stride_h = (tensor_layout == kHND) ? query.stride(1) : query.stride(2);
+            const int64_t k_stride_b = key.stride(0);
+            const int64_t k_stride_n = (tensor_layout == kHND) ? key.stride(2) : key.stride(1);
+            const int64_t k_stride_h = (tensor_layout == kHND) ? key.stride(1) : key.stride(2);
+            const int64_t v_stride_b = value.stride(0);
+            const int64_t v_stride_n = value.stride(1);
+            const int64_t v_stride_h = value.stride(2);
+            const int64_t o_stride_b = output.stride(0);
+            const int64_t o_stride_n = (tensor_layout == kHND) ? output.stride(2) : output.stride(1);
+            const int64_t o_stride_h = (tensor_layout == kHND) ? output.stride(1) : output.stride(2);
+            const float sm_scale_log2e = static_cast<float>(sm_scale) * kLog2e;
+            const hipStream_t stream = current_hip_stream(query);
+            #define LD(HD, C, BN, QDT, ODT) \
+                do { \
+                    dim3 bd(128); dim3 gd((qo_len + 31) / 32, q_heads, batch); \
+                    sageattn_gfx10::attn_kernel_gfx10_direct_t<HD, C, BN, QDT, ODT><<<gd, bd, 0, stream>>>( \
+                        reinterpret_cast<const QDT*>(query.data_ptr()), \
+                        reinterpret_cast<const QDT*>(key.data_ptr()), \
+                        reinterpret_cast<const __half*>(value.data_ptr()), \
+                        reinterpret_cast<ODT*>(output.data_ptr()), \
+                        batch, qo_len, kv_len, q_heads, kv_heads, \
+                        q_stride_b, q_stride_n, q_stride_h, \
+                        k_stride_b, k_stride_n, k_stride_h, \
+                        v_stride_b, v_stride_n, v_stride_h, \
+                        o_stride_b, o_stride_n, o_stride_h, \
+                        sm_scale_log2e, static_cast<int>(tensor_layout)); \
+                } while (0)
+            if (head_dim == 64) {
+                if (is_causal) LD(64, true, 32, __half, __half);
+                else LD(64, false, 32, __half, __half);
+            } else {
+                if (is_causal) LD(128, true, 32, __half, __half);
+                else LD(128, false, 32, __half, __half);
+            }
+            #undef LD
+            return output;
+        }
+    }
 
     const int64_t batch = query.size(0);
     const int64_t q_heads = (tensor_layout == kHND) ? query.size(1) : query.size(2);
@@ -2376,6 +2512,58 @@ Tensor fp16_attn_gfx11_t(
 Tensor bf16_attn_gfx11_t(
     Tensor query, Tensor key, Tensor value, Tensor output,
     int64_t tensor_layout, int64_t is_causal, double sm_scale, int64_t bm_sel) {
+    // ---- gfx10 (RDNA2) branch: no WMMA, use the SIMD V_DOT2 direct kernel ----
+    {
+        int dev = query.get_device_index();
+        hipDeviceProp_t prop;
+        hipGetDeviceProperties(&prop, dev);
+        if (prop.major == 10) {
+            const int64_t batch = query.size(0);
+            const int64_t q_heads = (tensor_layout == kHND) ? query.size(1) : query.size(2);
+            const int64_t kv_heads = (tensor_layout == kHND) ? key.size(1) : key.size(2);
+            const int64_t qo_len = (tensor_layout == kHND) ? query.size(2) : query.size(1);
+            const int64_t kv_len = (tensor_layout == kHND) ? key.size(2) : key.size(1);
+            const int64_t head_dim = query.size(3);
+            const int64_t q_stride_b = query.stride(0);
+            const int64_t q_stride_n = (tensor_layout == kHND) ? query.stride(2) : query.stride(1);
+            const int64_t q_stride_h = (tensor_layout == kHND) ? query.stride(1) : query.stride(2);
+            const int64_t k_stride_b = key.stride(0);
+            const int64_t k_stride_n = (tensor_layout == kHND) ? key.stride(2) : key.stride(1);
+            const int64_t k_stride_h = (tensor_layout == kHND) ? key.stride(1) : key.stride(2);
+            const int64_t v_stride_b = value.stride(0);
+            const int64_t v_stride_n = value.stride(1);
+            const int64_t v_stride_h = value.stride(2);
+            const int64_t o_stride_b = output.stride(0);
+            const int64_t o_stride_n = (tensor_layout == kHND) ? output.stride(2) : output.stride(1);
+            const int64_t o_stride_h = (tensor_layout == kHND) ? output.stride(1) : output.stride(2);
+            const float sm_scale_log2e = static_cast<float>(sm_scale) * kLog2e;
+            const hipStream_t stream = current_hip_stream(query);
+            #define LDB(HD, C, BN, QDT, ODT) \
+                do { \
+                    dim3 bd(128); dim3 gd((qo_len + 31) / 32, q_heads, batch); \
+                    sageattn_gfx10::attn_kernel_gfx10_direct_t<HD, C, BN, QDT, ODT><<<gd, bd, 0, stream>>>( \
+                        reinterpret_cast<const QDT*>(query.data_ptr()), \
+                        reinterpret_cast<const QDT*>(key.data_ptr()), \
+                        reinterpret_cast<const __half*>(value.data_ptr()), \
+                        reinterpret_cast<ODT*>(output.data_ptr()), \
+                        batch, qo_len, kv_len, q_heads, kv_heads, \
+                        q_stride_b, q_stride_n, q_stride_h, \
+                        k_stride_b, k_stride_n, k_stride_h, \
+                        v_stride_b, v_stride_n, v_stride_h, \
+                        o_stride_b, o_stride_n, o_stride_h, \
+                        sm_scale_log2e, static_cast<int>(tensor_layout)); \
+                } while (0)
+            if (head_dim == 64) {
+                if (is_causal) LDB(64, true, 32, __hip_bfloat16, __hip_bfloat16);
+                else LDB(64, false, 32, __hip_bfloat16, __hip_bfloat16);
+            } else {
+                if (is_causal) LDB(128, true, 32, __hip_bfloat16, __hip_bfloat16);
+                else LDB(128, false, 32, __hip_bfloat16, __hip_bfloat16);
+            }
+            #undef LDB
+            return output;
+        }
+    }
 
     const int64_t batch = query.size(0);
     const int64_t q_heads = (tensor_layout == kHND) ? query.size(1) : query.size(2);
