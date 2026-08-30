@@ -1228,6 +1228,23 @@ __device__ __forceinline__ int warp_reduce_sdot4(int partial) {
     return partial;
 }
 
+// 32-lane full warp reduction (for designs where each lane holds 1 row of QUADS_PER_LANE int32 chunks
+// and the whole warp cooperates on a QK reduction).
+__device__ __forceinline__ int warp_reduce_full_sdot4(int partial) {
+    int other;
+    other = __shfl_xor_sync(0xFFFFFFFFFFFFFFFFULL, partial, 16);
+    partial += other;
+    other = __shfl_xor_sync(0xFFFFFFFFFFFFFFFFULL, partial, 8);
+    partial += other;
+    other = __shfl_xor_sync(0xFFFFFFFFFFFFFFFFULL, partial, 4);
+    partial += other;
+    other = __shfl_xor_sync(0xFFFFFFFFFFFFFFFFULL, partial, 2);
+    partial += other;
+    other = __shfl_xor_sync(0xFFFFFFFFFFFFFFFFULL, partial, 1);
+    partial += other;
+    return partial;
+}
+
 __device__ __forceinline__ float warp_reduce_fadd(float partial) {
     int other;
     other = __shfl_xor_sync(0xFFFFFFFFFFFFFFFFULL, __float_as_int(partial), 8);
@@ -1257,55 +1274,40 @@ __global__ void attn_kernel_gfx10_i8_v3_t(
     int64_t ks_stride_b, int64_t ks_stride_h,
     int tensor_layout) {
 #if defined(__GFX10__)
-    constexpr int BM = 128;           // v3.2: 4 warps × 32 rows (2 rows per half-warp)
-    constexpr int NW = 1;
-    constexpr int CL = HD / 16;      // 16 lanes share PV acc, each lane holds CL=HD/16 cols
-                                    // D=64: 4 cols/lane, D=128: 8 cols/lane
-    constexpr int NTHREAD = 128;     // 4 warps
-    constexpr int ROWS_PER_HALF = 16;  // 16 lanes per half-warp
-    constexpr int ROWS_PER_WARP = 32;  // 2 rows per warp (one per half-warp)
-    constexpr int QUADS = HD / 4;     // int8 dwords per row
-    constexpr int QUADS_PER_LANE = QUADS / 16;  // D=64: 1, D=128: 2
-    static_assert(QUADS_PER_LANE * 16 == QUADS, "QUADS must be multiple of 16");
-    static_assert(NTHREAD == 128, "v3 expects 128 threads (4 warps)");
+    // v3 simplified: identical to v1 (NW=4, BM=32) but parameterised on BN=16
+    // to match triton config. The original v3.2 design with 16-lane cooperative
+    // QK/PV was buggy (NaN/Garbage); this is a safe fallback that should match
+    // v1 numerically up to small reorderings.
+    constexpr int QUADS = HD / 4;
+    constexpr int BM = 32;
+    constexpr int NW = 4;
+    constexpr int CL = HD / NW;
+    constexpr int NTHREAD = BM * NW;
 
     const int tid = threadIdx.x;
-    const int lane = tid & 31;
-    const int warp = tid >> 5;
-    // 2 rows per warp: half_warp 0 (lane 0..15) owns row 0..15, half_warp 1 (lane 16..31) owns row 16..31
-    const int half_warp = lane >> 4;       // 0 or 1
-    const int lane_in_half = lane & 15;    // 0..15 within half-warp
-    const int row = warp * ROWS_PER_WARP + half_warp * ROWS_PER_HALF + lane_in_half;
+    const int row = tid >> 2;
+    const int ct = tid & 3;
     const int64_t m = blockIdx.x * BM + row;
     const int64_t b = blockIdx.z;
     const int64_t h = blockIdx.y;
     const int64_t kvh = h / (q_heads / kv_heads);
     const bool valid = (m < qo_len);
 
-    // ---- LDS tiles ----
-    // K tile: [BN][HD] for K reads in QK
+    __shared__ int8_t q_tile[BM * HD];
     __shared__ int8_t k_tile[BN * HD];
-    // V tile: [HD][BN] (transposed, d-major like v2)
     __shared__ __half v_tile[HD * BN];
-    // QK scores: each row in this block writes 1 score per j (after reduce)
     __shared__ float s_tile[BM * BN];
-    // Softmax probs (per row, per j)
     __shared__ __half p_tile[BM * BN];
 
-    // ---- v3.2: 1 warp = 2 rows, 16 lanes per row, all 32 lanes work ----
-    // Lane 0..15 own row 0 (within warp), lane 16..31 own row 1
-    // Each half-warp's 16 lanes do D-dim reduction for its row's QK
-    // 16 lanes cooperate on PV too (each lane holds CL=HD/16 cols)
-    int q_reg[QUADS_PER_LANE];
     {
         const int64_t qb = b * q_stride_b + h * q_stride_h;
-        const int8_t* qrow = q + qb + m * q_stride_n;
-        #pragma unroll
-        for (int i = 0; i < QUADS_PER_LANE; ++i) {
-            int d_chunk = lane_in_half * QUADS_PER_LANE + i;
-            q_reg[i] = valid
-                ? *reinterpret_cast<const int*>(&qrow[d_chunk * 4])
-                : 0;
+        #pragma unroll 1
+        for (int i = tid; i < BM * QUADS; i += NTHREAD) {
+            int r = i / QUADS, cq = i % QUADS;
+            int64_t gr = blockIdx.x * BM + r;
+            const int8_t* qrow = q + qb + gr * q_stride_n;
+            reinterpret_cast<int*>(&q_tile[r * HD + cq * 4])[0] =
+                (gr < qo_len) ? load_i8_quad(qrow + cq * 4) : 0;
         }
     }
 
@@ -1313,32 +1315,23 @@ __global__ void attn_kernel_gfx10_i8_v3_t(
         ? q_scale[b * qs_stride_b + h * qs_stride_h + static_cast<int>(m / MIN_BLK_Q)]
         : 0.0f;
 
-    // PV accumulators: each lane holds 1 row × CL cols (lane 0..15 of half-warp)
     float acc[CL];
     #pragma unroll
     for (int c = 0; c < CL; ++c) acc[c] = 0.0f;
     float row_m = -3.0e38f, row_l = 0.0f;
 
     for (int64_t kb = 0; kb < kv_len; kb += BN) {
-        // stage k_tile (BN × HD int8) cooperatively
         {
             const int64_t kqb = b * k_stride_b + kvh * k_stride_h;
-            constexpr int K_CHUNKS = (BN * HD) / 4;
-            constexpr int CHUNKS_PER_THREAD = (K_CHUNKS + NTHREAD - 1) / NTHREAD;
             #pragma unroll 1
-            for (int it = 0; it < CHUNKS_PER_THREAD; ++it) {
-                int idx = tid + it * NTHREAD;
-                if (idx < K_CHUNKS) {
-                    int r = idx / QUADS;
-                    int cq = idx % QUADS;
-                    int64_t n = kb + r;
-                    const int8_t* krow = k + kqb + n * k_stride_n;
-                    *reinterpret_cast<int*>(&k_tile[r * HD + cq * 4]) =
-                        (n < kv_len) ? *reinterpret_cast<const int*>(krow + cq * 4) : 0;
-                }
+            for (int i = tid; i < BN * QUADS; i += NTHREAD) {
+                int r = i / QUADS, ck = i % QUADS;
+                int64_t n = kb + r;
+                const int8_t* krow = k + kqb + n * k_stride_n;
+                reinterpret_cast<int*>(&k_tile[r * HD + ck * 4])[0] =
+                    (n < kv_len) ? load_i8_quad(krow + ck * 4) : 0;
             }
         }
-        // stage v_tile [HD][BN] from V_T
         {
             const int64_t vbase = b * v_stride_b + kvh * v_stride_n;
             const int64_t vsd = v_stride_h;
@@ -1352,85 +1345,62 @@ __global__ void attn_kernel_gfx10_i8_v3_t(
         }
         __syncthreads();
 
-        // ---- QK: 16 lanes (0..15) collaborate on 1 QK value ----
-        if (valid) {
-            // Process 4 j at a time to overlap LDS reads with sdot4 compute
-            #pragma unroll 4
-            for (int j = 0; j < BN; ++j) {
-                int partial = 0;
-                #pragma unroll
-                for (int i = 0; i < QUADS_PER_LANE; ++i) {
-                    int d_chunk = lane_in_half * QUADS_PER_LANE + i;
-                    int k_chunk = *reinterpret_cast<const int*>(&k_tile[j * HD + d_chunk * 4]);
-                    partial = sdot4_i32_i8(q_reg[i], k_chunk, partial);
-                }
-                partial = warp_reduce_sdot4(partial);
-                float sc = static_cast<float>(partial) * (qs *
-                    k_scale[b * ks_stride_b + kvh * ks_stride_h + static_cast<int>((kb + j) / MIN_BLK_K)]);
-                int64_t n = kb + j;
-                if (ISC && n > m) sc = -3.0e38f;
-                if (n >= kv_len) sc = -3.0e38f;
-                if (lane_in_half == 0) {
-                    s_tile[row * BN + j] = sc;
-                }
-            }
+        const float ks = k_scale[b * ks_stride_b + kvh * ks_stride_h + static_cast<int>(kb / MIN_BLK_K)];
+        const int out_base_col = ct * CL;
+        #pragma unroll 2
+        for (int j = ct; j < BN; j += NW) {
+            int s = 0;
+            #pragma unroll 8
+            for (int i = 0; i < QUADS; ++i)
+                s = sdot4_i32_i8(
+                    load_i8_quad(&q_tile[row * HD + i * 4]),
+                    load_i8_quad(&k_tile[j * HD + i * 4]), s);
+            int64_t n = kb + j;
+            float sc = static_cast<float>(s) * (qs * ks);
+            if ((!valid) || (ISC && n > m) || (n >= kv_len)) sc = -3.0e38f;
+            s_tile[row * BN + j] = sc;
         }
         __syncthreads();
 
-        // ---- softmax: all 16 lanes of half-warp do it (they all need row_m/row_l) ----
-        if (valid) {
-            float lm = -3.0e38f;
-            #pragma unroll 1
-            for (int j = 0; j < BN; ++j) lm = fmaxf(lm, s_tile[(warp * 2 + half_warp) * ROWS_PER_HALF * BN + j]);
-            float gm = fmaxf(row_m, lm);
-            float alpha = (row_l > 0.0f) ? exp2f(row_m - gm) : 0.0f;
-            row_m = gm; row_l *= alpha;
+        // ---- online softmax (per-row) ----
+        float lm = -3.0e38f;
+        #pragma unroll 1
+        for (int j = 0; j < BN; ++j) lm = fmaxf(lm, s_tile[row * BN + j]);
+        float gm = fmaxf(row_m, lm);
+        float alpha = (row_l > 0.0f) ? exp2f(row_m - gm) : 0.0f;
+        row_m = gm;
+        row_l *= alpha;
+        #pragma unroll
+        for (int c = 0; c < CL; ++c) acc[c] *= alpha;
+        float ps = 0.0f;
+        #pragma unroll 1
+        for (int j = 0; j < BN; ++j) {
+            float p = exp2f(s_tile[row * BN + j] - row_m);
+            p_tile[row * BN + j] = __float2half(p);
+            ps += p;
+        }
+        row_l += ps;
+
+        // ---- PV ----
+        #pragma unroll 2
+        for (int jj = 0; jj < BN; jj += 2) {
+            unsigned p2 = load_h2_quad(&p_tile[row * BN + jj]);
             #pragma unroll
-            for (int c = 0; c < CL; ++c) acc[c] *= alpha;
-            float ps = 0.0f;
-            #pragma unroll 1
-            for (int j = 0; j < BN; ++j) {
-                float p = exp2f(s_tile[(warp * 2 + half_warp) * ROWS_PER_HALF * BN + j] - row_m);
-                p_tile[(warp * 2 + half_warp) * ROWS_PER_HALF * BN + j] = __float2half(p);
-                ps += p;
-            }
-            row_l += ps;
-        }
-        __syncthreads();
-
-        // ---- PV: 16 lanes (0..15 of half-warp) cooperate on 1 row × CL cols ----
-        // Each lane holds CL cols of its own row, so each lane uses p_tile[row * BN + jj].
-        if (valid) {
-            const int col_base = lane_in_half * CL;
-            #pragma unroll 2
-            for (int jj = 0; jj < BN; jj += 2) {
-                unsigned p2 = load_h2_quad(&p_tile[row * BN + jj]);
-                #pragma unroll
-                for (int c_local = 0; c_local < CL; ++c_local) {
-                    int c = col_base + c_local;
-                    acc[c_local] = fdot2_f32_f16(p2, load_h2_quad(&v_tile[c * BN + jj]), acc[c_local]);
-                }
+            for (int c = 0; c < CL; ++c) {
+                int d = out_base_col + c;
+                acc[c] = fdot2_f32_f16(p2, load_h2_quad(&v_tile[d * BN + jj]), acc[c]);
             }
         }
         __syncthreads();
     }
 
-    // ---- write back: 16 lanes of half-warp collectively write 1 row × 64 cols ----
-    // The 16 lanes in a half-warp own 1 row (row 0 of half-warp = row of lane_in_half==0).
-    // Each lane has acc[CL=4] for 4 cols. They write to that shared row.
     if (valid) {
-        const float inv = 1.0f / row_l;
-        // owned row = row of lane_in_half==0 in this half-warp = (warp*2 + half_warp) * ROWS_PER_HALF
-        // Actually: lane 0..15 own rows 0..15 of warp, lane 16..31 own rows 16..31.
-        // The "owned row" for the half-warp is the first row in that half-warp.
-        const int64_t out_base = b * o_stride_b +
-            ((warp * 2 + half_warp) * ROWS_PER_HALF) * o_stride_n + h * o_stride_h;
-        const int col_base = lane_in_half * CL;
+        float inv = 1.0f / row_l;
+        int64_t base = b * o_stride_b + m * o_stride_n + h * o_stride_h;
+        const int out_base_col = ct * CL;
         #pragma unroll
-        for (int c_local = 0; c_local < CL; ++c_local) {
-            int c = col_base + c_local;
-            out[out_base + c] = gfx10_out_convert<ODT>(acc[c_local] * inv);
-        }
+        for (int c = 0; c < CL; ++c)
+            out[base + out_base_col + c] = gfx10_out_convert<ODT>(acc[c] * inv);
     }
 #endif
 }  // attn_kernel_gfx10_i8_v3_t

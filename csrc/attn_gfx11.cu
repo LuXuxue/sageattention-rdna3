@@ -2185,8 +2185,8 @@ Tensor qk_int8_sv_bf16_attn_gfx11_t(
             #define L10_V3(HD, C, BN, ODT) \
                 do { \
                     dim3 b10(128); \
-                    dim3 g10((qo_len + 127) / 128, q_heads, batch); \
-                    sageattn_gfx10::attn_kernel_gfx10_i8_v3_t<HD, C, BN, ODT><<<g10, b10, 0, stream>>>( \
+                    dim3 g10((qo_len + 63) / 64, q_heads, batch); \
+                    sageattn_gfx10::attn_kernel_gfx10_i8_v2_t<HD, C, BN, ODT><<<g10, b10, 0, stream>>>( \
                         reinterpret_cast<const int8_t*>(query.data_ptr()), \
                         reinterpret_cast<const int8_t*>(key.data_ptr()), \
                         reinterpret_cast<const __half*>(value.data_ptr()), \

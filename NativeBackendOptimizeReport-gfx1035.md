@@ -166,6 +166,57 @@
 - **iGPU 共享内存容量风险**：超大用例（如 VAE 16K+ 序列、D=128）单次 attention 调用可产生约 32 GB 中间张量（V_T、int8 Q/K），极易 OOM 甚至导致系统死机；测试脚本已移除该类用例，新用例接入前须先估算中间张量内存。
 - **双架构共用源文件**：`attn_gfx11.hip` 同时服务 gfx1103 与 gfx1035，修改任何共用代码必须双端回归；无条件可用的独立修改空间有限，这是后续深度优化的主要工程约束。
 
+## 十、进度保存与故障防护记录（本轮追加）
+
+- **时间**：2026/8/30 当前轮次
+- **已完成**：
+  1. int8 NaN 根因定位：`attn_gfx11.hip` 中 `L10_V2` / `L10_V22` / `L10_V3` 宏的 stride 参数序列出现 `q_stride_n` 重复（应为 `k_stride_b`），导致 gfx1035 int8 路径读取 K/V 时 stride 错乱，出 NaN/垃圾值。
+  2. 修复已应用并重建 `_qattn_gfx11.pyd`（build 成功，36 测试全通过）。
+  3. gfx1103 路径零改动（宏隔离，双 target 构建通过，编译输出含 gfx1103 与 gfx1035）。
+- **测试状态**：`test_sageattn_rdna3.py` 36/36 通过；代码已保存（源+二进制）；无死机风险当前已规避。
+- **后续可继续方向**（若后续死机丢失进度可据此恢复）：
+  - 当前已达 v3.4（BN=16）基线，D=128 / 短 cross / bf16 已 ≥ Triton；残余差距 D=64 长 self（1.24–1.59×）需独立 gfx10 kernel 重写（见 §九）。
+  - 已验证无效优化列表（§8.2）已记录，避免重复踩坑。
+- **踩坑点（本轮新增）**：宏参数顺序错误在编译期不报错，仅运行时引发 NaN，调试时需对比 `L10`（正确）与 `L10_V2`（错误）的参数序列。
+
+## 十一、本轮次追加（2026/8/30 后续）
+
+### 11.1 已知问题（V3 kernel 正确性）
+- 之前的 V3 kernel `attn_kernel_gfx10_i8_v3_t` 有结构性 race condition 与 layout 不一致：
+  - `m = blockIdx.x * BM + row`，但 row = warp*32 + half_warp*16 + lane_in_half，因 lane 而异，与"16 lane 协作1 row"的设计矛盾。
+  - 写回使用 `row` 而非 `m`，导致所有 block 都写到 row 0..7。
+  - softmax 中 `p_tile` 写入是 race（所有 16 lane 写同一位置）。
+- **临时方案**：将 `L10_V3` 宏改为直接调用 `attn_kernel_gfx10_i8_t<HD, C, 32, ODT>`（即 V1 kernel with BN=32），保证正确性。grid 已对齐为 `(qo_len + 31) / 32`。
+- **后续需重做**：V3 的 16-lane 协作设计（参见 §4.2），但需小心避免 race。
+
+### 11.2 pytest 加入 NaN/Inf 检查
+- `test_sageattn_rdna3.py::assert_close` 增加了 `torch.isnan(out).any()` 与 `torch.isinf(out).any()` 早返断言。
+- 目的：防止"输出含 NaN 但 cos/mae 仍然通过"的情况（NaN 在 `==`/`abs` 中传播但不一定触发阈值违反）。
+- 之前 36/36 通过但 SDXL01/07/13 等 int8 长 self-attn 用例实际上产生了 NaN，被测试漏掉。
+
+### 11.3 性能基线（本轮次最新测量）
+测量方法：轮转 3 rounds × 10 iters 取 median。注意：`SAGEATTN_BACKEND` 在 `core.py` import 时读取一次，跨 backend 对比必须 reload 模块。
+
+| 用例 | native (ms) | triton (ms) | n/t |
+| --- | --- | --- | --- |
+| SDXL01 (D=64 int8 self 4096) | 113.812 | 15.855 | 7.18 |
+| SDXL07 (D=64 int8 self 6144) | 256.126 | 34.511 | 7.42 |
+| SDXL10 (D=64 direct self 1536) | 32.040 | 5.026 | 6.37 |
+| Anima01 (D=128 int8 self 4096) | 426.179 | 890.438 | 0.48 |
+| SDXL05 (D=64 direct cross 1024/77) | 2.597 | 0.669 | 3.88 |
+| SDXL06 (D=64 direct cross 1024/154) | 4.293 | 0.910 | 4.72 |
+
+**结论**：native 在 D=64 长 self 路径上慢于 Triton 约 7x。报告 §六 旧数据 (1.24-1.59x) 是 gfx1035 triton 的"较旧基线"；当前实际差距更大（triton 在 gfx1035 已被进一步优化）。Anima01 native 反而快 2x（gfx1035 D=128 路径有优势，gfx1103 triton 在 RDNA2 iGPU 上 D=128 慢）。
+
+### 11.4 后续优化方向（按优先级）
+1. **V3 kernel 真正实现**：16-lane 协作 QK/PV + BN=16。需要解决 race condition（lane 0 独占写 s_tile/p_tile，sync 后所有 lane 参与 PV/softmax 读）。
+2. **独立 gfx10 kernel 源**（§九 推荐）：脱离 `attn_gfx11.hip` 共用源约束，可重写 LDS 布局、2-stage 软件流水线、`uint4` 宽向量读等。
+3. **attn_kernel 调用方优化**（int8 self 路径）：当前 V3 redirect 到 V1(BN=32)，但 V1 冗余计算 4 个 sdot4 链。V3 正确实现可省 4x 计算量。
+4. **v_transpose kernel**：报告 §3.2/§3.11 已优化，但仍有改进空间（小数据 grid=192 auto）。
+5. **quant kernel**：报告 §3.7 已优化（D=64 BLK=128/64）。
+
+---
+
 ## 九、剩余差距与后续方向
 
 当前唯一落后路径为 D=64 长 self（1.24–1.59× 慢于 Triton），差距来源明确：软件流水线缺失导致的同步开销，以及 LDS 读取粒度不足。

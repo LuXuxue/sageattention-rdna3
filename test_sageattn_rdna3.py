@@ -41,7 +41,14 @@ def assert_close(out, ref, dtype):
 
     - fp16: 直接路径 (kv 短) 误差极小; int8 路径 (kv 长) 有量化误差
     - bf16: 精度本身较低, 阈值放宽
+    - NaN/Inf 检查：assert_close 本身不强制要求 finite，但包装器会检查
     """
+    # NaN/Inf 早期检测：kernel bug 可能产生 NaN 而不违反 cos/mae 阈值（NaN 在比较中被忽略）
+    has_nan = torch.isnan(out).any().item()
+    has_inf = torch.isinf(out).any().item()
+    assert not has_nan, f"Output contains NaN values — kernel likely produced garbage (NaN passes cos/mae comparisons)."
+    assert not has_inf, f"Output contains Inf values — kernel likely overflowed."
+
     cos = cosine_similarity(out, ref)
     mae = max_abs_error(out, ref)
     if dtype == torch.bfloat16:
