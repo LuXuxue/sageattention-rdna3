@@ -2237,9 +2237,13 @@ Tensor qk_int8_sv_bf16_attn_gfx11_t(
                     }
                 }
             } else {
-                // D=128: V2 + BN=32 显著优于 V3 + BN=16 (D=128 V3 kernel 在 RDNA2 上
-                // LDS 占用翻倍 → occupancy 崩溃, 详见 §11.5 演进); V3 仅在 SAGEATTN_GFX10_V3=1 强制时使用
-                const bool use_v3_d128 = (v3_mode == 1);
+                // D=128 int8 精度修复 (gfx1035):
+                //   V2 (BN=32) 在 kv_len>2048 时存在 online-softmax 精度损失 (Anima01/03/05,
+                //   AnimaVAE01 等 BF16 D128 int8 长序列 MaxErr 0.2+, cos<0.98)。
+                //   V3 (BN=16) 在 kv_len>=2304 时精确 (mae~0.003, 与 triton 同精度)。
+                //   因此 kv_len>2048 默认走 V3 (BN=16), 否则走 V2 (BN=32)。
+                //   SAGEATTN_GFX10_V3 可覆盖: 1=强制 V3, 0=强制关闭 V3 (回到旧 V2 路径)。
+                const bool use_v3_d128 = (v3_mode == 1) || (v3_mode != 0 && kv_len > 2048);
                 const int bn = (kv_len <= 77) ? 16 : 32;
                 if (use_v3_d128) {
                     if (is_causal) { if (out_bf) L10_V3(128, true, 16, __hip_bfloat16); else L10_V3(128, true, 16, __half); }

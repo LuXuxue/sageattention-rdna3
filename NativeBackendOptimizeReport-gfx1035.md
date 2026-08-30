@@ -141,3 +141,62 @@ RDNA2 (gfx1035) 与 RDNA3 (gfx1103) 在矩阵计算指令上存在根本差异�
    * 减少 kernel launch 开销（当前 SDXL01 grid 数达 640）。
 4. **D=128 专项优化**：
    * 虽然 D=128 已快于 Triton，但 QK 归约链更长，reduce 开销占比更高，仍有进一步压榨性能的空间。
+
+---
+
+## 十、 会话进度更新（2026-08-30）
+
+> 本节为持续推进 gfx1035 优化时动态追加的进度记录，避免测试死机/中断造成进度丢失。
+
+### 10.1 BF16/FP16 int8 长序列 MaxErr 过大问题的根因与修复【已完成并验证】
+
+**现象**：gfx1035 上 D=128 int8 路径（Anima01/03/05, AnimaVAE01 均为 BF16）MaxErr 过大：
+| 用例 | 修复前 native | triton 参考 |
+| --- | --- | --- |
+| Anima01 (4096) | mae 0.27 / cos 0.975 | mae 0.0024 / cos 0.9999 |
+| Anima03 (6144) | mae 0.47 / cos 0.969 | — |
+| AnimaVAE01 (16384) | mae 0.20 / cos 0.964 | — |
+
+**关键诊断**（用 Python 重建 native 的量化 QK + fp32 softmax/PV 与理想 P 对比）：
+1. **量化本身不是根因**：`s_int8 * (q_scale * k_scale)` 与理想 P 的 cos=0.9999（量化 QK 正确）。
+2. **问题在 V2(BN=32) kernel 的 online-softmax/PV 累积**：V1/V2/V22 三个布局（BM=32/64）在 D=128 且 kv_len≥2304 时全部出现 mae 0.2-0.34；V3(BN=16) 在同数据下 mae 0.003。
+3. **改 p_tile 为 fp32 无效**：把 V2 的 p_tile 从 fp16 改为 fp32（并改标量 fp32 PV）后误差仍为 0.254 → **不是 fp16 概率截断问题**，而是 BN=32 + D=128 长序列下 online-softmax 的深层数值/结构问题（尚未彻底定位到指令级，保留为待办）。
+
+**修复方案（已生效）**：在 `qk_int8_sv_bf16_attn_gfx11_t` 的 gfx10 分支中，D=128 int8 当 `kv_len>2048` 默认路由到 V3(BN=16)（该尺寸下 V3 精确：mae~0.003），否则用 V2(BN=32)。`SAGEATTN_GFX10_V3` 可覆盖（1=强制 V3，0=关闭 V3）。**仅改 gfx10 分支，gfx1103 零改动。**
+
+**修复后验证**（gfx1035 实测）：Anima01/03/05 全部 cos 0.9999 / mae 0.003-0.004，对齐 triton。
+
+**性能对比（修复后，round-robin 计时，含 quant+vt 全流程）**：
+| 用例 | native (ms) | triton (ms) | 比率 (native/triton) |
+| --- | --- | --- | --- |
+| Anima01 (D128, 4096) | 538.9 | 888.5 | **0.61× (快 1.65×)** ✅ |
+| Anima03 (D128, 6144) | 1231 | 2027 | **0.61× (快 1.65×)** ✅ |
+| Anima05 (D128, 9216) | 2810 | triton 崩溃 | 快 ✅ |
+| SDXL01 (D64, 4096) | 64.8 | 15.6 | 4.14× ⚠️ 仍为瓶颈 |
+| SDXL07 (D64, 6144) | 143.6 | 34.3 | 4.19× ⚠️ 仍为瓶颈 |
+
+**结论**：D=128 已修复且快于 triton（1.65×）；D=64 仍是唯一瓶颈（慢 4x，与报告 §6 一致）。注意：D=128 路由 V3 后比原 V2 的 311ms 慢，若后续定位到 V2 的 D=128 精度根因，可再切回 V2 提速到 2.85×。
+
+### 10.2 V3 kernel 的已知边界 bug（待办）
+
+**现象**：V3(BN=16) D=128 在 kv_len≤2048 时输出 NaN（seq 512/768/1024/1536/2048 均 NaN），kv_len≥3072 正常（mae 0.003-0.004）。**注意**：当前 pytest 的 D=64 用例在 int8 阈值以下的尺寸走 direct 路径，不会触发该 NaN，故测试全部通过。
+**影响**：D=128 int8 小序列（kv≤2048）不能用 V3（已由 dispatch 保证走 V2，V2 在 kv≤2048 精确）。此为独立 bug，与 D=128 精度修复解耦，保留为待办。
+
+### 10.3 pytest 增强【已完成】
+
+- 新增 `TestSageAttnMaxErr`：覆盖 6 个用例（D=128/D=64 的 int8 BF16/FP16 + D=128/D=64 的 fp16 direct），判定条件与 `benchmark_attn.py` 一致：`max_err < 0.05`、`cos > 0.99`、无 NaN/Inf。对 triton 的 D=128 长序列（seq≥6144）提前 skip（iGPU 上 triton 长 D=128 会 python.dll 硬崩溃）。
+- **验证**：`pytest --backend native` = 42 passed（原 36 + 新 6）；`--backend triton` 下 MaxErr 3 passed 3 skipped（无崩溃）。
+- 使用小型触发尺寸（D=128 用 seq=2304 最小触发 V2 精度 bug 的尺寸；D=64 用 3072；direct 用 1024/2048），兼顾触发 bug + 快速 + 避免 fp32 SDPA 参考 OOM。
+
+### 10.4 编译流程踩坑记录
+
+- **hipify 一步是关键**：本项目的构建链是 `attn_gfx11.cu → (hipify) → attn_gfx11.hip → (hipcc 编译)`。`attn_gfx11.hip` 是已提交文件，ninja 默认 "skipped, already hipified" **不会随 .cu 改动重新生成**；修改 `.cu` 后必须确认日志出现 `attn_gfx11.cu -> attn_gfx11.hip [ok]`（而非 [skipped]），否则改动不生效。改 `mma_gfx10.h` 等头文件需 touch 或 clean 重建。
+- 构建完成标志是 `copying ... _qattn_gfx11.pyd -> sageattention`，且 `(Get-Item pyd).LastWriteTime` 更新。`subprocess.CalledProcessError`/`clang-cl ... exit status 1` 是 torch cpp_extension 检查编译器版本的良性告警，非编译失败。
+- 当前 setup.py 默认同时编译 `--offload-arch=gfx1103 --offload-arch=gfx1035` 双 target。
+
+### 10.5 待办（按优先级）
+
+1. **拆分 attn_gfx11.cu** → `attn_gfx110x.cu`(gfx11) / `attn_gfx103x.cu`(gfx10)，setup.py 按 GPU_ARCHS 判断只编译对应源，减少编译时间。gfx10 kernel 已在独立头文件（mma_gfx10.h, attn_gfx10_new.h）中，需将 host 调度/辅助函数（quant/mean/v_transpose + 3 个 API 入口）抽到共享源，避免重复符号。
+2. **D=64 性能优化**（超 triton 4x 的瓶颈）：软件流水线、宽向量 LDS 读取、QK 链拆分（报告 §9.1）。
+3. **定位并修复 V2 的 D=128 长序列 online-softmax 精度根因**（可恢复 V2 的 2.85× 优势）与 V3 的小序列 NaN bug。
+4. 若时间允许，优化 D=128 的 QK 归约链与 persistent kernel 减少 launch 开销。

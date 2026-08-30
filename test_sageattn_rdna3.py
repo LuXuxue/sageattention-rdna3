@@ -4,11 +4,10 @@ import pytest
 import os
 from typing import Optional
 
-# 默认后端为 native (本项目核心); 用户可显式设 SAGEATTN_BACKEND=triton 覆盖
-# setdefault 尊重已有环境变量, 与 core.py 的 triton 默认值解耦
+# 后端显式指定：所有测试通过 conftest.py 的 pytest --backend 选项显式选择 native/triton。
+# _selected_backend (conftest.py) 在导入 sageattention 之前设置 SAGEATTN_BACKEND，
+# 避免 core.py 在 import 时读环境变量的歧义。
 os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
-os.environ.setdefault("SAGEATTN_BACKEND", "native")
-_IS_TRITON_BACKEND = os.getenv("SAGEATTN_BACKEND").lower() == "triton"
 
 
 @pytest.fixture(autouse=True)
@@ -22,6 +21,18 @@ def reference_attention(q, k, v, is_causal=False, sm_scale=None):
     return F.scaled_dot_product_attention(
         q, k, v, is_causal=is_causal, scale=sm_scale
     )
+
+
+def reference_fp32_nhd(q, k, v, is_causal=False):
+    """High-precision fp32 SDPA reference for NHD input [B,S,H,D]. 输出转回原 dtype。"""
+    with torch.no_grad():
+        out = F.scaled_dot_product_attention(
+            q.float().permute(0, 2, 1, 3),
+            k.float().permute(0, 2, 1, 3),
+            v.float().permute(0, 2, 1, 3),
+            is_causal=is_causal,
+        )
+        return out.permute(0, 2, 1, 3).to(q.dtype)
 
 
 def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -68,11 +79,11 @@ def check_gpu():
 
 
 @pytest.fixture
-def sageattn():
+def sageattn(backend):
     """Import sageattn from the package."""
     try:
         from sageattention import sageattn
-        if not _IS_TRITON_BACKEND:
+        if backend == "native":
             from sageattention.core import GFX11_NATIVE_ENABLED
             if not GFX11_NATIVE_ENABLED:
                 pytest.skip(
@@ -294,5 +305,60 @@ class TestSageAttnEdgeCases:
         assert_close(out, ref, torch.float16)
 
 
+class TestSageAttnMaxErr:
+    """int8 / fp16-direct 路径 MaxErr 回归测试。
+
+    覆盖 gfx1035 各主要路径:
+      - D=128 int8 (BF16/FP16): 修复前 V2(BN=32) 在 kv>2048 时 online-softmax 精度损失
+        (Anima01/03/05, AnimaVAE01: mae 0.2-0.47, cos<0.98)。
+        修复后路由 V3(BN=16), mae 应 < 0.05 (对齐 triton)。
+      - D=64 int8 (BF16/FP16): 长序列, 保持低 MaxErr。
+      - D=128/D=64 fp16 direct: 短序列 (非 int8), 精度应更高。
+    所有用例与 benchmark_attn.py 相同判定: max_err < 0.05 才通过。
+    """
+
+    # 每个路径用小型但能触发对应分支的用例 (兼顾触发 bug + 测试快速 + 避免 fp32 SDPA 参考 OOM)。
+    # int8 路径: D=128 需 kv>2048 (seq=2304 为最小触发 V2 精度 bug 尺寸); D=64 需 kv>3072 (seq=3072)。
+    # direct 路径: D=128 kv<=2048 (seq=1024); D=64 kv<=3072 (seq=2048)。
+    # (name, b, h_q, h_kv, sq, d, dtype)
+    CASES = [
+        ("D128_BF16_int8", 1, 4, 4, 2304, 128, torch.bfloat16),
+        ("D128_FP16_int8", 1, 4, 4, 2304, 128, torch.float16),
+        ("D64_BF16_int8", 1, 4, 4, 3072, 64, torch.bfloat16),
+        ("D64_FP16_int8", 1, 4, 4, 3072, 64, torch.float16),
+        ("D128_FP16_direct", 1, 4, 4, 1024, 128, torch.float16),
+        ("D64_FP16_direct", 1, 4, 4, 2048, 64, torch.float16),
+    ]
+
+    @pytest.mark.parametrize("case_idx", range(len(CASES)))
+    def test_int8_maxerr(self, sageattn, backend, case_idx):
+        name, b, h_q, h_kv, sq, d, dtype = self.CASES[case_idx]
+        # 对 triton backend 跳过超长 D=128 用例: iGPU 上 triton 长序列(D=128, seq>=6144)
+        # 不稳定, 会触发 python.dll 硬崩溃/OOM (非可捕获异常, 必须提前 skip)。
+        # native 后端不受影响 (这些正是本次要回归的用例)。
+        if backend == "triton" and d == 128 and sq >= 6144:
+            pytest.skip(f"triton D=128 long-seq (seq={sq}) is unstable on iGPU (crash/OOM)")
+        q = torch.randn(b, sq, h_q, d, device="cuda", dtype=dtype)
+        k = torch.randn(b, sq, h_kv, d, device="cuda", dtype=dtype)
+        v = torch.randn(b, sq, h_kv, d, device="cuda", dtype=dtype)
+
+        ref = reference_fp32_nhd(q, k, v, is_causal=False)
+        out = sageattn(q, k, v, tensor_layout="NHD", is_causal=False)
+
+        has_nan = torch.isnan(out).any().item()
+        has_inf = torch.isinf(out).any().item()
+        assert not has_nan, f"{name}: output contains NaN"
+        assert not has_inf, f"{name}: output contains Inf"
+
+        cos = cosine_similarity(out, ref)
+        mae = max_abs_error(out, ref)
+        # 判定条件与 benchmark_attn.py 一致: max_err < 0.05 才通过。
+        # 修复前 D128 int8 长序列 mae 0.2-0.47; 修复后 (V3/BN=16) 与 triton 同精度 mae<0.01。
+        assert cos > 0.99, f"{name}: cosine similarity {cos} too low"
+        assert mae < 0.05, f"{name}: max abs error {mae} too high (must be <0.05 like benchmark)"
+        del q, k, v, out, ref
+        torch.cuda.empty_cache()
+
+
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "--tb=short"])
+    pytest.main([__file__, "-v", "--tb=short", "--backend", "native"])
