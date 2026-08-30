@@ -2112,6 +2112,19 @@ Tensor qk_int8_sv_bf16_attn_gfx11_t(
 
             // V_T 恒 fp16 (v_transpose 已转), VDT 恒 __half。ODT 由 output dtype 决定。
             const bool out_bf = (output.scalar_type() == ScalarType::BFloat16);
+            // SAGEATTN_GFX10_V2: 0=v1, 1=v2 (默认), 2=auto (self 长序列用 v2, 短/交叉用 v1)
+            const int v2_mode = getenv("SAGEATTN_GFX10_V2") ? atoi(getenv("SAGEATTN_GFX10_V2")) : 2;
+            // SAGEATTN_GFX10_VT_GLOBAL: 0=off, 1=force v2.2 (PV from global V_T), 2=auto (self 长序列试用)
+            const int vt_mode = getenv("SAGEATTN_GFX10_VT_GLOBAL") ? atoi(getenv("SAGEATTN_GFX10_VT_GLOBAL")) : 0;
+            // auto 模式: BM=64 v2 在 self 长序列 (qo_len==kv_len>=512) 优 1.5-2x，
+            // 但短序列/cross-attn (block 数 < 6*8=48) 用 v2 浪费 lanes，应回退 v1 (BM=32)
+            const bool use_v2 = (v2_mode == 1) || (v2_mode == 2 && qo_len == kv_len && qo_len >= 512);
+            // v2.2 only when v2 already on (PV-from-global needs 2-row layout)
+            const bool use_v22 = use_v2 && ((vt_mode == 1) || (vt_mode == 2 && qo_len == kv_len && qo_len >= 1536));
+            // SAGEATTN_GFX10_V3: 0=off, 1=force v3 (true tile layout), 2=auto (self 长序列试用)
+            // v3 与 v2/v1 互斥：v3 单独走，BM=64 (4 warps × 16 rows)
+            const int v3_mode = getenv("SAGEATTN_GFX10_V3") ? atoi(getenv("SAGEATTN_GFX10_V3")) : 2;
+            const bool use_v3 = (v3_mode == 1) || (v3_mode == 2 && qo_len == kv_len && qo_len >= 512);
             #define L10(HD, C, BN, ODT) \
                 do { \
                     dim3 b10(128); \
@@ -2131,26 +2144,132 @@ Tensor qk_int8_sv_bf16_attn_gfx11_t(
                         qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
                         static_cast<int>(tensor_layout)); \
                 } while (0)
+            #define L10_V2(HD, C, BN, ODT) \
+                do { \
+                    dim3 b10(128); \
+                    dim3 g10((qo_len + 63) / 64, q_heads, batch); \
+                    sageattn_gfx10::attn_kernel_gfx10_i8_v2_t<HD, C, BN, ODT><<<g10, b10, 0, stream>>>( \
+                        reinterpret_cast<const int8_t*>(query.data_ptr()), \
+                        reinterpret_cast<const int8_t*>(key.data_ptr()), \
+                        reinterpret_cast<const __half*>(value.data_ptr()), \
+                        reinterpret_cast<ODT*>(output.data_ptr()), \
+                        reinterpret_cast<const float*>(q_scale.data_ptr()), \
+                        reinterpret_cast<const float*>(k_scale.data_ptr()), \
+                        batch, qo_len, kv_len, q_heads, kv_heads, \
+                        q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                        k_stride_b, k_stride_n, k_stride_h, \
+                        v_stride_b, v_stride_n, v_stride_h, \
+                        o_stride_b, o_stride_n, o_stride_h, \
+                        qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
+                        static_cast<int>(tensor_layout)); \
+                } while (0)
+            #define L10_V22(HD, C, BN, ODT) \
+                do { \
+                    dim3 b10(128); \
+                    dim3 g10((qo_len + 63) / 64, q_heads, batch); \
+                    sageattn_gfx10::attn_kernel_gfx10_i8_v2_2_t<HD, C, BN, ODT><<<g10, b10, 0, stream>>>( \
+                        reinterpret_cast<const int8_t*>(query.data_ptr()), \
+                        reinterpret_cast<const int8_t*>(key.data_ptr()), \
+                        reinterpret_cast<const __half*>(value.data_ptr()), \
+                        reinterpret_cast<ODT*>(output.data_ptr()), \
+                        reinterpret_cast<const float*>(q_scale.data_ptr()), \
+                        reinterpret_cast<const float*>(k_scale.data_ptr()), \
+                        batch, qo_len, kv_len, q_heads, kv_heads, \
+                        q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                        k_stride_b, k_stride_n, k_stride_h, \
+                        v_stride_b, v_stride_n, v_stride_h, \
+                        o_stride_b, o_stride_n, o_stride_h, \
+                        qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
+                        static_cast<int>(tensor_layout)); \
+                } while (0)
+            #define L10_V3(HD, C, BN, ODT) \
+                do { \
+                    dim3 b10(128); \
+                    dim3 g10((qo_len + 127) / 128, q_heads, batch); \
+                    sageattn_gfx10::attn_kernel_gfx10_i8_v3_t<HD, C, BN, ODT><<<g10, b10, 0, stream>>>( \
+                        reinterpret_cast<const int8_t*>(query.data_ptr()), \
+                        reinterpret_cast<const int8_t*>(key.data_ptr()), \
+                        reinterpret_cast<const __half*>(value.data_ptr()), \
+                        reinterpret_cast<ODT*>(output.data_ptr()), \
+                        reinterpret_cast<const float*>(q_scale.data_ptr()), \
+                        reinterpret_cast<const float*>(k_scale.data_ptr()), \
+                        batch, qo_len, kv_len, q_heads, kv_heads, \
+                        q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                        k_stride_b, k_stride_n, k_stride_h, \
+                        v_stride_b, v_stride_n, v_stride_h, \
+                        o_stride_b, o_stride_n, o_stride_h, \
+                        qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
+                        static_cast<int>(tensor_layout)); \
+                } while (0)
             if (head_dim == 64) {
+                // v3.4: BN=16 matches triton config; v3 wins on self long AND short cross
+                const bool use_v3_long = (qo_len == kv_len && qo_len >= 512);
+                const bool use_v3_short_cross = (qo_len != kv_len && qo_len >= 256);
                 const int bn = (qo_len == kv_len) ? ((kv_len <= 77) ? 16 : 32) : 32;
-                if (bn == 16) {
-                    if (is_causal) { if (out_bf) L10(64, true, 16, __hip_bfloat16); else L10(64, true, 16, __half); }
-                    else { if (out_bf) L10(64, false, 16, __hip_bfloat16); else L10(64, false, 16, __half); }
+                if (use_v3 && (use_v3_long || use_v3_short_cross)) {
+                    // v3 with BN=16 (long self-attn, D=64)
+                    if (is_causal) { if (out_bf) L10_V3(64, true, 16, __hip_bfloat16); else L10_V3(64, true, 16, __half); }
+                    else { if (out_bf) L10_V3(64, false, 16, __hip_bfloat16); else L10_V3(64, false, 16, __half); }
+                } else if (use_v22) {
+                    if (bn == 16) {
+                        if (is_causal) { if (out_bf) L10_V22(64, true, 16, __hip_bfloat16); else L10_V22(64, true, 16, __half); }
+                        else { if (out_bf) L10_V22(64, false, 16, __hip_bfloat16); else L10_V22(64, false, 16, __half); }
+                    } else {
+                        if (is_causal) { if (out_bf) L10_V22(64, true, 32, __hip_bfloat16); else L10_V22(64, true, 32, __half); }
+                        else { if (out_bf) L10_V22(64, false, 32, __hip_bfloat16); else L10_V22(64, false, 32, __half); }
+                    }
+                } else if (use_v2) {
+                    if (bn == 16) {
+                        if (is_causal) { if (out_bf) L10_V2(64, true, 16, __hip_bfloat16); else L10_V2(64, true, 16, __half); }
+                        else { if (out_bf) L10_V2(64, false, 16, __hip_bfloat16); else L10_V2(64, false, 16, __half); }
+                    } else {
+                        if (is_causal) { if (out_bf) L10_V2(64, true, 32, __hip_bfloat16); else L10_V2(64, true, 32, __half); }
+                        else { if (out_bf) L10_V2(64, false, 32, __hip_bfloat16); else L10_V2(64, false, 32, __half); }
+                    }
                 } else {
-                    if (is_causal) { if (out_bf) L10(64, true, 32, __hip_bfloat16); else L10(64, true, 32, __half); }
-                    else { if (out_bf) L10(64, false, 32, __hip_bfloat16); else L10(64, false, 32, __half); }
+                    if (bn == 16) {
+                        if (is_causal) { if (out_bf) L10(64, true, 16, __hip_bfloat16); else L10(64, true, 16, __half); }
+                        else { if (out_bf) L10(64, false, 16, __hip_bfloat16); else L10(64, false, 16, __half); }
+                    } else {
+                        if (is_causal) { if (out_bf) L10(64, true, 32, __hip_bfloat16); else L10(64, true, 32, __half); }
+                        else { if (out_bf) L10(64, false, 32, __hip_bfloat16); else L10(64, false, 32, __half); }
+                    }
                 }
             } else {
-                const int bn = (kv_len <= 77) ? 16 : 32;
-                if (bn == 16) {
-                    if (is_causal) { if (out_bf) L10(128, true, 16, __hip_bfloat16); else L10(128, true, 16, __half); }
-                    else { if (out_bf) L10(128, false, 16, __hip_bfloat16); else L10(128, false, 16, __half); }
+                const int bn = (kv_len <= 77) ? 16 : 16;  // v3.4: BN=16 for v3
+                if (use_v3) {
+                    if (is_causal) { if (out_bf) L10_V3(128, true, 16, __hip_bfloat16); else L10_V3(128, true, 16, __half); }
+                    else { if (out_bf) L10_V3(128, false, 16, __hip_bfloat16); else L10_V3(128, false, 16, __half); }
+                } else if (use_v22) {
+                    if (bn == 16) {
+                        if (is_causal) { if (out_bf) L10_V22(128, true, 16, __hip_bfloat16); else L10_V22(128, true, 16, __half); }
+                        else { if (out_bf) L10_V22(128, false, 16, __hip_bfloat16); else L10_V22(128, false, 16, __half); }
+                    } else {
+                        if (is_causal) { if (out_bf) L10_V22(128, true, 32, __hip_bfloat16); else L10_V22(128, true, 32, __half); }
+                        else { if (out_bf) L10_V22(128, false, 32, __hip_bfloat16); else L10_V22(128, false, 32, __half); }
+                    }
+                } else if (use_v2) {
+                    if (bn == 16) {
+                        if (is_causal) { if (out_bf) L10_V2(128, true, 16, __hip_bfloat16); else L10_V2(128, true, 16, __half); }
+                        else { if (out_bf) L10_V2(128, false, 16, __hip_bfloat16); else L10_V2(128, false, 16, __half); }
+                    } else {
+                        if (is_causal) { if (out_bf) L10_V2(128, true, 32, __hip_bfloat16); else L10_V2(128, true, 32, __half); }
+                        else { if (out_bf) L10_V2(128, false, 32, __hip_bfloat16); else L10_V2(128, false, 32, __half); }
+                    }
                 } else {
-                    if (is_causal) { if (out_bf) L10(128, true, 32, __hip_bfloat16); else L10(128, true, 32, __half); }
-                    else { if (out_bf) L10(128, false, 32, __hip_bfloat16); else L10(128, false, 32, __half); }
+                    if (bn == 16) {
+                        if (is_causal) { if (out_bf) L10(128, true, 16, __hip_bfloat16); else L10(128, true, 16, __half); }
+                        else { if (out_bf) L10(128, false, 16, __hip_bfloat16); else L10(128, false, 16, __half); }
+                    } else {
+                        if (is_causal) { if (out_bf) L10(128, true, 32, __hip_bfloat16); else L10(128, true, 32, __half); }
+                        else { if (out_bf) L10(128, false, 32, __hip_bfloat16); else L10(128, false, 32, __half); }
+                    }
                 }
             }
             #undef L10
+            #undef L10_V2
+            #undef L10_V22
+            #undef L10_V3
             return output;
         }
     }
@@ -2385,6 +2504,21 @@ Tensor fp16_attn_gfx11_t(
             const int64_t o_stride_h = (tensor_layout == kHND) ? output.stride(1) : output.stride(2);
             const float sm_scale_log2e = static_cast<float>(sm_scale) * kLog2e;
             const hipStream_t stream = current_hip_stream(query);
+            // SAGEATTN_GFX10_V2: 0=v1, 1=v2, 2=auto (self 长序列用 v2, 其他用 v1)
+            const int v2_mode = getenv("SAGEATTN_GFX10_V2") ? atoi(getenv("SAGEATTN_GFX10_V2")) : 2;
+            // SAGEATTN_GFX10_VT_GLOBAL: 0=off, 1=force v2.2 (PV from global V_T), 2=auto
+            const int vt_mode = getenv("SAGEATTN_GFX10_VT_GLOBAL") ? atoi(getenv("SAGEATTN_GFX10_VT_GLOBAL")) : 0;
+            // auto 模式: direct 路径 v2 (BM=64) 仅在 self 长序列 (qo_len==kv_len>=1024) 有正收益
+            // 短 cross (kv<512) v2 反而慢 2-3x
+            const bool use_v2 = (v2_mode == 1) || (v2_mode == 2 && qo_len == kv_len && qo_len >= 1024);
+            const bool use_v22 = use_v2 && ((vt_mode == 1) || (vt_mode == 2 && qo_len == kv_len && qo_len >= 1536));
+            // SAGEATTN_GFX10_V3: 0=off, 1=force v3, 2=auto
+            // v3.4 status: BROKEN for fp16/bf16 (16 lanes × 2 halfs = D/2, only covers half row)
+            //                  BROKEN for int8 PV output (each lane writes 4 cols, 60 cols uninit)
+            //                  Works for int8 QK (lane reduce correct) but PV output is incomplete
+            // Disable by default; use SAGEATTN_GFX10_V3=1 to opt-in if you know what you're doing
+            const int v3_mode = getenv("SAGEATTN_GFX10_V3") ? atoi(getenv("SAGEATTN_GFX10_V3")) : 0;
+            const bool use_v3 = (v3_mode == 1) || (v3_mode == 2 && qo_len == kv_len && qo_len >= 512);
             #define LD(HD, C, BN, QDT, ODT) \
                 do { \
                     dim3 bd(128); dim3 gd((qo_len + 31) / 32, q_heads, batch); \
@@ -2400,14 +2534,83 @@ Tensor fp16_attn_gfx11_t(
                         o_stride_b, o_stride_n, o_stride_h, \
                         sm_scale_log2e, static_cast<int>(tensor_layout)); \
                 } while (0)
-            if (head_dim == 64) {
-                if (is_causal) LD(64, true, 32, __half, __half);
-                else LD(64, false, 32, __half, __half);
+            #define LD_V2(HD, C, BN, QDT, ODT) \
+                do { \
+                    dim3 bd(128); dim3 gd((qo_len + 63) / 64, q_heads, batch); \
+                    sageattn_gfx10::attn_kernel_gfx10_direct_v2_t<HD, C, BN, QDT, ODT><<<gd, bd, 0, stream>>>( \
+                        reinterpret_cast<const QDT*>(query.data_ptr()), \
+                        reinterpret_cast<const QDT*>(key.data_ptr()), \
+                        reinterpret_cast<const __half*>(value.data_ptr()), \
+                        reinterpret_cast<ODT*>(output.data_ptr()), \
+                        batch, qo_len, kv_len, q_heads, kv_heads, \
+                        q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                        k_stride_b, k_stride_n, k_stride_h, \
+                        v_stride_b, v_stride_n, v_stride_h, \
+                        o_stride_b, o_stride_n, o_stride_h, \
+                        sm_scale_log2e, static_cast<int>(tensor_layout)); \
+                } while (0)
+            #define LD_V22(HD, C, BN, QDT, ODT) \
+                do { \
+                    dim3 bd(128); dim3 gd((qo_len + 63) / 64, q_heads, batch); \
+                    sageattn_gfx10::attn_kernel_gfx10_direct_v2_2_t<HD, C, BN, QDT, ODT><<<gd, bd, 0, stream>>>( \
+                        reinterpret_cast<const QDT*>(query.data_ptr()), \
+                        reinterpret_cast<const QDT*>(key.data_ptr()), \
+                        reinterpret_cast<const __half*>(value.data_ptr()), \
+                        reinterpret_cast<ODT*>(output.data_ptr()), \
+                        batch, qo_len, kv_len, q_heads, kv_heads, \
+                        q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                        k_stride_b, k_stride_n, k_stride_h, \
+                        v_stride_b, v_stride_n, v_stride_h, \
+                        o_stride_b, o_stride_n, o_stride_h, \
+                        sm_scale_log2e, static_cast<int>(tensor_layout)); \
+                } while (0)
+            #define LD_V3(HD, C, BN, QDT, ODT) \
+                do { \
+                    dim3 bd(128); dim3 gd((qo_len + 127) / 128, q_heads, batch); \
+                    sageattn_gfx10::attn_kernel_gfx10_direct_v3_t<HD, C, BN, QDT, ODT><<<gd, bd, 0, stream>>>( \
+                        reinterpret_cast<const QDT*>(query.data_ptr()), \
+                        reinterpret_cast<const QDT*>(key.data_ptr()), \
+                        reinterpret_cast<const __half*>(value.data_ptr()), \
+                        reinterpret_cast<ODT*>(output.data_ptr()), \
+                        batch, qo_len, kv_len, q_heads, kv_heads, \
+                        q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                        k_stride_b, k_stride_n, k_stride_h, \
+                        v_stride_b, v_stride_n, v_stride_h, \
+                        o_stride_b, o_stride_n, o_stride_h, \
+                        sm_scale_log2e, static_cast<int>(tensor_layout)); \
+                } while (0)
+            if (use_v22) {
+                if (head_dim == 64) {
+                    if (is_causal) LD_V22(64, true, 32, __half, __half);
+                    else LD_V22(64, false, 32, __half, __half);
+                } else {
+                    if (is_causal) LD_V22(128, true, 32, __half, __half);
+                    else LD_V22(128, false, 32, __half, __half);
+                }
+            } else if (use_v3) {
+                if (is_causal) LD_V3(64, true, 16, __half, __half);
+                else LD_V3(64, false, 16, __half, __half);
+            } else if (use_v2) {
+                if (head_dim == 64) {
+                    if (is_causal) LD_V2(64, true, 32, __half, __half);
+                    else LD_V2(64, false, 32, __half, __half);
+                } else {
+                    if (is_causal) LD_V2(128, true, 32, __half, __half);
+                    else LD_V2(128, false, 32, __half, __half);
+                }
             } else {
-                if (is_causal) LD(128, true, 32, __half, __half);
-                else LD(128, false, 32, __half, __half);
+                if (head_dim == 64) {
+                    if (is_causal) LD(64, true, 32, __half, __half);
+                    else LD(64, false, 32, __half, __half);
+                } else {
+                    if (is_causal) LD(128, true, 32, __half, __half);
+                    else LD(128, false, 32, __half, __half);
+                }
             }
             #undef LD
+            #undef LD_V2
+            #undef LD_V22
+            #undef LD_V3
             return output;
         }
     }
@@ -2538,6 +2741,20 @@ Tensor bf16_attn_gfx11_t(
             const int64_t o_stride_h = (tensor_layout == kHND) ? output.stride(1) : output.stride(2);
             const float sm_scale_log2e = static_cast<float>(sm_scale) * kLog2e;
             const hipStream_t stream = current_hip_stream(query);
+            // SAGEATTN_GFX10_V2: 0=v1, 1=v2, 2=auto (self 长序列用 v2, 其他用 v1)
+            const int v2_mode = getenv("SAGEATTN_GFX10_V2") ? atoi(getenv("SAGEATTN_GFX10_V2")) : 2;
+            // SAGEATTN_GFX10_VT_GLOBAL: 0=off, 1=force v2.2 (PV from global V_T), 2=auto
+            const int vt_mode = getenv("SAGEATTN_GFX10_VT_GLOBAL") ? atoi(getenv("SAGEATTN_GFX10_VT_GLOBAL")) : 0;
+            // auto 模式: direct 路径 v2 (BM=64) 仅在 self 长序列 (qo_len==kv_len>=1024) 有正收益
+            const bool use_v2 = (v2_mode == 1) || (v2_mode == 2 && qo_len == kv_len && qo_len >= 1024);
+            const bool use_v22 = use_v2 && ((vt_mode == 1) || (vt_mode == 2 && qo_len == kv_len && qo_len >= 1536));
+            // SAGEATTN_GFX10_V3: 0=off, 1=force v3, 2=auto
+            // v3.4 status: BROKEN for fp16/bf16 (16 lanes × 2 halfs = D/2, only covers half row)
+            //                  BROKEN for int8 PV output (each lane writes 4 cols, 60 cols uninit)
+            //                  Works for int8 QK (lane reduce correct) but PV output is incomplete
+            // Disable by default; use SAGEATTN_GFX10_V3=1 to opt-in if you know what you're doing
+            const int v3_mode = getenv("SAGEATTN_GFX10_V3") ? atoi(getenv("SAGEATTN_GFX10_V3")) : 0;
+            const bool use_v3 = (v3_mode == 1) || (v3_mode == 2 && qo_len == kv_len && qo_len >= 512);
             #define LDB(HD, C, BN, QDT, ODT) \
                 do { \
                     dim3 bd(128); dim3 gd((qo_len + 31) / 32, q_heads, batch); \
@@ -2553,14 +2770,83 @@ Tensor bf16_attn_gfx11_t(
                         o_stride_b, o_stride_n, o_stride_h, \
                         sm_scale_log2e, static_cast<int>(tensor_layout)); \
                 } while (0)
-            if (head_dim == 64) {
-                if (is_causal) LDB(64, true, 32, __hip_bfloat16, __hip_bfloat16);
-                else LDB(64, false, 32, __hip_bfloat16, __hip_bfloat16);
+            #define LDB_V2(HD, C, BN, QDT, ODT) \
+                do { \
+                    dim3 bd(128); dim3 gd((qo_len + 63) / 64, q_heads, batch); \
+                    sageattn_gfx10::attn_kernel_gfx10_direct_v2_t<HD, C, BN, QDT, ODT><<<gd, bd, 0, stream>>>( \
+                        reinterpret_cast<const QDT*>(query.data_ptr()), \
+                        reinterpret_cast<const QDT*>(key.data_ptr()), \
+                        reinterpret_cast<const __half*>(value.data_ptr()), \
+                        reinterpret_cast<ODT*>(output.data_ptr()), \
+                        batch, qo_len, kv_len, q_heads, kv_heads, \
+                        q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                        k_stride_b, k_stride_n, k_stride_h, \
+                        v_stride_b, v_stride_n, v_stride_h, \
+                        o_stride_b, o_stride_n, o_stride_h, \
+                        sm_scale_log2e, static_cast<int>(tensor_layout)); \
+                } while (0)
+            #define LDB_V22(HD, C, BN, QDT, ODT) \
+                do { \
+                    dim3 bd(128); dim3 gd((qo_len + 63) / 64, q_heads, batch); \
+                    sageattn_gfx10::attn_kernel_gfx10_direct_v2_2_t<HD, C, BN, QDT, ODT><<<gd, bd, 0, stream>>>( \
+                        reinterpret_cast<const QDT*>(query.data_ptr()), \
+                        reinterpret_cast<const QDT*>(key.data_ptr()), \
+                        reinterpret_cast<const __half*>(value.data_ptr()), \
+                        reinterpret_cast<ODT*>(output.data_ptr()), \
+                        batch, qo_len, kv_len, q_heads, kv_heads, \
+                        q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                        k_stride_b, k_stride_n, k_stride_h, \
+                        v_stride_b, v_stride_n, v_stride_h, \
+                        o_stride_b, o_stride_n, o_stride_h, \
+                        sm_scale_log2e, static_cast<int>(tensor_layout)); \
+                } while (0)
+            #define LDB_V3(HD, C, BN, QDT, ODT) \
+                do { \
+                    dim3 bd(128); dim3 gd((qo_len + 127) / 128, q_heads, batch); \
+                    sageattn_gfx10::attn_kernel_gfx10_direct_v3_t<HD, C, BN, QDT, ODT><<<gd, bd, 0, stream>>>( \
+                        reinterpret_cast<const QDT*>(query.data_ptr()), \
+                        reinterpret_cast<const QDT*>(key.data_ptr()), \
+                        reinterpret_cast<const __half*>(value.data_ptr()), \
+                        reinterpret_cast<ODT*>(output.data_ptr()), \
+                        batch, qo_len, kv_len, q_heads, kv_heads, \
+                        q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                        k_stride_b, k_stride_n, k_stride_h, \
+                        v_stride_b, v_stride_n, v_stride_h, \
+                        o_stride_b, o_stride_n, o_stride_h, \
+                        sm_scale_log2e, static_cast<int>(tensor_layout)); \
+                } while (0)
+            if (use_v22) {
+                if (head_dim == 64) {
+                    if (is_causal) LDB_V22(64, true, 32, __hip_bfloat16, __hip_bfloat16);
+                    else LDB_V22(64, false, 32, __hip_bfloat16, __hip_bfloat16);
+                } else {
+                    if (is_causal) LDB_V22(128, true, 32, __hip_bfloat16, __hip_bfloat16);
+                    else LDB_V22(128, false, 32, __hip_bfloat16, __hip_bfloat16);
+                }
+            } else if (use_v3) {
+                if (is_causal) LDB_V3(64, true, 16, __hip_bfloat16, __hip_bfloat16);
+                else LDB_V3(64, false, 16, __hip_bfloat16, __hip_bfloat16);
+            } else if (use_v2) {
+                if (head_dim == 64) {
+                    if (is_causal) LDB_V2(64, true, 32, __hip_bfloat16, __hip_bfloat16);
+                    else LDB_V2(64, false, 32, __hip_bfloat16, __hip_bfloat16);
+                } else {
+                    if (is_causal) LDB_V2(128, true, 32, __hip_bfloat16, __hip_bfloat16);
+                    else LDB_V2(128, false, 32, __hip_bfloat16, __hip_bfloat16);
+                }
             } else {
-                if (is_causal) LDB(128, true, 32, __hip_bfloat16, __hip_bfloat16);
-                else LDB(128, false, 32, __hip_bfloat16, __hip_bfloat16);
+                if (head_dim == 64) {
+                    if (is_causal) LDB(64, true, 32, __hip_bfloat16, __hip_bfloat16);
+                    else LDB(64, false, 32, __hip_bfloat16, __hip_bfloat16);
+                } else {
+                    if (is_causal) LDB(128, true, 32, __hip_bfloat16, __hip_bfloat16);
+                    else LDB(128, false, 32, __hip_bfloat16, __hip_bfloat16);
+                }
             }
             #undef LDB
+            #undef LDB_V2
+            #undef LDB_V22
+            #undef LDB_V3
             return output;
         }
     }

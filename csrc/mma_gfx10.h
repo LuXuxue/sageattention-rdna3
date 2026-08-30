@@ -248,6 +248,438 @@ __global__ void attn_kernel_gfx10_i8_t(
 }  // attn_kernel_gfx10_i8_t
 
 // ============================================================================
+// gfx10 int8 QK attention kernel v2: 2 rows per thread for ILP.
+//
+// Motivation: per-lane-row v1 (BM=32, NW=4) has 1 thread holding 1 row's
+//   16-element dot4 chain. Even with 8-way unroll, the chain takes 16 cycles
+//   per j, and 8 j iterations = 128 cycles per QK per thread. With 2 rows
+//   per thread, the 2 dot4 chains are independent and the compiler can
+//   interleave them, halving the per-row QK time.
+//
+// Layout:
+//   Block = 128 threads, BM=64, NW=4 (col groups = 4 per row).
+//   Thread t -> row_pair = t>>3 (0..15), within-pair row = (t>>2)&1 (0..1),
+//                 col_group = t&3 (0..3).
+//   Each thread holds 2 rows × 4 col-groups = 8 acc, 2 row-m, 2 row-l.
+//   QK: 2 independent dot4 chains (per row), interleaved for ILP.
+//   PV: 8 acc (2 rows × 4 col groups), interleaved dot2.
+// ============================================================================
+template <int HD, bool ISC, int BN, typename ODT>
+__global__ void attn_kernel_gfx10_i8_v2_t(
+    const int8_t* __restrict__ q, const int8_t* __restrict__ k,
+    const __half* __restrict__ v, ODT* __restrict__ out,
+    const float* __restrict__ q_scale, const float* __restrict__ k_scale,
+    int64_t batch, int64_t qo_len, int64_t kv_len,
+    int64_t q_heads, int64_t kv_heads,
+    int64_t q_stride_b, int64_t q_stride_n, int64_t q_stride_h,
+    int64_t q_stride_n_dir_unused,  // padding to match v1's signature
+    int64_t k_stride_b, int64_t k_stride_n, int64_t k_stride_h,
+    int64_t v_stride_b, int64_t v_stride_n, int64_t v_stride_h,
+    int64_t o_stride_b, int64_t o_stride_n, int64_t o_stride_h,
+    int64_t qs_stride_b, int64_t qs_stride_h,
+    int64_t ks_stride_b, int64_t ks_stride_h,
+    int tensor_layout) {
+#if defined(__GFX10__)
+    constexpr int QUADS = HD / 4;     // int8 dwords per row
+    constexpr int BM = 64;            // Q rows per block (2x v1)
+    constexpr int NW = 4;             // col groups per row
+    constexpr int NR = 2;             // rows per thread
+    constexpr int CL = HD / NW;       // output cols per thread (16 for HD64)
+    constexpr int NTHREAD = (BM / NR) * NW;  // 32 * 4 = 128 threads
+    static_assert(NR * (BM / NR) == BM, "BM must be multiple of NR");
+    static_assert(NTHREAD == 128, "v2 layout expects 128 threads");
+
+    const int tid = threadIdx.x;
+    const int rp = tid >> 2;          // row-pair index 0..31 (BM/NR=32)
+    const int ri = tid & 2 ? 1 : 0;   // within-pair row index 0/1 (we use bit 1)
+    // Use (t & 0x4) for row select, lower 2 bits for col group
+    const int row_in_pair = (tid >> 2) & 1;  // 0 or 1
+    const int ct = tid & 3;            // 0..3 column group
+    const int row0 = rp * 2 + 0;       // first row owned
+    const int row1 = rp * 2 + 1;       // second row owned
+    const int64_t m0 = blockIdx.x * BM + row0;
+    const int64_t m1 = blockIdx.x * BM + row1;
+
+    const int64_t b = blockIdx.z;
+    const int64_t h = blockIdx.y;
+    const int64_t kvh = h / (q_heads / kv_heads);
+
+    // ---- LDS tiles ----
+    __shared__ int8_t q_tile[BM * HD];
+    __shared__ int8_t k_tile[BN * HD];
+    __shared__ __half v_tile[HD * BN];
+    __shared__ float s_tile[BM * BN];
+    __shared__ __half p_tile[BM * BN];
+
+    const bool valid0 = (m0 < qo_len);
+    const bool valid1 = (m1 < qo_len);
+
+    // ---- stage Q tile (BM x HD int8) cooperatively ----
+    {
+        const int64_t qb = b * q_stride_b + h * q_stride_h;
+        #pragma unroll 1
+        for (int i = tid; i < BM * QUADS; i += NTHREAD) {
+            int r = i / QUADS, cq = i % QUADS;
+            int64_t gr = blockIdx.x * BM + r;
+            const int8_t* qrow = q + qb + gr * q_stride_n;
+            reinterpret_cast<int*>(&q_tile[r * HD + cq * 4])[0] =
+                (gr < qo_len) ? load_i8_quad(qrow + cq * 4) : 0;
+        }
+    }
+    __syncthreads();  // ensure all Q writes are visible before pre-load to regs
+
+    // Pre-load this thread's 2 rows of Q into registers (2 rows * QUADS i32)
+    int q_reg0[QUADS], q_reg1[QUADS];
+    #pragma unroll
+    for (int i = 0; i < QUADS; ++i) {
+        q_reg0[i] = *reinterpret_cast<const int*>(&q_tile[row0 * HD + i * 4]);
+        q_reg1[i] = *reinterpret_cast<const int*>(&q_tile[row1 * HD + i * 4]);
+    }
+
+    const float qs0 = valid0
+        ? q_scale[b * qs_stride_b + h * qs_stride_h + static_cast<int>(m0 / MIN_BLK_Q)]
+        : 0.0f;
+    const float qs1 = valid1
+        ? q_scale[b * qs_stride_b + h * qs_stride_h + static_cast<int>(m1 / MIN_BLK_Q)]
+        : 0.0f;
+
+    // ---- PV accumulators: 2 rows × CL cols ----
+    float acc0[CL], acc1[CL];
+    #pragma unroll
+    for (int c = 0; c < CL; ++c) { acc0[c] = 0.0f; acc1[c] = 0.0f; }
+    float row_m0 = -3.0e38f, row_l0 = 0.0f;
+    float row_m1 = -3.0e38f, row_l1 = 0.0f;
+
+    for (int64_t kb = 0; kb < kv_len; kb += BN) {
+        // stage k_tile (BN x HD int8)
+        {
+            const int64_t kqb = b * k_stride_b + kvh * k_stride_h;
+            #pragma unroll 1
+            for (int i = tid; i < BN * QUADS; i += NTHREAD) {
+                int r = i / QUADS, ck = i % QUADS;
+                int64_t n = kb + r;
+                const int8_t* krow = k + kqb + n * k_stride_n;
+                reinterpret_cast<int*>(&k_tile[r * HD + ck * 4])[0] =
+                    (n < kv_len) ? load_i8_quad(krow + ck * 4) : 0;
+            }
+        }
+        // stage v_tile [HD][BN] from V_T
+        {
+            const int64_t vbase = b * v_stride_b + kvh * v_stride_n;
+            const int64_t vsd = v_stride_h;
+            #pragma unroll 1
+            for (int i = tid; i < HD * BN; i += NTHREAD) {
+                int d = i / BN, cj = i % BN;
+                int64_t n = kb + cj;
+                const __half* vp = v + vbase + d * vsd + n;
+                v_tile[d * BN + cj] = (n < kv_len) ? *vp : __float2half(0.0f);
+            }
+        }
+        __syncthreads();
+
+        // ---- QK: 2 independent dot4 chains per j (one per row) ----
+        const float ks = k_scale[b * ks_stride_b + kvh * ks_stride_h + static_cast<int>(kb / MIN_BLK_K)];
+        const int out_base_col = ct * CL;
+        #pragma unroll 4
+        for (int j = ct; j < BN; j += NW) {
+            int s0 = 0, s1 = 0;
+            #pragma unroll 8
+            for (int i = 0; i < QUADS; ++i) {
+                int k_i = load_i8_quad(&k_tile[j * HD + i * 4]);
+                s0 = sdot4_i32_i8(q_reg0[i], k_i, s0);
+                s1 = sdot4_i32_i8(q_reg1[i], k_i, s1);
+            }
+            int64_t n = kb + j;
+            float sc0 = static_cast<float>(s0) * (qs0 * ks);
+            float sc1 = static_cast<float>(s1) * (qs1 * ks);
+            if ((!valid0) || (ISC && n > m0) || (n >= kv_len)) sc0 = -3.0e38f;
+            if ((!valid1) || (ISC && n > m1) || (n >= kv_len)) sc1 = -3.0e38f;
+            s_tile[row0 * BN + j] = sc0;
+            s_tile[row1 * BN + j] = sc1;
+        }
+        __syncthreads();
+
+        // ---- online softmax (per row, 2 rows) ----
+        // Row 0
+        {
+            float lm = -3.0e38f;
+            #pragma unroll 1
+            for (int j = 0; j < BN; ++j) lm = fmaxf(lm, s_tile[row0 * BN + j]);
+            float gm = fmaxf(row_m0, lm);
+            float alpha = (row_l0 > 0.0f) ? exp2f(row_m0 - gm) : 0.0f;
+            row_m0 = gm; row_l0 *= alpha;
+            #pragma unroll
+            for (int c = 0; c < CL; ++c) acc0[c] *= alpha;
+            float ps = 0.0f;
+            #pragma unroll 1
+            for (int j = 0; j < BN; ++j) {
+                float p = exp2f(s_tile[row0 * BN + j] - row_m0);
+                p_tile[row0 * BN + j] = __float2half(p);
+                ps += p;
+            }
+            row_l0 += ps;
+        }
+        // Row 1
+        {
+            float lm = -3.0e38f;
+            #pragma unroll 1
+            for (int j = 0; j < BN; ++j) lm = fmaxf(lm, s_tile[row1 * BN + j]);
+            float gm = fmaxf(row_m1, lm);
+            float alpha = (row_l1 > 0.0f) ? exp2f(row_m1 - gm) : 0.0f;
+            row_m1 = gm; row_l1 *= alpha;
+            #pragma unroll
+            for (int c = 0; c < CL; ++c) acc1[c] *= alpha;
+            float ps = 0.0f;
+            #pragma unroll 1
+            for (int j = 0; j < BN; ++j) {
+                float p = exp2f(s_tile[row1 * BN + j] - row_m1);
+                p_tile[row1 * BN + j] = __float2half(p);
+                ps += p;
+            }
+            row_l1 += ps;
+        }
+
+        // ---- PV: 2 rows × CL cols, interleaved dot2 ----
+        #pragma unroll 2
+        for (int jj = 0; jj < BN; jj += 2) {
+            unsigned p2_0 = load_h2_quad(&p_tile[row0 * BN + jj]);
+            unsigned p2_1 = load_h2_quad(&p_tile[row1 * BN + jj]);
+            #pragma unroll
+            for (int c = 0; c < CL; ++c) {
+                int d = out_base_col + c;
+                acc0[c] = fdot2_f32_f16(p2_0, load_h2_quad(&v_tile[d * BN + jj]), acc0[c]);
+                acc1[c] = fdot2_f32_f16(p2_1, load_h2_quad(&v_tile[d * BN + jj]), acc1[c]);
+            }
+        }
+        __syncthreads();
+    }
+
+    // ---- normalize + write back ----
+    if (valid0) {
+        float inv = 1.0f / row_l0;
+        int64_t base = b * o_stride_b + m0 * o_stride_n + h * o_stride_h;
+        const int out_base_col = ct * CL;
+        #pragma unroll
+        for (int c = 0; c < CL; ++c)
+            out[base + out_base_col + c] = gfx10_out_convert<ODT>(acc0[c] * inv);
+    }
+    if (valid1) {
+        float inv = 1.0f / row_l1;
+        int64_t base = b * o_stride_b + m1 * o_stride_n + h * o_stride_h;
+        const int out_base_col = ct * CL;
+        #pragma unroll
+        for (int c = 0; c < CL; ++c)
+            out[base + out_base_col + c] = gfx10_out_convert<ODT>(acc1[c] * inv);
+    }
+#endif
+}  // attn_kernel_gfx10_i8_v2_t
+
+// ============================================================================
+// gfx10 int8 QK attention kernel v2.2: same as v2 but PV reads V_T directly
+// from global (bypasses LDS v_tile).
+//
+// Trade-off:
+//   + Skip v_tile staging (1 __syncthreads + LDS write per kv-tile)
+//   + Less LDS pressure (saves 4 KiB / block for D=64)
+//   - PV reads V_T from L1/L2 each iteration (cache-friendly; 32B per row × 16 rows
+//     per thread = 512B per thread per kv-tile, 16KB per block per kv-tile, fits
+//     in 32KB L1)
+//
+// Dispatched only for self-attn long sequences where the saved sync outweighs
+// the extra global reads. Set SAGEATTN_GFX10_VT_GLOBAL=1 to force, =2 to auto.
+// ============================================================================
+template <int HD, bool ISC, int BN, typename ODT>
+__global__ void attn_kernel_gfx10_i8_v2_2_t(
+    const int8_t* __restrict__ q, const int8_t* __restrict__ k,
+    const __half* __restrict__ v, ODT* __restrict__ out,
+    const float* __restrict__ q_scale, const float* __restrict__ k_scale,
+    int64_t batch, int64_t qo_len, int64_t kv_len,
+    int64_t q_heads, int64_t kv_heads,
+    int64_t q_stride_b, int64_t q_stride_n, int64_t q_stride_h,
+    int64_t q_stride_n_dir_unused,
+    int64_t k_stride_b, int64_t k_stride_n, int64_t k_stride_h,
+    int64_t v_stride_b, int64_t v_stride_n, int64_t v_stride_h,
+    int64_t o_stride_b, int64_t o_stride_n, int64_t o_stride_h,
+    int64_t qs_stride_b, int64_t qs_stride_h,
+    int64_t ks_stride_b, int64_t ks_stride_h,
+    int tensor_layout) {
+#if defined(__GFX10__)
+    constexpr int QUADS = HD / 4;
+    constexpr int BM = 64, NW = 4, NR = 2;
+    constexpr int CL = HD / NW;
+    constexpr int NTHREAD = (BM / NR) * NW;
+
+    const int tid = threadIdx.x;
+    const int rp = tid >> 2;
+    const int ct = tid & 3;
+    const int row0 = rp * 2 + 0;
+    const int row1 = rp * 2 + 1;
+    const int64_t m0 = blockIdx.x * BM + row0;
+    const int64_t m1 = blockIdx.x * BM + row1;
+
+    const int64_t b = blockIdx.z;
+    const int64_t h = blockIdx.y;
+    const int64_t kvh = h / (q_heads / kv_heads);
+
+    __shared__ int8_t q_tile[BM * HD];
+    __shared__ int8_t k_tile[BN * HD];
+    __shared__ float s_tile[BM * BN];
+    __shared__ __half p_tile[BM * BN];
+
+    const bool valid0 = (m0 < qo_len);
+    const bool valid1 = (m1 < qo_len);
+
+    // stage Q
+    {
+        const int64_t qb = b * q_stride_b + h * q_stride_h;
+        #pragma unroll 1
+        for (int i = tid; i < BM * QUADS; i += NTHREAD) {
+            int r = i / QUADS, cq = i % QUADS;
+            int64_t gr = blockIdx.x * BM + r;
+            const int8_t* qrow = q + qb + gr * q_stride_n;
+            reinterpret_cast<int*>(&q_tile[r * HD + cq * 4])[0] =
+                (gr < qo_len) ? load_i8_quad(qrow + cq * 4) : 0;
+        }
+    }
+    __syncthreads();
+
+    int q_reg0[QUADS], q_reg1[QUADS];
+    #pragma unroll
+    for (int i = 0; i < QUADS; ++i) {
+        q_reg0[i] = *reinterpret_cast<const int*>(&q_tile[row0 * HD + i * 4]);
+        q_reg1[i] = *reinterpret_cast<const int*>(&q_tile[row1 * HD + i * 4]);
+    }
+
+    const float qs0 = valid0
+        ? q_scale[b * qs_stride_b + h * qs_stride_h + static_cast<int>(m0 / MIN_BLK_Q)]
+        : 0.0f;
+    const float qs1 = valid1
+        ? q_scale[b * qs_stride_b + h * qs_stride_h + static_cast<int>(m1 / MIN_BLK_Q)]
+        : 0.0f;
+
+    float acc0[CL], acc1[CL];
+    #pragma unroll
+    for (int c = 0; c < CL; ++c) { acc0[c] = 0.0f; acc1[c] = 0.0f; }
+    float row_m0 = -3.0e38f, row_l0 = 0.0f;
+    float row_m1 = -3.0e38f, row_l1 = 0.0f;
+
+    const int64_t vbase = b * v_stride_b + kvh * v_stride_n;
+    const int64_t vsd = v_stride_h;
+
+    for (int64_t kb = 0; kb < kv_len; kb += BN) {
+        // stage k_tile only (no v_tile!)
+        {
+            const int64_t kqb = b * k_stride_b + kvh * k_stride_h;
+            #pragma unroll 1
+            for (int i = tid; i < BN * QUADS; i += NTHREAD) {
+                int r = i / QUADS, ck = i % QUADS;
+                int64_t n = kb + r;
+                const int8_t* krow = k + kqb + n * k_stride_n;
+                reinterpret_cast<int*>(&k_tile[r * HD + ck * 4])[0] =
+                    (n < kv_len) ? load_i8_quad(krow + ck * 4) : 0;
+            }
+        }
+        __syncthreads();
+
+        // ---- QK (same as v2) ----
+        const float ks = k_scale[b * ks_stride_b + kvh * ks_stride_h + static_cast<int>(kb / MIN_BLK_K)];
+        const int out_base_col = ct * CL;
+        #pragma unroll 2
+        for (int j = ct; j < BN; j += NW) {
+            int s0 = 0, s1 = 0;
+            #pragma unroll 8
+            for (int i = 0; i < QUADS; ++i) {
+                int k_i = load_i8_quad(&k_tile[j * HD + i * 4]);
+                s0 = sdot4_i32_i8(q_reg0[i], k_i, s0);
+                s1 = sdot4_i32_i8(q_reg1[i], k_i, s1);
+            }
+            int64_t n = kb + j;
+            float sc0 = static_cast<float>(s0) * (qs0 * ks);
+            float sc1 = static_cast<float>(s1) * (qs1 * ks);
+            if ((!valid0) || (ISC && n > m0) || (n >= kv_len)) sc0 = -3.0e38f;
+            if ((!valid1) || (ISC && n > m1) || (n >= kv_len)) sc1 = -3.0e38f;
+            s_tile[row0 * BN + j] = sc0;
+            s_tile[row1 * BN + j] = sc1;
+        }
+        __syncthreads();
+
+        // ---- online softmax (2 rows) ----
+        {
+            float lm = -3.0e38f;
+            #pragma unroll 1
+            for (int j = 0; j < BN; ++j) lm = fmaxf(lm, s_tile[row0 * BN + j]);
+            float gm = fmaxf(row_m0, lm);
+            float alpha = (row_l0 > 0.0f) ? exp2f(row_m0 - gm) : 0.0f;
+            row_m0 = gm; row_l0 *= alpha;
+            #pragma unroll
+            for (int c = 0; c < CL; ++c) acc0[c] *= alpha;
+            float ps = 0.0f;
+            #pragma unroll 1
+            for (int j = 0; j < BN; ++j) {
+                float p = exp2f(s_tile[row0 * BN + j] - row_m0);
+                p_tile[row0 * BN + j] = __float2half(p);
+                ps += p;
+            }
+            row_l0 += ps;
+        }
+        {
+            float lm = -3.0e38f;
+            #pragma unroll 1
+            for (int j = 0; j < BN; ++j) lm = fmaxf(lm, s_tile[row1 * BN + j]);
+            float gm = fmaxf(row_m1, lm);
+            float alpha = (row_l1 > 0.0f) ? exp2f(row_m1 - gm) : 0.0f;
+            row_m1 = gm; row_l1 *= alpha;
+            #pragma unroll
+            for (int c = 0; c < CL; ++c) acc1[c] *= alpha;
+            float ps = 0.0f;
+            #pragma unroll 1
+            for (int j = 0; j < BN; ++j) {
+                float p = exp2f(s_tile[row1 * BN + j] - row_m1);
+                p_tile[row1 * BN + j] = __float2half(p);
+                ps += p;
+            }
+            row_l1 += ps;
+        }
+
+        // ---- PV: read V_T from global (L1/L2 cache) ----
+        #pragma unroll 2
+        for (int jj = 0; jj < BN; jj += 2) {
+            unsigned p2_0 = load_h2_quad(&p_tile[row0 * BN + jj]);
+            unsigned p2_1 = load_h2_quad(&p_tile[row1 * BN + jj]);
+            #pragma unroll
+            for (int c = 0; c < CL; ++c) {
+                int d = out_base_col + c;
+                int64_t n = kb + jj;
+                if (n < kv_len) {
+                    unsigned v2 = *reinterpret_cast<const unsigned*>(v + vbase + d * vsd + n);
+                    acc0[c] = fdot2_f32_f16(p2_0, v2, acc0[c]);
+                    acc1[c] = fdot2_f32_f16(p2_1, v2, acc1[c]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (valid0) {
+        float inv = 1.0f / row_l0;
+        int64_t base = b * o_stride_b + m0 * o_stride_n + h * o_stride_h;
+        const int out_base_col = ct * CL;
+        #pragma unroll
+        for (int c = 0; c < CL; ++c)
+            out[base + out_base_col + c] = gfx10_out_convert<ODT>(acc0[c] * inv);
+    }
+    if (valid1) {
+        float inv = 1.0f / row_l1;
+        int64_t base = b * o_stride_b + m1 * o_stride_n + h * o_stride_h;
+        const int out_base_col = ct * CL;
+        #pragma unroll
+        for (int c = 0; c < CL; ++c)
+            out[base + out_base_col + c] = gfx10_out_convert<ODT>(acc1[c] * inv);
+    }
+#endif
+}  // attn_kernel_gfx10_i8_v2_2_t
+
+// ============================================================================
 // gfx10 fp16/bf16 direct attention kernel (no quantization).
 //
 // Q/K are read as QDT (__half or __hip_bfloat16) and converted to fp16 when
@@ -383,6 +815,801 @@ __global__ void attn_kernel_gfx10_direct_t(
     }
 #endif
 }  // attn_kernel_gfx10_direct_t
+
+// ============================================================================
+// gfx10 fp16/bf16 direct attention kernel v2: 2 rows per thread for ILP.
+//
+// Same structure as attn_kernel_gfx10_i8_v2_t, but with fp16 V_DOT2 for QK
+// and explicit bf16->fp16 conversion on Q/K stage.
+// ============================================================================
+template <int HD, bool ISC, int BN, typename QDT, typename ODT>
+__global__ void attn_kernel_gfx10_direct_v2_t(
+    const QDT* __restrict__ q, const QDT* __restrict__ k,
+    const __half* __restrict__ v, ODT* __restrict__ out,
+    int64_t batch, int64_t qo_len, int64_t kv_len,
+    int64_t q_heads, int64_t kv_heads,
+    int64_t q_stride_b, int64_t q_stride_n, int64_t q_stride_h,
+    int64_t q_stride_n_dir_unused,  // padding to match v1
+    int64_t k_stride_b, int64_t k_stride_n, int64_t k_stride_h,
+    int64_t v_stride_b, int64_t v_stride_n, int64_t v_stride_h,
+    int64_t o_stride_b, int64_t o_stride_n, int64_t o_stride_h,
+    float sm_scale_log2e, int tensor_layout) {
+#if defined(__GFX10__)
+    constexpr int BM = 64, NW = 4, NR = 2;
+    constexpr int CL = HD / NW;       // 16 for D=64, 32 for D=128
+    constexpr int NTHREAD = (BM / NR) * NW;  // 32 * 4 = 128
+
+    const int tid = threadIdx.x;
+    const int rp = tid >> 2;          // 0..31 (BM/NR row-pairs)
+    const int ct = tid & 3;            // 0..3 column group
+    const int row0 = rp * 2 + 0;
+    const int row1 = rp * 2 + 1;
+    const int64_t m0 = blockIdx.x * BM + row0;
+    const int64_t m1 = blockIdx.x * BM + row1;
+
+    const int64_t b = blockIdx.z;
+    const int64_t h = blockIdx.y;
+    const int64_t kvh = h / (q_heads / kv_heads);
+
+    __shared__ __half q_tile[BM * HD];
+    __shared__ __half k_tile[BN * HD];
+    __shared__ __half v_tile[HD * BN];
+    __shared__ float s_tile[BM * BN];
+    __shared__ __half p_tile[BM * BN];
+
+    const bool valid0 = (m0 < qo_len);
+    const bool valid1 = (m1 < qo_len);
+
+    // stage Q tile (BM x HD) as fp16
+    {
+        const int64_t qb = b * q_stride_b + h * q_stride_h;
+        #pragma unroll 1
+        for (int i = tid; i < BM * HD; i += NTHREAD) {
+            int r = i / HD, cq = i % HD;
+            int64_t gr = blockIdx.x * BM + r;
+            q_tile[r * HD + cq] = (gr < qo_len)
+                ? gfx10_to_half<QDT>(q[qb + gr * q_stride_n + cq])
+                : __float2half(0.0f);
+        }
+    }
+    __syncthreads();  // ensure all Q writes visible before pre-load to regs
+
+    // Pre-load this thread's 2 rows of Q into registers (2 rows * HD/2 u32)
+    constexpr int H2 = HD / 2;
+    unsigned q_reg0[H2], q_reg1[H2];
+    #pragma unroll
+    for (int i = 0; i < H2; ++i) {
+        q_reg0[i] = *reinterpret_cast<const unsigned*>(&q_tile[row0 * HD + i * 2]);
+        q_reg1[i] = *reinterpret_cast<const unsigned*>(&q_tile[row1 * HD + i * 2]);
+    }
+
+    float acc0[CL], acc1[CL];
+    #pragma unroll
+    for (int c = 0; c < CL; ++c) { acc0[c] = 0.0f; acc1[c] = 0.0f; }
+    float row_m0 = -3.0e38f, row_l0 = 0.0f;
+    float row_m1 = -3.0e38f, row_l1 = 0.0f;
+
+    for (int64_t kb = 0; kb < kv_len; kb += BN) {
+        // stage k_tile as fp16
+        {
+            const int64_t kqb = b * k_stride_b + kvh * k_stride_h;
+            #pragma unroll 1
+            for (int i = tid; i < BN * HD; i += NTHREAD) {
+                int r = i / HD, ck = i % HD;
+                int64_t n = kb + r;
+                k_tile[r * HD + ck] = (n < kv_len)
+                    ? gfx10_to_half<QDT>(k[kqb + n * k_stride_n + ck])
+                    : __float2half(0.0f);
+            }
+        }
+        // stage v_tile [HD][BN] from V_T
+        {
+            const int64_t vbase = b * v_stride_b + kvh * v_stride_n;
+            const int64_t vsd = v_stride_h;
+            #pragma unroll 1
+            for (int i = tid; i < HD * BN; i += NTHREAD) {
+                int d = i / BN, cj = i % BN;
+                int64_t n = kb + cj;
+                v_tile[d * BN + cj] = (n < kv_len)
+                    ? v[vbase + d * vsd + n]
+                    : __float2half(0.0f);
+            }
+        }
+        __syncthreads();
+
+        // ---- QK: 2 independent fdot2 chains per j (one per row) ----
+        const int out_base_col = ct * CL;
+        #pragma unroll 2
+        for (int j = ct; j < BN; j += NW) {
+            float s0 = 0.0f, s1 = 0.0f;
+            #pragma unroll 8
+            for (int dq = 0; dq < HD; dq += 2) {
+                unsigned k_dq = load_h2_quad(&k_tile[j * HD + dq]);
+                s0 = fdot2_f32_f16(q_reg0[dq / 2], k_dq, s0);
+                s1 = fdot2_f32_f16(q_reg1[dq / 2], k_dq, s1);
+            }
+            int64_t n = kb + j;
+            float sc0 = s0 * sm_scale_log2e;
+            float sc1 = s1 * sm_scale_log2e;
+            if ((!valid0) || (ISC && n > m0) || (n >= kv_len)) sc0 = -3.0e38f;
+            if ((!valid1) || (ISC && n > m1) || (n >= kv_len)) sc1 = -3.0e38f;
+            s_tile[row0 * BN + j] = sc0;
+            s_tile[row1 * BN + j] = sc1;
+        }
+        __syncthreads();
+
+        // ---- online softmax (per row) ----
+        {
+            float lm = -3.0e38f;
+            #pragma unroll 1
+            for (int j = 0; j < BN; ++j) lm = fmaxf(lm, s_tile[row0 * BN + j]);
+            float gm = fmaxf(row_m0, lm);
+            float alpha = (row_l0 > 0.0f) ? exp2f(row_m0 - gm) : 0.0f;
+            row_m0 = gm; row_l0 *= alpha;
+            #pragma unroll
+            for (int c = 0; c < CL; ++c) acc0[c] *= alpha;
+            float ps = 0.0f;
+            #pragma unroll 1
+            for (int j = 0; j < BN; ++j) {
+                float p = exp2f(s_tile[row0 * BN + j] - row_m0);
+                p_tile[row0 * BN + j] = __float2half(p);
+                ps += p;
+            }
+            row_l0 += ps;
+        }
+        {
+            float lm = -3.0e38f;
+            #pragma unroll 1
+            for (int j = 0; j < BN; ++j) lm = fmaxf(lm, s_tile[row1 * BN + j]);
+            float gm = fmaxf(row_m1, lm);
+            float alpha = (row_l1 > 0.0f) ? exp2f(row_m1 - gm) : 0.0f;
+            row_m1 = gm; row_l1 *= alpha;
+            #pragma unroll
+            for (int c = 0; c < CL; ++c) acc1[c] *= alpha;
+            float ps = 0.0f;
+            #pragma unroll 1
+            for (int j = 0; j < BN; ++j) {
+                float p = exp2f(s_tile[row1 * BN + j] - row_m1);
+                p_tile[row1 * BN + j] = __float2half(p);
+                ps += p;
+            }
+            row_l1 += ps;
+        }
+
+        // ---- PV: 2 rows × CL cols, interleaved dot2 ----
+        #pragma unroll 2
+        for (int jj = 0; jj < BN; jj += 2) {
+            unsigned p2_0 = load_h2_quad(&p_tile[row0 * BN + jj]);
+            unsigned p2_1 = load_h2_quad(&p_tile[row1 * BN + jj]);
+            #pragma unroll
+            for (int c = 0; c < CL; ++c) {
+                int d = out_base_col + c;
+                acc0[c] = fdot2_f32_f16(p2_0, load_h2_quad(&v_tile[d * BN + jj]), acc0[c]);
+                acc1[c] = fdot2_f32_f16(p2_1, load_h2_quad(&v_tile[d * BN + jj]), acc1[c]);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (valid0) {
+        float inv = 1.0f / row_l0;
+        int64_t base = b * o_stride_b + m0 * o_stride_n + h * o_stride_h;
+        const int out_base_col = ct * CL;
+        #pragma unroll
+        for (int c = 0; c < CL; ++c)
+            out[base + out_base_col + c] = gfx10_out_convert<ODT>(acc0[c] * inv);
+    }
+    if (valid1) {
+        float inv = 1.0f / row_l1;
+        int64_t base = b * o_stride_b + m1 * o_stride_n + h * o_stride_h;
+        const int out_base_col = ct * CL;
+        #pragma unroll
+        for (int c = 0; c < CL; ++c)
+            out[base + out_base_col + c] = gfx10_out_convert<ODT>(acc1[c] * inv);
+    }
+#endif
+}  // attn_kernel_gfx10_direct_v2_t
+
+// ============================================================================
+// gfx10 fp16/bf16 direct kernel v2.2: same as direct_v2 but PV reads V_T from
+// global (bypasses LDS v_tile). See attn_kernel_gfx10_i8_v2_2_t for rationale.
+// ============================================================================
+template <int HD, bool ISC, int BN, typename QDT, typename ODT>
+__global__ void attn_kernel_gfx10_direct_v2_2_t(
+    const QDT* __restrict__ q, const QDT* __restrict__ k,
+    const __half* __restrict__ v, ODT* __restrict__ out,
+    int64_t batch, int64_t qo_len, int64_t kv_len,
+    int64_t q_heads, int64_t kv_heads,
+    int64_t q_stride_b, int64_t q_stride_n, int64_t q_stride_h,
+    int64_t q_stride_n_dir_unused,
+    int64_t k_stride_b, int64_t k_stride_n, int64_t k_stride_h,
+    int64_t v_stride_b, int64_t v_stride_n, int64_t v_stride_h,
+    int64_t o_stride_b, int64_t o_stride_n, int64_t o_stride_h,
+    float sm_scale_log2e, int tensor_layout) {
+#if defined(__GFX10__)
+    constexpr int BM = 64, NW = 4, NR = 2;
+    constexpr int CL = HD / NW;
+    constexpr int NTHREAD = (BM / NR) * NW;
+
+    const int tid = threadIdx.x;
+    const int rp = tid >> 2;
+    const int ct = tid & 3;
+    const int row0 = rp * 2 + 0;
+    const int row1 = rp * 2 + 1;
+    const int64_t m0 = blockIdx.x * BM + row0;
+    const int64_t m1 = blockIdx.x * BM + row1;
+
+    const int64_t b = blockIdx.z;
+    const int64_t h = blockIdx.y;
+    const int64_t kvh = h / (q_heads / kv_heads);
+
+    __shared__ __half q_tile[BM * HD];
+    __shared__ __half k_tile[BN * HD];
+    __shared__ float s_tile[BM * BN];
+    __shared__ __half p_tile[BM * BN];
+
+    const bool valid0 = (m0 < qo_len);
+    const bool valid1 = (m1 < qo_len);
+
+    // stage Q
+    {
+        const int64_t qb = b * q_stride_b + h * q_stride_h;
+        #pragma unroll 1
+        for (int i = tid; i < BM * HD; i += NTHREAD) {
+            int r = i / HD, cq = i % HD;
+            int64_t gr = blockIdx.x * BM + r;
+            q_tile[r * HD + cq] = (gr < qo_len)
+                ? gfx10_to_half<QDT>(q[qb + gr * q_stride_n + cq])
+                : __float2half(0.0f);
+        }
+    }
+    __syncthreads();
+
+    constexpr int H2 = HD / 2;
+    unsigned q_reg0[H2], q_reg1[H2];
+    #pragma unroll
+    for (int i = 0; i < H2; ++i) {
+        q_reg0[i] = *reinterpret_cast<const unsigned*>(&q_tile[row0 * HD + i * 2]);
+        q_reg1[i] = *reinterpret_cast<const unsigned*>(&q_tile[row1 * HD + i * 2]);
+    }
+
+    float acc0[CL], acc1[CL];
+    #pragma unroll
+    for (int c = 0; c < CL; ++c) { acc0[c] = 0.0f; acc1[c] = 0.0f; }
+    float row_m0 = -3.0e38f, row_l0 = 0.0f;
+    float row_m1 = -3.0e38f, row_l1 = 0.0f;
+
+    const int64_t vbase = b * v_stride_b + kvh * v_stride_n;
+    const int64_t vsd = v_stride_h;
+
+    for (int64_t kb = 0; kb < kv_len; kb += BN) {
+        // stage k_tile only (no v_tile)
+        {
+            const int64_t kqb = b * k_stride_b + kvh * k_stride_h;
+            #pragma unroll 1
+            for (int i = tid; i < BN * HD; i += NTHREAD) {
+                int r = i / HD, ck = i % HD;
+                int64_t n = kb + r;
+                k_tile[r * HD + ck] = (n < kv_len)
+                    ? gfx10_to_half<QDT>(k[kqb + n * k_stride_n + ck])
+                    : __float2half(0.0f);
+            }
+        }
+        __syncthreads();
+
+        // ---- QK (same as direct_v2) ----
+        const int out_base_col = ct * CL;
+        #pragma unroll 2
+        for (int j = ct; j < BN; j += NW) {
+            float s0 = 0.0f, s1 = 0.0f;
+            #pragma unroll 8
+            for (int dq = 0; dq < HD; dq += 2) {
+                unsigned k_dq = load_h2_quad(&k_tile[j * HD + dq]);
+                s0 = fdot2_f32_f16(q_reg0[dq / 2], k_dq, s0);
+                s1 = fdot2_f32_f16(q_reg1[dq / 2], k_dq, s1);
+            }
+            int64_t n = kb + j;
+            float sc0 = s0 * sm_scale_log2e;
+            float sc1 = s1 * sm_scale_log2e;
+            if ((!valid0) || (ISC && n > m0) || (n >= kv_len)) sc0 = -3.0e38f;
+            if ((!valid1) || (ISC && n > m1) || (n >= kv_len)) sc1 = -3.0e38f;
+            s_tile[row0 * BN + j] = sc0;
+            s_tile[row1 * BN + j] = sc1;
+        }
+        __syncthreads();
+
+        // ---- softmax (2 rows) ----
+        {
+            float lm = -3.0e38f;
+            #pragma unroll 1
+            for (int j = 0; j < BN; ++j) lm = fmaxf(lm, s_tile[row0 * BN + j]);
+            float gm = fmaxf(row_m0, lm);
+            float alpha = (row_l0 > 0.0f) ? exp2f(row_m0 - gm) : 0.0f;
+            row_m0 = gm; row_l0 *= alpha;
+            #pragma unroll
+            for (int c = 0; c < CL; ++c) acc0[c] *= alpha;
+            float ps = 0.0f;
+            #pragma unroll 1
+            for (int j = 0; j < BN; ++j) {
+                float p = exp2f(s_tile[row0 * BN + j] - row_m0);
+                p_tile[row0 * BN + j] = __float2half(p);
+                ps += p;
+            }
+            row_l0 += ps;
+        }
+        {
+            float lm = -3.0e38f;
+            #pragma unroll 1
+            for (int j = 0; j < BN; ++j) lm = fmaxf(lm, s_tile[row1 * BN + j]);
+            float gm = fmaxf(row_m1, lm);
+            float alpha = (row_l1 > 0.0f) ? exp2f(row_m1 - gm) : 0.0f;
+            row_m1 = gm; row_l1 *= alpha;
+            #pragma unroll
+            for (int c = 0; c < CL; ++c) acc1[c] *= alpha;
+            float ps = 0.0f;
+            #pragma unroll 1
+            for (int j = 0; j < BN; ++j) {
+                float p = exp2f(s_tile[row1 * BN + j] - row_m1);
+                p_tile[row1 * BN + j] = __float2half(p);
+                ps += p;
+            }
+            row_l1 += ps;
+        }
+
+        // ---- PV: read V_T from global (L1/L2 cache) ----
+        #pragma unroll 2
+        for (int jj = 0; jj < BN; jj += 2) {
+            unsigned p2_0 = load_h2_quad(&p_tile[row0 * BN + jj]);
+            unsigned p2_1 = load_h2_quad(&p_tile[row1 * BN + jj]);
+            #pragma unroll
+            for (int c = 0; c < CL; ++c) {
+                int d = out_base_col + c;
+                int64_t n = kb + jj;
+                if (n < kv_len) {
+                    unsigned v2 = *reinterpret_cast<const unsigned*>(v + vbase + d * vsd + n);
+                    acc0[c] = fdot2_f32_f16(p2_0, v2, acc0[c]);
+                    acc1[c] = fdot2_f32_f16(p2_1, v2, acc1[c]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (valid0) {
+        float inv = 1.0f / row_l0;
+        int64_t base = b * o_stride_b + m0 * o_stride_n + h * o_stride_h;
+        const int out_base_col = ct * CL;
+        #pragma unroll
+        for (int c = 0; c < CL; ++c)
+            out[base + out_base_col + c] = gfx10_out_convert<ODT>(acc0[c] * inv);
+    }
+    if (valid1) {
+        float inv = 1.0f / row_l1;
+        int64_t base = b * o_stride_b + m1 * o_stride_n + h * o_stride_h;
+        const int out_base_col = ct * CL;
+        #pragma unroll
+        for (int c = 0; c < CL; ++c)
+            out[base + out_base_col + c] = gfx10_out_convert<ODT>(acc1[c] * inv);
+    }
+#endif
+}  // attn_kernel_gfx10_direct_v2_2_t
+
+// ============================================================================
+// gfx10 v3: TRUE TILE LAYOUT - 1 warp cooperates on QK reduction across D
+// ============================================================================
+//
+// Design (gfx1035 RDNA2, no WMMA, V_DOT4 / V_DOT2 only):
+//   - 1 block = 4 warps × 32 lanes = 128 threads
+//   - BM = 64 (4 warps × 16 lanes-per-row)
+//   - Each warp = 16 rows: lane 0..15 own row 0..15 of that warp's tile
+//   - 16 lanes collaborate on D-dim QK reduction (1 V_DOT4 per lane, then
+//     5-step permlanex16 tree reduce = 1 QK value)
+//   - PV: 16 lanes hold 1 row × D cols (D=64: 4 cols/lane × 16 lanes; D=128: 8/lane)
+//
+// Compared to v2 (per-lane-row 16-elem dot4 chain):
+//   - QK: 1 dot4 per lane (1 cycle) + 5 permlanex reduce = 6 cycle per QK value
+//     vs v2's 16 cycle chain × 1 row × amortized 2 rows = 8 cycle/row amortized
+//   - PV: 1 fdot2 per lane × 16 lanes parallel = 16 fdot2/cycle vs v2's 16 fdot2/cycle
+//     (1 row × CL=16 cols) — but v2 has 2 rows in parallel = 32 fdot2/cycle per thread pair
+//   - Net: v3 has half the rows per warp (16 vs 32) but full D-dim parallel per QK
+//
+// Block size = 4 warps allows up to 4 blocks per CU in parallel (1 wave on 4 SIMDs).
+// ============================================================================
+__device__ __forceinline__ int warp_reduce_sdot4(int partial) {
+    int other;
+    other = __shfl_xor_sync(0xFFFFFFFFFFFFFFFFULL, partial, 8);
+    partial += other;
+    other = __shfl_xor_sync(0xFFFFFFFFFFFFFFFFULL, partial, 4);
+    partial += other;
+    other = __shfl_xor_sync(0xFFFFFFFFFFFFFFFFULL, partial, 2);
+    partial += other;
+    other = __shfl_xor_sync(0xFFFFFFFFFFFFFFFFULL, partial, 1);
+    partial += other;
+    return partial;
+}
+
+__device__ __forceinline__ float warp_reduce_fadd(float partial) {
+    int other;
+    other = __shfl_xor_sync(0xFFFFFFFFFFFFFFFFULL, __float_as_int(partial), 8);
+    partial = __int_as_float(__float_as_int(partial) + other);
+    other = __shfl_xor_sync(0xFFFFFFFFFFFFFFFFULL, __float_as_int(partial), 4);
+    partial = __int_as_float(__float_as_int(partial) + other);
+    other = __shfl_xor_sync(0xFFFFFFFFFFFFFFFFULL, __float_as_int(partial), 2);
+    partial = __int_as_float(__float_as_int(partial) + other);
+    other = __shfl_xor_sync(0xFFFFFFFFFFFFFFFFULL, __float_as_int(partial), 1);
+    partial = __int_as_float(__float_as_int(partial) + other);
+    return partial;
+}
+
+template <int HD, bool ISC, int BN, typename ODT>
+__global__ void attn_kernel_gfx10_i8_v3_t(
+    const int8_t* __restrict__ q, const int8_t* __restrict__ k,
+    const __half* __restrict__ v, ODT* __restrict__ out,
+    const float* __restrict__ q_scale, const float* __restrict__ k_scale,
+    int64_t batch, int64_t qo_len, int64_t kv_len,
+    int64_t q_heads, int64_t kv_heads,
+    int64_t q_stride_b, int64_t q_stride_n, int64_t q_stride_h,
+    int64_t q_stride_n_dir_unused,
+    int64_t k_stride_b, int64_t k_stride_n, int64_t k_stride_h,
+    int64_t v_stride_b, int64_t v_stride_n, int64_t v_stride_h,
+    int64_t o_stride_b, int64_t o_stride_n, int64_t o_stride_h,
+    int64_t qs_stride_b, int64_t qs_stride_h,
+    int64_t ks_stride_b, int64_t ks_stride_h,
+    int tensor_layout) {
+#if defined(__GFX10__)
+    constexpr int BM = 128;           // v3.2: 4 warps × 32 rows (2 rows per half-warp)
+    constexpr int NW = 1;
+    constexpr int CL = HD / 16;      // 16 lanes share PV acc, each lane holds CL=HD/16 cols
+                                    // D=64: 4 cols/lane, D=128: 8 cols/lane
+    constexpr int NTHREAD = 128;     // 4 warps
+    constexpr int ROWS_PER_HALF = 16;  // 16 lanes per half-warp
+    constexpr int ROWS_PER_WARP = 32;  // 2 rows per warp (one per half-warp)
+    constexpr int QUADS = HD / 4;     // int8 dwords per row
+    constexpr int QUADS_PER_LANE = QUADS / 16;  // D=64: 1, D=128: 2
+    static_assert(QUADS_PER_LANE * 16 == QUADS, "QUADS must be multiple of 16");
+    static_assert(NTHREAD == 128, "v3 expects 128 threads (4 warps)");
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    // 2 rows per warp: half_warp 0 (lane 0..15) owns row 0..15, half_warp 1 (lane 16..31) owns row 16..31
+    const int half_warp = lane >> 4;       // 0 or 1
+    const int lane_in_half = lane & 15;    // 0..15 within half-warp
+    const int row = warp * ROWS_PER_WARP + half_warp * ROWS_PER_HALF + lane_in_half;
+    const int64_t m = blockIdx.x * BM + row;
+    const int64_t b = blockIdx.z;
+    const int64_t h = blockIdx.y;
+    const int64_t kvh = h / (q_heads / kv_heads);
+    const bool valid = (m < qo_len);
+
+    // ---- LDS tiles ----
+    // K tile: [BN][HD] for K reads in QK
+    __shared__ int8_t k_tile[BN * HD];
+    // V tile: [HD][BN] (transposed, d-major like v2)
+    __shared__ __half v_tile[HD * BN];
+    // QK scores: each row in this block writes 1 score per j (after reduce)
+    __shared__ float s_tile[BM * BN];
+    // Softmax probs (per row, per j)
+    __shared__ __half p_tile[BM * BN];
+
+    // ---- v3.2: 1 warp = 2 rows, 16 lanes per row, all 32 lanes work ----
+    // Lane 0..15 own row 0 (within warp), lane 16..31 own row 1
+    // Each half-warp's 16 lanes do D-dim reduction for its row's QK
+    // 16 lanes cooperate on PV too (each lane holds CL=HD/16 cols)
+    int q_reg[QUADS_PER_LANE];
+    {
+        const int64_t qb = b * q_stride_b + h * q_stride_h;
+        const int8_t* qrow = q + qb + m * q_stride_n;
+        #pragma unroll
+        for (int i = 0; i < QUADS_PER_LANE; ++i) {
+            int d_chunk = lane_in_half * QUADS_PER_LANE + i;
+            q_reg[i] = valid
+                ? *reinterpret_cast<const int*>(&qrow[d_chunk * 4])
+                : 0;
+        }
+    }
+
+    const float qs = valid
+        ? q_scale[b * qs_stride_b + h * qs_stride_h + static_cast<int>(m / MIN_BLK_Q)]
+        : 0.0f;
+
+    // PV accumulators: each lane holds 1 row × CL cols (lane 0..15 of half-warp)
+    float acc[CL];
+    #pragma unroll
+    for (int c = 0; c < CL; ++c) acc[c] = 0.0f;
+    float row_m = -3.0e38f, row_l = 0.0f;
+
+    for (int64_t kb = 0; kb < kv_len; kb += BN) {
+        // stage k_tile (BN × HD int8) cooperatively
+        {
+            const int64_t kqb = b * k_stride_b + kvh * k_stride_h;
+            constexpr int K_CHUNKS = (BN * HD) / 4;
+            constexpr int CHUNKS_PER_THREAD = (K_CHUNKS + NTHREAD - 1) / NTHREAD;
+            #pragma unroll 1
+            for (int it = 0; it < CHUNKS_PER_THREAD; ++it) {
+                int idx = tid + it * NTHREAD;
+                if (idx < K_CHUNKS) {
+                    int r = idx / QUADS;
+                    int cq = idx % QUADS;
+                    int64_t n = kb + r;
+                    const int8_t* krow = k + kqb + n * k_stride_n;
+                    *reinterpret_cast<int*>(&k_tile[r * HD + cq * 4]) =
+                        (n < kv_len) ? *reinterpret_cast<const int*>(krow + cq * 4) : 0;
+                }
+            }
+        }
+        // stage v_tile [HD][BN] from V_T
+        {
+            const int64_t vbase = b * v_stride_b + kvh * v_stride_n;
+            const int64_t vsd = v_stride_h;
+            #pragma unroll 1
+            for (int i = tid; i < HD * BN; i += NTHREAD) {
+                int d = i / BN, cj = i % BN;
+                int64_t n = kb + cj;
+                const __half* vp = v + vbase + d * vsd + n;
+                v_tile[d * BN + cj] = (n < kv_len) ? *vp : __float2half(0.0f);
+            }
+        }
+        __syncthreads();
+
+        // ---- QK: 16 lanes (0..15) collaborate on 1 QK value ----
+        if (valid) {
+            // Process 4 j at a time to overlap LDS reads with sdot4 compute
+            #pragma unroll 4
+            for (int j = 0; j < BN; ++j) {
+                int partial = 0;
+                #pragma unroll
+                for (int i = 0; i < QUADS_PER_LANE; ++i) {
+                    int d_chunk = lane_in_half * QUADS_PER_LANE + i;
+                    int k_chunk = *reinterpret_cast<const int*>(&k_tile[j * HD + d_chunk * 4]);
+                    partial = sdot4_i32_i8(q_reg[i], k_chunk, partial);
+                }
+                partial = warp_reduce_sdot4(partial);
+                float sc = static_cast<float>(partial) * (qs *
+                    k_scale[b * ks_stride_b + kvh * ks_stride_h + static_cast<int>((kb + j) / MIN_BLK_K)]);
+                int64_t n = kb + j;
+                if (ISC && n > m) sc = -3.0e38f;
+                if (n >= kv_len) sc = -3.0e38f;
+                if (lane_in_half == 0) {
+                    s_tile[row * BN + j] = sc;
+                }
+            }
+        }
+        __syncthreads();
+
+        // ---- softmax: all 16 lanes of half-warp do it (they all need row_m/row_l) ----
+        if (valid) {
+            float lm = -3.0e38f;
+            #pragma unroll 1
+            for (int j = 0; j < BN; ++j) lm = fmaxf(lm, s_tile[(warp * 2 + half_warp) * ROWS_PER_HALF * BN + j]);
+            float gm = fmaxf(row_m, lm);
+            float alpha = (row_l > 0.0f) ? exp2f(row_m - gm) : 0.0f;
+            row_m = gm; row_l *= alpha;
+            #pragma unroll
+            for (int c = 0; c < CL; ++c) acc[c] *= alpha;
+            float ps = 0.0f;
+            #pragma unroll 1
+            for (int j = 0; j < BN; ++j) {
+                float p = exp2f(s_tile[(warp * 2 + half_warp) * ROWS_PER_HALF * BN + j] - row_m);
+                p_tile[(warp * 2 + half_warp) * ROWS_PER_HALF * BN + j] = __float2half(p);
+                ps += p;
+            }
+            row_l += ps;
+        }
+        __syncthreads();
+
+        // ---- PV: 16 lanes (0..15 of half-warp) cooperate on 1 row × CL cols ----
+        // Each lane holds CL cols of its own row, so each lane uses p_tile[row * BN + jj].
+        if (valid) {
+            const int col_base = lane_in_half * CL;
+            #pragma unroll 2
+            for (int jj = 0; jj < BN; jj += 2) {
+                unsigned p2 = load_h2_quad(&p_tile[row * BN + jj]);
+                #pragma unroll
+                for (int c_local = 0; c_local < CL; ++c_local) {
+                    int c = col_base + c_local;
+                    acc[c_local] = fdot2_f32_f16(p2, load_h2_quad(&v_tile[c * BN + jj]), acc[c_local]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // ---- write back: 16 lanes of half-warp collectively write 1 row × 64 cols ----
+    // The 16 lanes in a half-warp own 1 row (row 0 of half-warp = row of lane_in_half==0).
+    // Each lane has acc[CL=4] for 4 cols. They write to that shared row.
+    if (valid) {
+        const float inv = 1.0f / row_l;
+        // owned row = row of lane_in_half==0 in this half-warp = (warp*2 + half_warp) * ROWS_PER_HALF
+        // Actually: lane 0..15 own rows 0..15 of warp, lane 16..31 own rows 16..31.
+        // The "owned row" for the half-warp is the first row in that half-warp.
+        const int64_t out_base = b * o_stride_b +
+            ((warp * 2 + half_warp) * ROWS_PER_HALF) * o_stride_n + h * o_stride_h;
+        const int col_base = lane_in_half * CL;
+        #pragma unroll
+        for (int c_local = 0; c_local < CL; ++c_local) {
+            int c = col_base + c_local;
+            out[out_base + c] = gfx10_out_convert<ODT>(acc[c_local] * inv);
+        }
+    }
+#endif
+}  // attn_kernel_gfx10_i8_v3_t
+
+// ============================================================================
+// gfx10 fp16/bf16 direct kernel v3.2: 1 warp = 2 rows, 16 lanes cooperate
+// ============================================================================
+template <int HD, bool ISC, int BN, typename QDT, typename ODT>
+__global__ void attn_kernel_gfx10_direct_v3_t(
+    // direct v3 padding marker
+    const QDT* __restrict__ q, const QDT* __restrict__ k,
+    const __half* __restrict__ v, ODT* __restrict__ out,
+    int64_t batch, int64_t qo_len, int64_t kv_len,
+    int64_t q_heads, int64_t kv_heads,
+    int64_t q_stride_b, int64_t q_stride_n, int64_t q_stride_h,
+    int64_t q_stride_n_dir_unused,
+    int64_t k_stride_b, int64_t k_stride_n, int64_t k_stride_h,
+    int64_t v_stride_b, int64_t v_stride_n, int64_t v_stride_h,
+    int64_t o_stride_b, int64_t o_stride_n, int64_t o_stride_h,
+    float sm_scale_log2e, int tensor_layout) {
+#if defined(__GFX10__)
+    constexpr int BM = 128;
+    constexpr int NW = 1;
+    constexpr int CL = HD / 16;  // D=64: 4 cols/lane, D=128: 8 cols/lane
+    constexpr int NTHREAD = 128;
+    constexpr int ROWS_PER_HALF = 16;
+    constexpr int ROWS_PER_WARP = 32;
+    constexpr int H2 = HD / 2;          // fp16 pairs per row
+    constexpr int H2_PER_LANE = H2 / 16;  // D=64: 2, D=128: 4
+    static_assert(H2_PER_LANE * 16 == H2, "H2 must be multiple of 16");
+    static_assert(NTHREAD == 128, "v3 expects 128 threads (4 warps)");
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int half_warp = lane >> 4;
+    const int lane_in_half = lane & 15;
+    const int row = warp * ROWS_PER_WARP + half_warp * ROWS_PER_HALF + lane_in_half;
+    const int64_t m = blockIdx.x * BM + row;
+    const int64_t b = blockIdx.z;
+    const int64_t h = blockIdx.y;
+    const int64_t kvh = h / (q_heads / kv_heads);
+    const bool valid = (m < qo_len);
+
+    __shared__ __half q_tile[BM * HD];
+    __shared__ __half k_tile[BN * HD];
+    __shared__ __half v_tile[HD * BN];
+    __shared__ float s_tile[BM * BN];
+    __shared__ __half p_tile[BM * BN];
+
+    // Pre-load Q into registers (lane_in_half = which D-dim chunk)
+    unsigned q_reg[H2_PER_LANE];
+    {
+        const int64_t qb = b * q_stride_b + h * q_stride_h;
+        const QDT* qrow = q + qb + m * q_stride_n;
+        #pragma unroll
+        for (int i = 0; i < H2_PER_LANE; ++i) {
+            int d_chunk = lane_in_half * H2_PER_LANE + i;
+            q_reg[i] = valid
+                ? *reinterpret_cast<const unsigned*>(&qrow[d_chunk * 2])
+                : 0u;
+        }
+    }
+
+    float acc[CL];
+    #pragma unroll
+    for (int c = 0; c < CL; ++c) acc[c] = 0.0f;
+    float row_m = -3.0e38f, row_l = 0.0f;
+
+    for (int64_t kb = 0; kb < kv_len; kb += BN) {
+        // stage k_tile (BN × HD)
+        {
+            const int64_t kqb = b * k_stride_b + kvh * k_stride_h;
+            constexpr int K_CHUNKS = (BN * HD) / 2;  // half-pairs
+            constexpr int CHUNKS_PER_THREAD = (K_CHUNKS + NTHREAD - 1) / NTHREAD;
+            #pragma unroll 1
+            for (int it = 0; it < CHUNKS_PER_THREAD; ++it) {
+                int idx = tid + it * NTHREAD;
+                if (idx < K_CHUNKS) {
+                    int r = idx / (HD / 2);
+                    int cp = idx % (HD / 2);
+                    int64_t n = kb + r;
+                    const QDT* krow = k + kqb + n * k_stride_n;
+                    *reinterpret_cast<unsigned*>(&k_tile[r * HD + cp * 2]) =
+                        (n < kv_len)
+                            ? *reinterpret_cast<const unsigned*>(&krow[cp * 2])
+                            : 0u;
+                }
+            }
+        }
+        // stage v_tile [HD][BN]
+        {
+            const int64_t vbase = b * v_stride_b + kvh * v_stride_n;
+            const int64_t vsd = v_stride_h;
+            #pragma unroll 1
+            for (int i = tid; i < HD * BN; i += NTHREAD) {
+                int d = i / BN, cj = i % BN;
+                int64_t n = kb + cj;
+                const __half* vp = v + vbase + d * vsd + n;
+                v_tile[d * BN + cj] = (n < kv_len) ? *vp : __float2half(0.0f);
+            }
+        }
+        __syncthreads();
+
+        // ---- QK: 16 lanes cooperate, fdot2 chain per chunk ----
+        if (valid) {
+            #pragma unroll
+            for (int j = 0; j < BN; ++j) {
+                float partial = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < H2_PER_LANE; ++i) {
+                    int d_chunk = lane_in_half * H2_PER_LANE + i;
+                    unsigned k_chunk = load_h2_quad(&k_tile[j * HD + d_chunk * 2]);
+                    partial = fdot2_f32_f16(q_reg[i], k_chunk, partial);
+                }
+                partial = warp_reduce_fadd(partial);
+                float sc = partial * sm_scale_log2e;
+                int64_t n = kb + j;
+                if (ISC && n > m) sc = -3.0e38f;
+                if (n >= kv_len) sc = -3.0e38f;
+                if (lane_in_half == 0) {
+                    s_tile[row * BN + j] = sc;
+                }
+            }
+        }
+        __syncthreads();
+
+        // ---- softmax: all 16 lanes of half-warp (each has own row_m/row_l) ----
+        if (valid) {
+            float lm = -3.0e38f;
+            #pragma unroll 1
+            for (int j = 0; j < BN; ++j) lm = fmaxf(lm, s_tile[row * BN + j]);
+            float gm = fmaxf(row_m, lm);
+            float alpha = (row_l > 0.0f) ? exp2f(row_m - gm) : 0.0f;
+            row_m = gm; row_l *= alpha;
+            #pragma unroll
+            for (int c = 0; c < CL; ++c) acc[c] *= alpha;
+            float ps = 0.0f;
+            #pragma unroll 1
+            for (int j = 0; j < BN; ++j) {
+                float p = exp2f(s_tile[row * BN + j] - row_m);
+                p_tile[row * BN + j] = __float2half(p);
+                ps += p;
+            }
+            row_l += ps;
+        }
+        __syncthreads();
+
+        // ---- PV: 16 lanes cooperate, each lane has its own row's acc and p_tile ----
+        if (valid) {
+            const int col_base = lane_in_half * CL;
+            #pragma unroll 2
+            for (int jj = 0; jj < BN; jj += 2) {
+                unsigned p2 = load_h2_quad(&p_tile[row * BN + jj]);
+                #pragma unroll
+                for (int c_local = 0; c_local < CL; ++c_local) {
+                    int c = col_base + c_local;
+                    acc[c_local] = fdot2_f32_f16(p2, load_h2_quad(&v_tile[c * BN + jj]), acc[c_local]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // ---- write back: 16 lanes of half-warp collectively write 1 row × 64 cols ----
+    if (valid) {
+        const float inv = 1.0f / row_l;
+        // owned row = (warp*2 + half_warp) * ROWS_PER_HALF (the first row of this half-warp)
+        const int64_t out_base = b * o_stride_b +
+            ((warp * 2 + half_warp) * ROWS_PER_HALF) * o_stride_n + h * o_stride_h;
+        const int col_base = lane_in_half * CL;
+        #pragma unroll
+        for (int c_local = 0; c_local < CL; ++c_local) {
+            int c = col_base + c_local;
+            out[out_base + c] = gfx10_out_convert<ODT>(acc[c_local] * inv);
+        }
+    }
+#endif
+}  // attn_kernel_gfx10_direct_v3_t
 
 
 }  // namespace sageattn_gfx10

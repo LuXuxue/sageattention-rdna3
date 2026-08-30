@@ -161,7 +161,6 @@ test_cases = [
     ("SDXL16", 1, 20, 20, 2304, 2304, 64, torch.float16),
     ("SDXL17", 1, 20, 20, 2304, 77, 64, torch.float16),
     ("SDXL18", 1, 20, 20, 2304, 154, 64, torch.float16),
-    #("SDXLVAE03", 1, 4, 4, 36864, 36864, 128, torch.float16),
 
     # 2. Anima，MHA: h_q == h_kv，BF16
     ("Anima01", 1, 16, 16, 4096, 4096, 128, torch.bfloat16),
@@ -172,7 +171,6 @@ test_cases = [
     ("AnimaVAE02", 1, 3, 3, 24576, 24576, 128, torch.bfloat16),
     ("Anima05", 1, 16, 16, 9216, 9216, 128, torch.bfloat16),
     ("Anima06", 1, 16, 16, 9216, 512, 128, torch.bfloat16),
-    #("AnimaVAE03", 1, 3, 3, 36864, 36864, 128, torch.bfloat16),
 
     # SDXL VAE (sdxl.vae.safetensors, LDM AutoencoderKL 结构):
     #   mid block attention 为单头 512 通道 (ch=128, ch_mult=[1,2,4,4] -> mid 512)，
