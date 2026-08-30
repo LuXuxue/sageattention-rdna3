@@ -147,14 +147,12 @@ test_cases = [
     ("SDXL04", 1, 20, 20, 1024, 1024, 64, torch.float16),
     ("SDXL05", 1, 20, 20, 1024, 77, 64, torch.float16),
     ("SDXL06", 1, 20, 20, 1024, 154, 64, torch.float16),
-    ("SDXLVAE01", 1, 4, 4, 16384, 16384, 128, torch.float16),
     ("SDXL07", 1, 10, 10, 6144, 6144, 64, torch.float16),
     ("SDXL08", 1, 10, 10, 6144, 77, 64, torch.float16),
     ("SDXL09", 1, 10, 10, 6144, 154, 64, torch.float16),
     ("SDXL10", 1, 20, 20, 1536, 1536, 64, torch.float16),
     ("SDXL11", 1, 20, 20, 1536, 77, 64, torch.float16),
     ("SDXL12", 1, 20, 20, 1536, 154, 64, torch.float16),
-    ("SDXLVAE02", 1, 4, 4, 24576, 24576, 128, torch.float16),
     ("SDXL13", 1, 10, 10, 9216, 9216, 64, torch.float16),
     ("SDXL14", 1, 10, 10, 9216, 77, 64, torch.float16),
     ("SDXL15", 1, 10, 10, 9216, 154, 64, torch.float16),
@@ -165,13 +163,12 @@ test_cases = [
     # 2. Anima，MHA: h_q == h_kv，BF16
     ("Anima01", 1, 16, 16, 4096, 4096, 128, torch.bfloat16),
     ("Anima02", 1, 16, 16, 4096, 512, 128, torch.bfloat16),
-    ("AnimaVAE01", 1, 3, 3, 16384, 16384, 128, torch.bfloat16),
     ("Anima03", 1, 16, 16, 6144, 6144, 128, torch.bfloat16),
     ("Anima04", 1, 16, 16, 6144, 512, 128, torch.bfloat16),
-    ("AnimaVAE02", 1, 3, 3, 24576, 24576, 128, torch.bfloat16),
     ("Anima05", 1, 16, 16, 9216, 9216, 128, torch.bfloat16),
     ("Anima06", 1, 16, 16, 9216, 512, 128, torch.bfloat16),
 
+    # 3. VAE
     # SDXL VAE (sdxl.vae.safetensors, LDM AutoencoderKL 结构):
     #   mid block attention 为单头 512 通道 (ch=128, ch_mult=[1,2,4,4] -> mid 512)，
     #   flash-attn / SageAttention 均不支持 head_dim=512，
@@ -185,6 +182,8 @@ test_cases = [
     #   1024x1536 -> latent 128x192  -> N = 24576
     #   1536x1536 -> latent 192x192  -> N = 36864
     #   1536x2304 -> latent 192x288  -> N = 55296
+    ("SDXLVAE01", 1, 4, 4, 16384, 16384, 128, torch.float16),
+    ("AnimaVAE01", 1, 3, 3, 16384, 16384, 128, torch.bfloat16),
 
     # 4. Krea2，GQA: h_q = 48, h_kv = 12
     # 如启用，请根据实际模型精度修改最后一个 dtype 字段。

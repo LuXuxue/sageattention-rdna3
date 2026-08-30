@@ -5,7 +5,7 @@ from typing import Any, Optional, Tuple, Union
 # Backend selection via environment variable:
 #   SAGEATTN_BACKEND=triton            - Triton autotune kernel (default, best perf)
 #   SAGEATTN_BACKEND=native            - HIP native WMMA kernel (transposed layout)
-_BACKEND = os.getenv("SAGEATTN_BACKEND", "triton").lower()
+_BACKEND = os.getenv("SAGEATTN_BACKEND", "native").lower()
 
 _qattn_gfx11 = None
 GFX11_NATIVE_ENABLED = False

@@ -51,6 +51,7 @@ constexpr int LDS_PAD = 16;
 // gfx10 (RDNA2) 独立实现: kernel 依赖上方 MIN_BLK_Q/MIN_BLK_K/kLog2e 常量,
 // 故在此处 (常量定义之后) include。mma_gfx10.h 自带 #pragma once。
 #include "mma_gfx10.h"
+#include "attn_gfx10_new.h"
 
 Tensor new_empty_like(const Tensor& like, std::initializer_list<int64_t> sizes, ScalarType dtype) {
     return torch::stable::new_empty(like, std::vector<int64_t>(sizes), std::make_optional(dtype));
@@ -2186,7 +2187,7 @@ Tensor qk_int8_sv_bf16_attn_gfx11_t(
                 do { \
                     dim3 b10(128); \
                     dim3 g10((qo_len + 63) / 64, q_heads, batch); \
-                    sageattn_gfx10::attn_kernel_gfx10_i8_v2_t<HD, C, BN, ODT><<<g10, b10, 0, stream>>>( \
+                    sageattn_gfx10::attn_kernel_gfx10_i8_v3_t<HD, C, BN, ODT><<<g10, b10, 0, stream>>>( \
                         reinterpret_cast<const int8_t*>(query.data_ptr()), \
                         reinterpret_cast<const int8_t*>(key.data_ptr()), \
                         reinterpret_cast<const __half*>(value.data_ptr()), \
@@ -2236,8 +2237,11 @@ Tensor qk_int8_sv_bf16_attn_gfx11_t(
                     }
                 }
             } else {
-                const int bn = (kv_len <= 77) ? 16 : 16;  // v3.4: BN=16 for v3
-                if (use_v3) {
+                // D=128: V2 + BN=32 显著优于 V3 + BN=16 (D=128 V3 kernel 在 RDNA2 上
+                // LDS 占用翻倍 → occupancy 崩溃, 详见 §11.5 演进); V3 仅在 SAGEATTN_GFX10_V3=1 强制时使用
+                const bool use_v3_d128 = (v3_mode == 1);
+                const int bn = (kv_len <= 77) ? 16 : 32;
+                if (use_v3_d128) {
                     if (is_causal) { if (out_bf) L10_V3(128, true, 16, __hip_bfloat16); else L10_V3(128, true, 16, __half); }
                     else { if (out_bf) L10_V3(128, false, 16, __hip_bfloat16); else L10_V3(128, false, 16, __half); }
                 } else if (use_v22) {
