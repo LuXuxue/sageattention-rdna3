@@ -1947,8 +1947,10 @@ Tensor v_transpose_gfx110x(Tensor value, Tensor value_t, int64_t tensor_layout) 
     dim3 block(256);
     // grid 分派: 小数据量 (total_tiles <= 4096) 用 grid=192 (每 block 多 tile),
     // 实测 SDXL10 (1920 tiles) v_transpose 0.237→0.147ms (-38%, 固定开销占比大);
-    // 大数据量保持每 block 1 tile (Anima01 8192 tiles grid 减小反而 +5-10%, barrier
-    // 串行 + L2 局部性损失)。SAGEATTN_VT_GRID: 0=auto, N=强制固定 grid
+    // 大数据量曾用 grid=total (每 block 1 tile)。2026-09 复核: D128 int8 self
+    // (8k-18k tiles) 下 grid=total 在部分 GPU 状态下调度/同步开销主导 (实测慢 40-60%),
+    // 折中 cap ~total/10 (上限 1536), 稳定态不同态均不劣化 (交错 A/B 全程 ±5% 内,
+    // 设计 C 再优 1-7%)。SAGEATTN_VT_GRID: 0=auto, N=强制固定 grid
     int64_t grid_cap;
     const char* vt_grid_env = getenv("SAGEATTN_VT_GRID");
     if (vt_grid_env && atoi(vt_grid_env) > 0) {
@@ -1956,7 +1958,7 @@ Tensor v_transpose_gfx110x(Tensor value, Tensor value_t, int64_t tensor_layout) 
     } else if (total_tiles <= 4096) {
         grid_cap = 192;
     } else {
-        grid_cap = total_tiles;
+        grid_cap = std::min<int64_t>(std::max<int64_t>(total_tiles / 10, 128), 1536);
     }
     dim3 grid(static_cast<unsigned>(std::min(total_tiles, grid_cap)));
     if (value.scalar_type() == ScalarType::BFloat16) {
