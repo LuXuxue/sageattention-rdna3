@@ -27,6 +27,10 @@ __inline__ __device__ T blockReduceMax(T val)
     __syncthreads();
     val = (threadIdx.x < (blockDim.x / 32.f)) ? shared[lane] : -1e20f;
     val = warpReduceMax(val);
+    // 尾随 barrier: 防止本调用 warp0 对 shared[lane] 的读阶段
+    // 与下一次调用 (RATIO 循环) 其它 warp lane0 对 shared[wid] 的写阶段重叠
+    // (data race -> D=64 int8 quant 的 q_scale/q_int8 非确定, 见 try.md §4)
+    __syncthreads();
     return val;
 }
 

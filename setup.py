@@ -15,7 +15,6 @@ cmdclass = {}
 
 
 def append_env_flags(flags, env_name):
-    """Append extra compiler flags from environment variable."""
     extra = os.getenv(env_name, "").strip()
     if extra:
         flags += extra.split()
@@ -61,7 +60,6 @@ def configure_rocm(default_rocm_home):
         sdk_bin,
     ]
 
-    # On Windows, ensure MSVC linker (link.exe) and SDK tools (rc.exe) are findable
     if os.name == "nt":
         msvc_link_dir = _find_msvc_bin_dir()
         if msvc_link_dir:
@@ -77,7 +75,6 @@ def configure_rocm(default_rocm_home):
 
 
 def _find_msvc_bin_dir():
-    """Find the MSVC Hostx64/x64 bin directory containing link.exe."""
     import glob
     patterns = [
         r"C:\Program Files (x86)\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64",
@@ -93,7 +90,6 @@ def _find_msvc_bin_dir():
 
 
 def _find_windows_sdk_bin():
-    """Find the Windows SDK x64 bin directory containing rc.exe."""
     import glob
     matches = sorted(
         glob.glob(r"C:\Program Files (x86)\Windows Kits\10\bin\*\x64"),
@@ -106,10 +102,8 @@ def _find_windows_sdk_bin():
 
 
 def _get_msvc_lib_dirs():
-    """Get MSVC and Windows SDK library directories for linking."""
     import glob
     dirs = []
-    # MSVC lib
     msvc_patterns = [
         r"C:\Program Files (x86)\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\lib\x64",
         r"C:\Program Files\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\lib\x64",
@@ -119,7 +113,6 @@ def _get_msvc_lib_dirs():
         if matches:
             dirs.append(matches[0])
             break
-    # Windows SDK libs
     sdk_patterns = [
         r"C:\Program Files (x86)\Windows Kits\10\Lib\*\ucrt\x64",
         r"C:\Program Files (x86)\Windows Kits\10\Lib\*\um\x64",
@@ -134,9 +127,10 @@ def _get_msvc_lib_dirs():
 def get_target_archs():
     """Get target AMD GPU architectures.
 
-    Supports gfx1103 (RDNA3, WMMA) and gfx1035 (RDNA2, MFMA/V_DOT4) so a single
-    built wheel can run on both. Select via env GPU_ARCHS / PYTORCH_ROCM_ARCH
-    (e.g. "gfx1035;gfx1103"), else defaults to both installed device wheels.
+    Supports gfx110x (RDNA3, WMMA) and gfx103x (RDNA2, V_DOT4/V_DOT2) so a single
+    built tree can produce either or both extension modules. Select via
+    GPU_ARCHS / PYTORCH_ROCM_ARCH (e.g. "gfx1035;gfx1103"), else defaults to
+    both installed device wheels.
     """
     env_archs = os.getenv("GPU_ARCHS") or os.getenv("PYTORCH_ROCM_ARCH")
     if env_archs:
@@ -148,6 +142,52 @@ def get_target_archs():
         if out:
             return out
     return ["gfx1103", "gfx1035"]
+
+
+def split_archs(archs):
+    """Split arch list into RDNA3 (gfx11xx) and RDNA2 (gfx103x) groups.
+
+    Returns (archs_11, archs_103). RDNA1 (gfx10xx except gfx103x) is not
+    supported and triggers a warning.
+    """
+    a11, a103, other = [], [], []
+    for a in archs:
+        if a.startswith("gfx11"):
+            a11.append(a)
+        elif a.startswith("gfx103"):
+            a103.append(a)
+        else:
+            other.append(a)
+    if other:
+        warnings.warn(
+            f"Unsupported AMD arch(s) {other} ignored. "
+            "Supported: gfx110x (RDNA3), gfx103x (RDNA2)."
+        )
+    return a11, a103
+
+
+def base_hip_flags(rocm_home, abi, limited_api_flags):
+    return [
+        "-O3",
+        "-std=c++17",
+        "-ffast-math",
+        "-fgpu-flush-denormals-to-zero",
+        "-fno-offload-uniform-block",
+        "-D__HIP_PLATFORM_AMD__=1",
+        "-U__HIP_NO_HALF_OPERATORS__",
+        "-U__HIP_NO_HALF_CONVERSIONS__",
+        f"-D_GLIBCXX_USE_CXX11_ABI={abi}",
+        "-mllvm", "--lsr-drop-solution=1",
+        "-mllvm", "-enable-post-misched=1",
+        "-mllvm", "-amdgpu-early-inline-all=true",
+        "-mllvm", "-amdgpu-function-calls=false",
+        "-mllvm", "-amdgpu-max-memory-clause=32",
+        "-mllvm", "-amdgpu-vgpr-index-mode=1",
+        f"--rocm-path={rocm_home}",
+        # V 全局转置 PV 方案 (out = P @ V, V_T [B,H,D,N] 行读 B operand):
+        # 消除 v_frag 的 128 次 u16 LDS 列读, 大幅提升 PV 效率
+        "-DSAGEATTN_VT_GLOBAL=1",
+    ] + limited_api_flags
 
 
 if not SKIP_BUILD:
@@ -164,104 +204,82 @@ if not SKIP_BUILD:
         target_archs = get_target_archs()
         print(f"Target AMD GPU architectures: {target_archs}")
 
-        if not any(a.startswith("gfx11") for a in target_archs):
-            warnings.warn(
-                f"Target architectures {target_archs} contain no gfx11xx. "
-                "The extension also supports gfx10xx (RDNA2, MFMA/V_DOT4)."
+        archs_11, archs_103 = split_archs(target_archs)
+        if not archs_11 and not archs_103:
+            raise RuntimeError(
+                f"No supported AMD archs in {target_archs}. "
+                "Need gfx110x (RDNA3) or gfx103x (RDNA2)."
             )
-            CXX_FLAGS = [
-                "/O2",
-                "/std:c++17",
-                "/permissive-",
-                f"/D_GLIBCXX_USE_CXX11_ABI={ABI}",
-            ]
-        else:
-            CXX_FLAGS = [
-                "-O3",
-                "-std=c++17",
-                f"-D_GLIBCXX_USE_CXX11_ABI={ABI}",
-            ]
-        CXX_FLAGS += LIMITED_API_FLAGS
 
-        HIP_FLAGS = [
+        CXX_FLAGS_BASE = [
             "-O3",
             "-std=c++17",
-            "-ffast-math",
-            "-fgpu-flush-denormals-to-zero",
-            "-fno-offload-uniform-block",
-            "-D__HIP_PLATFORM_AMD__=1",
-            "-U__HIP_NO_HALF_OPERATORS__",
-            "-U__HIP_NO_HALF_CONVERSIONS__",
             f"-D_GLIBCXX_USE_CXX11_ABI={ABI}",
-            "-mllvm",
-            "--lsr-drop-solution=1",
-            "-mllvm",
-            "-enable-post-misched=1",
-            "-mllvm",
-            "-amdgpu-early-inline-all=true",
-            "-mllvm",
-            "-amdgpu-function-calls=false",
-            "-mllvm",
-            "-amdgpu-max-memory-clause=32",
-            "-mllvm",
-            "-amdgpu-vgpr-index-mode=1",
-            f"--rocm-path={rocm_home}",
-            # V 全局转置 PV 方案 (out = P @ V, V_T [B,H,D,N] 行读 B operand):
-            # 消除 v_frag 的 128 次 u16 LDS 列读, 大幅提升 PV 效率
-            # (配合 core.py 的 V 转置; 若需旧路径, 改为 -DSAGEATTN_VT_GLOBAL=0 并关 core 转置)
-            "-DSAGEATTN_VT_GLOBAL=1",
         ] + LIMITED_API_FLAGS
-
-        # Emit device code for each target arch. gfx1035 (RDNA2) uses V_DOT4_I32_I8
-        # for the int8 QK and V_DOT2_F32_F16 for the fp16 PV — both are SIMD dot
-        # instructions that need NO extra target feature (gfx1035 enables them by
-        # default; verified by probe). Do NOT pass "+mai-insts" here: it is only
-        # needed for MFMA (unavailable on RDNA2 consumer gfx1035 per gfx1035.md
-        # §0.12) and it is a global clang flag that, when combined in the same
-        # multi-arch hipcc invocation, also reaches gfx1103 and crashes the LLVM
-        # AMDGPU backend during WMMA codegen (Branch relaxation pass segfault).
-        for arch in target_archs:
-            HIP_FLAGS.append(f"--offload-arch={arch}")
 
         rocm_device_lib_path = os.path.join(
             rocm_home, "lib", "llvm", "amdgcn", "bitcode"
         )
-        if os.path.isdir(rocm_device_lib_path):
-            HIP_FLAGS.append(f"--rocm-device-lib-path={rocm_device_lib_path}")
-
-        append_env_flags(CXX_FLAGS, "CXX_APPEND_FLAGS")
-        append_env_flags(HIP_FLAGS, "NVCC_APPEND_FLAGS")
-        append_env_flags(HIP_FLAGS, "HIPCC_APPEND_FLAGS")
 
         include_dirs = unique_paths([os.path.join(rocm_home, "include")])
 
-        # On Windows, find MSVC/SDK library paths for linking
         extra_link_args = []
         if os.name == "nt":
             link_lib_dirs = _get_msvc_lib_dirs()
             for d in link_lib_dirs:
                 extra_link_args.append(f"/LIBPATH:{d}")
 
-        ext_modules.append(
-            CUDAExtension(
-                name="sageattention._qattn_gfx11",
-                sources=[
-                    "csrc/pybind_gfx11.cpp",
-                    "csrc/attn_gfx11.cu",
-                ],
-                include_dirs=include_dirs,
-                extra_compile_args={
-                    "cxx": CXX_FLAGS,
-                    "nvcc": HIP_FLAGS,
-                },
-                extra_link_args=extra_link_args,
-                py_limited_api=True,
+        if archs_11:
+            print(f"  Building RDNA3 (gfx110x) extension for: {archs_11}")
+            hip_flags_11 = base_hip_flags(rocm_home, ABI, LIMITED_API_FLAGS)
+            for a in archs_11:
+                hip_flags_11.append(f"--offload-arch={a}")
+            if os.path.isdir(rocm_device_lib_path):
+                hip_flags_11.append(f"--rocm-device-lib-path={rocm_device_lib_path}")
+            append_env_flags(CXX_FLAGS_BASE, "CXX_APPEND_FLAGS")
+            append_env_flags(hip_flags_11, "NVCC_APPEND_FLAGS")
+            append_env_flags(hip_flags_11, "HIPCC_APPEND_FLAGS")
+            ext_modules.append(
+                CUDAExtension(
+                    name="sageattention._qattn_gfx110x",
+                    sources=[
+                        "csrc/pybind_gfx110x.cpp",
+                        "csrc/attn_gfx110x.cu",
+                    ],
+                    include_dirs=include_dirs,
+                    extra_compile_args={"cxx": CXX_FLAGS_BASE, "nvcc": hip_flags_11},
+                    extra_link_args=extra_link_args,
+                    py_limited_api=True,
+                )
             )
-        )
+
+        if archs_103:
+            print(f"  Building RDNA2 (gfx103x) extension for: {archs_103}")
+            hip_flags_103 = base_hip_flags(rocm_home, ABI, LIMITED_API_FLAGS)
+            for a in archs_103:
+                hip_flags_103.append(f"--offload-arch={a}")
+            if os.path.isdir(rocm_device_lib_path):
+                hip_flags_103.append(f"--rocm-device-lib-path={rocm_device_lib_path}")
+            append_env_flags(CXX_FLAGS_BASE, "CXX_APPEND_FLAGS_103")
+            append_env_flags(hip_flags_103, "NVCC_APPEND_FLAGS_103")
+            append_env_flags(hip_flags_103, "HIPCC_APPEND_FLAGS_103")
+            ext_modules.append(
+                CUDAExtension(
+                    name="sageattention._qattn_gfx103x",
+                    sources=[
+                        "csrc/pybind_gfx103x.cpp",
+                        "csrc/attn_gfx103x.cu",
+                    ],
+                    include_dirs=include_dirs,
+                    extra_compile_args={"cxx": CXX_FLAGS_BASE, "nvcc": hip_flags_103},
+                    extra_link_args=extra_link_args,
+                    py_limited_api=True,
+                )
+            )
     else:
         warnings.warn(
             "ROCm/HIP not detected (torch.version.hip is None). "
-            "Skipping the gfx11 native attention extension. "
+            "Skipping the native attention extension. "
             "This package requires a ROCm-enabled PyTorch build with an AMD GPU."
         )
 
@@ -270,8 +288,8 @@ if not SKIP_BUILD:
 setup(
     name="sageattention",
     version="0.1.0",
-    description="SageAttention HIP native implementation for RDNA3 (gfx11xx)",
-    author="SageAttention RDNA3 Contributors",
+    description="SageAttention HIP native implementation for AMD RDNA GPUs (gfx110x RDNA3, gfx103x RDNA2)",
+    author="SageAttention RDNA Contributors",
     license="Apache-2.0",
     packages=find_packages(),
     ext_modules=ext_modules,

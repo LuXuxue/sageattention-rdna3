@@ -3,38 +3,76 @@ import os
 from typing import Any, Optional, Tuple, Union
 
 # Backend selection via environment variable:
-#   SAGEATTN_BACKEND=triton            - Triton autotune kernel (default, best perf)
-#   SAGEATTN_BACKEND=native            - HIP native WMMA kernel (transposed layout)
+#   SAGEATTN_BACKEND=triton            - Triton autotune kernel
+#   SAGEATTN_BACKEND=native            - HIP native WMMA kernel
 _BACKEND = os.getenv("SAGEATTN_BACKEND", "native").lower()
 
-_qattn_gfx11 = None
-GFX11_NATIVE_ENABLED = False
+# 运行时懒加载 native extension: 按当前 HIP 设备的 gfx arch 选择 _qattn_gfx110x (RDNA3) 或 _qattn_gfx103x (RDNA2)
+# 避免 import 时硬编码单架构; 同进程只加载匹配设备的一个 pyd, torch.ops.sageattention 注册不冲突
+_qattn_ops = None
+GFX_NATIVE_ENABLED = False
+GFX_ARCH_LOADED = None  # 记录实际加载的扩展 (gfx110x / gfx103x)
 _import_error = None
 
-try:
-    from . import _qattn_gfx11 as _ext
-    _qattn_gfx11 = torch.ops.sageattention
-    GFX11_NATIVE_ENABLED = True
-except Exception as e:
-    _import_error = e
+def _detect_gfx_arch():
+    """Return 'gfx110x' (RDNA3) or 'gfx103x' (RDNA2) for current HIP device, or None."""
+    try:
+        if not torch.cuda.is_available():
+            return None
+        dev = torch.cuda.current_device()
+        prop = torch.cuda.get_device_properties(dev)
+        # 优先 gcnArchName (ROCm HIP 返回 "gfx1103" 等); 回退 major 整型
+        name = getattr(prop, 'gcnArchName', None) or getattr(prop, 'name', '')
+        if isinstance(name, str) and name.startswith('gfx'):
+            if name.startswith('gfx11'):
+                return 'gfx110x'
+            if name.startswith('gfx103'):
+                return 'gfx103x'
+            return None
+        # 回退: prop.major 是 gfx major (gfx1103 -> 11)
+        mj = getattr(prop, 'major', None)
+        if mj == 11:
+            return 'gfx110x'
+        if mj == 10:
+            return 'gfx103x'
+        return None
+    except Exception:
+        return None
+
+
+def _load_native_extension(arch):
+    """Import the native pyd for the given arch ('gfx110x' or 'gfx103x')."""
+    mod_name = f'_qattn_{arch}'
+    import importlib
+    mod = importlib.import_module(f'.{mod_name}', package=__package__ or 'sageattention')
+    return mod, torch.ops.sageattention
 
 
 def _get_native_ops():
-    global _qattn_gfx11, GFX11_NATIVE_ENABLED
-    if _qattn_gfx11 is None:
-        try:
-            from . import _qattn_gfx11 as _ext
-            _qattn_gfx11 = torch.ops.sageattention
-            GFX11_NATIVE_ENABLED = True
-        except Exception as e:
-            raise RuntimeError(
-                "sageattention native extension (_qattn_gfx11) is not available. "
-                "Please build and install the package with:\n"
-                "  pip install -e . --no-build-isolation\n"
-                "on a system with ROCm/HIP and a gfx11xx GPU.\n"
-                f"Original error: {e}"
-            ) from e
-    return _qattn_gfx11
+    global _qattn_ops, GFX_NATIVE_ENABLED, GFX_ARCH_LOADED, _import_error
+    if _qattn_ops is not None:
+        return _qattn_ops
+    arch = _detect_gfx_arch()
+    if arch is None:
+        raise RuntimeError(
+            "sageattention native extension: cannot determine AMD gfx arch of current device. "
+            "Supported: gfx110x (RDNA3), gfx103x (RDNA2). "
+            "Use backend='triton' or set SAGEATTN_BACKEND=triton."
+        )
+    try:
+        _load_native_extension(arch)  # import side effect registers torch.ops
+        _qattn_ops = torch.ops.sageattention
+        GFX_NATIVE_ENABLED = True
+        GFX_ARCH_LOADED = arch
+    except Exception as e:
+        _import_error = e
+        raise RuntimeError(
+            f"sageattention native extension (_qattn_{arch}) is not available. "
+            f"Build with GPU_ARCHS containing an {arch[:-1]}* arch, e.g.\n"
+            "  GPU_ARCHS=gfx1103 pip install -e . --no-build-isolation\n"
+            f"on a ROCm/HIP system.\nOriginal error: {e}"
+        ) from e
+    return _qattn_ops
 
 
 def sageattn(

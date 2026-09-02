@@ -84,10 +84,12 @@ def sageattn(backend):
     try:
         from sageattention import sageattn
         if backend == "native":
-            from sageattention.core import GFX11_NATIVE_ENABLED
-            if not GFX11_NATIVE_ENABLED:
+            from sageattention.core import _get_native_ops
+            try:
+                _get_native_ops()
+            except Exception as e:
                 pytest.skip(
-                    "sageattention native extension (_qattn_gfx11) not built. "
+                    f"sageattention native extension not built: {e}. "
                     "Run: pip install -e . --no-build-isolation on a ROCm/HIP system."
                 )
         return sageattn
