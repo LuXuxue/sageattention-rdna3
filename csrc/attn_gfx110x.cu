@@ -145,6 +145,36 @@ __global__ void mean_hnd_kernel(
     }
 }
 
+// 多值 blockReduceMax: 一次屏障对 RATIO 个标量并行归约 (原方案 RATIO 次串行
+// blockReduceMax 产生 2*RATIO 次 barrier; D=64 BLK=128 RATIO=4 时每块 8+2 次 barrier
+// 缩为一次向量归约的 2 次 barrier + 1 次 amax 守卫 barrier)
+template <typename T, int N>
+__device__ __forceinline__ void blockReduceMaxVec(T* val) {
+    static __shared__ T shared[32][N];
+    const int lane = threadIdx.x & 0x1f;
+    const int wid  = threadIdx.x >> 5;
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) {
+#pragma unroll
+        for (int i = 0; i < N; ++i) val[i] = fmaxf(val[i], __shfl_xor_sync(FINAL_MASK, val[i], m, 32));
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int i = 0; i < N; ++i) shared[wid][i] = val[i];
+    }
+    __syncthreads();
+    if (threadIdx.x < (blockDim.x / 32)) {
+#pragma unroll
+        for (int i = 0; i < N; ++i) val[i] = fmaxf(val[i], shared[lane][i]);
+    }
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) {
+#pragma unroll
+        for (int i = 0; i < N; ++i) val[i] = fmaxf(val[i], __shfl_xor_sync(FINAL_MASK, val[i], m, 32));
+    }
+    __syncthreads();
+}
+
 template <typename T, int HeadDim, int BLK, int MIN_BLK>
 __global__ void quant_qk_int8_hnd_kernel(
     const T* __restrict__ input,
@@ -164,13 +194,13 @@ __global__ void quant_qk_int8_hnd_kernel(
     constexpr int Threads = 256;
     // 大 block (BLK 行) + MIN_BLK 粒度 scale: block 处理 BLK 行, 每 MIN_BLK 行一组
     // 独立 amax (RATIO 组), 用 RATIO 个 fmax 累加器 ILP —— 避免大 block 的串行 fmax 链
-    // (报告 §八: MIN_BLK 调大触发 fmax 串行依赖链 +37-45%; 此处 MIN_BLK 不变, 只放大
-    // 每 block 的吞吐/减少 block 调度开销, 对齐 triton 的 BLK=128 大 block quant)
     constexpr int RATIO = BLK / MIN_BLK;
     constexpr int PackElems = 8;
-    // pass1 读入的原始数据缓存在 LDS (Q 128 行 D=128 = 32KB, K 64 行 = 16KB), pass2 从 LDS 读
+    constexpr int Packs = (BLK * HeadDim) / 8;
+    constexpr int PackPairs = Packs / 2;
+    constexpr int PPT = (PackPairs + Threads - 1) / Threads;  // 每 thread 的 pack-pair 数
+    // pass1 原始数据缓存于寄存器 (免 shared_data LDS 往返 + 尾部 barrier), 仅剩 shared_amax
     __shared__ float shared_amax[RATIO];
-    __shared__ uint4 shared_data[(BLK * HeadDim) / 8];
 
     const int head = blockIdx.y;
     const int b = blockIdx.z;
@@ -187,63 +217,72 @@ __global__ void quant_qk_int8_hnd_kernel(
         const int tid = threadIdx.x;
         constexpr int Packs = (BLK * HeadDim) / 8;
 
-        // ---- pass1: 读全局 (32B/thread) -> shared_data + 分组 amax (RATIO 累加器 ILP) ----
+        // ---- pass1: 读全局 (32B/thread) -> 寄存器缓存 + 分组 amax (RATIO 累加器 ILP) ----
         float local_amax[RATIO];
 #pragma unroll
         for (int r = 0; r < RATIO; ++r) local_amax[r] = 1e-7f;
-        for (int p = tid; p < Packs / 2; p += Threads) {
-            const int pack = p * 2;
-            const int elem_base = pack * PackElems;
-            const int row = elem_base / HeadDim;
-            const int d = elem_base - row * HeadDim;
-            const int64_t seq = base_row + row;
-            if (seq < seq_len) {
-                const int64_t in_off = static_cast<int64_t>(b) * in_stride_b + seq * in_stride_n + head * in_stride_h + d;
-                const uint4 raw0 = *reinterpret_cast<const uint4*>(input + in_off);
-                const uint4 raw1 = *reinterpret_cast<const uint4*>(input + in_off + 8);
-                shared_data[pack] = raw0;
-                shared_data[pack + 1] = raw1;
-                const int r = row / MIN_BLK;
-                const T* v0 = reinterpret_cast<const T*>(&raw0);
-                const T* v1 = reinterpret_cast<const T*>(&raw1);
-                float am = local_amax[r];
-                if (!is_q && key_mean != nullptr) {
+        uint4 reg[PPT][2];
 #pragma unroll
-                    for (int i = 0; i < 8; ++i) {
-                        float v = to_float(v0[i]) - to_float(key_mean[(b * heads + head) * HeadDim + d + i]);
-                        am = fmaxf(am, fabsf(v * pass1_scale));
-                    }
+        for (int it = 0; it < PPT; ++it) {
+            const int p = tid + it * Threads;
+            uint4 raw0 = make_uint4(0, 0, 0, 0);
+            uint4 raw1 = make_uint4(0, 0, 0, 0);
+            if (p < PackPairs) {
+                const int pack = p * 2;
+                const int elem_base = pack * PackElems;
+                const int row = elem_base / HeadDim;
+                const int d = elem_base - row * HeadDim;
+                const int64_t seq = base_row + row;
+                if (seq < seq_len) {
+                    const int64_t in_off = static_cast<int64_t>(b) * in_stride_b + seq * in_stride_n + head * in_stride_h + d;
+                    raw0 = *reinterpret_cast<const uint4*>(input + in_off);
+                    raw1 = *reinterpret_cast<const uint4*>(input + in_off + 8);
+                    const int r = row / MIN_BLK;
+                    const T* v0 = reinterpret_cast<const T*>(&raw0);
+                    const T* v1 = reinterpret_cast<const T*>(&raw1);
+                    float am = local_amax[r];
+                    if (!is_q && key_mean != nullptr) {
 #pragma unroll
-                    for (int i = 0; i < 8; ++i) {
-                        float v = to_float(v1[i]) - to_float(key_mean[(b * heads + head) * HeadDim + d + 8 + i]);
-                        am = fmaxf(am, fabsf(v * pass1_scale));
-                    }
-                } else {
+                        for (int i = 0; i < 8; ++i) {
+                            float v = to_float(v0[i]) - to_float(key_mean[(b * heads + head) * HeadDim + d + i]);
+                            am = fmaxf(am, fabsf(v * pass1_scale));
+                        }
 #pragma unroll
-                    for (int i = 0; i < 8; ++i) {
-                        float v = to_float(v0[i]);
-                        am = fmaxf(am, fabsf(v * pass1_scale));
-                    }
+                        for (int i = 0; i < 8; ++i) {
+                            float v = to_float(v1[i]) - to_float(key_mean[(b * heads + head) * HeadDim + d + 8 + i]);
+                            am = fmaxf(am, fabsf(v * pass1_scale));
+                        }
+                    } else {
 #pragma unroll
-                    for (int i = 0; i < 8; ++i) {
-                        float v = to_float(v1[i]);
-                        am = fmaxf(am, fabsf(v * pass1_scale));
+                        for (int i = 0; i < 8; ++i) {
+                            float v = to_float(v0[i]);
+                            am = fmaxf(am, fabsf(v * pass1_scale));
+                        }
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            float v = to_float(v1[i]);
+                            am = fmaxf(am, fabsf(v * pass1_scale));
+                        }
                     }
+                    local_amax[r] = am;
                 }
-                local_amax[r] = am;
-            } else {
-                shared_data[pack] = make_uint4(0, 0, 0, 0);
-                shared_data[pack + 1] = make_uint4(0, 0, 0, 0);
             }
+            reg[it][0] = raw0;
+            reg[it][1] = raw1;
         }
-        // 归约 RATIO 个 amax (blockReduceMax 内部有 barrier, 尾部子块写 scale 需守卫防越界)
-        for (int r = 0; r < RATIO; ++r) {
-            const float block_amax = vllm::blockReduceMax(local_amax[r]);
-            if (tid == 0) {
-                shared_amax[r] = block_amax;
+        // ---- 归约: RATIO 个 amax 一次向量 blockReduce (2 barriers 只付一次) ----
+        float red[RATIO];
+#pragma unroll
+        for (int r = 0; r < RATIO; ++r) red[r] = local_amax[r];
+        blockReduceMaxVec<float, RATIO>(red);
+        if (tid == 0) {
+#pragma unroll
+            for (int r = 0; r < RATIO; ++r) {
+                shared_amax[r] = red[r];
+                // 尾部子块写 scale 需守卫防越界
                 if (base_row + static_cast<int64_t>(r) * MIN_BLK < seq_len) {
                     scale_out[(static_cast<int64_t>(b) * heads + head) * scale_groups + blk * RATIO + r] =
-                        block_amax / 127.0f;
+                        red[r] / 127.0f;
                 }
             }
         }
@@ -252,72 +291,75 @@ __global__ void quant_qk_int8_hnd_kernel(
 #pragma unroll
         for (int r = 0; r < RATIO; ++r) inv_scale[r] = 127.0f / shared_amax[r];
 
-        // ---- pass2: 从 LDS 读 -> 量化 (按子块 r 选 scale) -> 写回 ----
-        for (int p = tid; p < Packs / 2; p += Threads) {
-            const int pack = p * 2;
-            const int elem_base = pack * PackElems;
-            const int row = elem_base / HeadDim;
-            const int d = elem_base - row * HeadDim;
-            const int64_t seq = base_row + row;
-            if (seq < seq_len) {
-                const int r = row / MIN_BLK;
-                const int64_t out_off = (static_cast<int64_t>(b) * heads + head) * seq_len * HeadDim + seq * HeadDim + d;
-                const uint4 raw0 = shared_data[pack];      // pass1 缓存在 LDS, 省全局重读
-                const uint4 raw1 = shared_data[pack + 1];
-                const T* values = reinterpret_cast<const T*>(&raw0);
-                const T* values1 = reinterpret_cast<const T*>(&raw1);
-                char4 out0, out1, out2, out3;
-                float v0 = to_float(values[0]), v1 = to_float(values[1]);
-                float v2 = to_float(values[2]), v3 = to_float(values[3]);
-                float v4 = to_float(values[4]), v5 = to_float(values[5]);
-                float v6 = to_float(values[6]), v7 = to_float(values[7]);
-                float w0 = to_float(values1[0]), w1 = to_float(values1[1]);
-                float w2 = to_float(values1[2]), w3 = to_float(values1[3]);
-                float w4 = to_float(values1[4]), w5 = to_float(values1[5]);
-                float w6 = to_float(values1[6]), w7 = to_float(values1[7]);
-                if (!is_q && key_mean != nullptr) {
-                    const int64_t mean_base = (b * heads + head) * HeadDim + d;
-                    v0 -= to_float(key_mean[mean_base + 0]);
-                    v1 -= to_float(key_mean[mean_base + 1]);
-                    v2 -= to_float(key_mean[mean_base + 2]);
-                    v3 -= to_float(key_mean[mean_base + 3]);
-                    v4 -= to_float(key_mean[mean_base + 4]);
-                    v5 -= to_float(key_mean[mean_base + 5]);
-                    v6 -= to_float(key_mean[mean_base + 6]);
-                    v7 -= to_float(key_mean[mean_base + 7]);
-                    w0 -= to_float(key_mean[mean_base + 8]);
-                    w1 -= to_float(key_mean[mean_base + 9]);
-                    w2 -= to_float(key_mean[mean_base + 10]);
-                    w3 -= to_float(key_mean[mean_base + 11]);
-                    w4 -= to_float(key_mean[mean_base + 12]);
-                    w5 -= to_float(key_mean[mean_base + 13]);
-                    w6 -= to_float(key_mean[mean_base + 14]);
-                    w7 -= to_float(key_mean[mean_base + 15]);
+        // ---- pass2: 从寄存器读 -> 量化 (按子块 r 选 scale) -> 写回 ----
+#pragma unroll
+        for (int it = 0; it < PPT; ++it) {
+            const int p = tid + it * Threads;
+            if (p < PackPairs) {
+                const int pack = p * 2;
+                const int elem_base = pack * PackElems;
+                const int row = elem_base / HeadDim;
+                const int d = elem_base - row * HeadDim;
+                const int64_t seq = base_row + row;
+                if (seq < seq_len) {
+                    const int r = row / MIN_BLK;
+                    const int64_t out_off = (static_cast<int64_t>(b) * heads + head) * seq_len * HeadDim + seq * HeadDim + d;
+                    const uint4 raw0 = reg[it][0];      // pass1 缓存在寄存器, 省 LDS 往返
+                    const uint4 raw1 = reg[it][1];
+                    const T* values = reinterpret_cast<const T*>(&raw0);
+                    const T* values1 = reinterpret_cast<const T*>(&raw1);
+                    char4 out0, out1, out2, out3;
+                    float v0 = to_float(values[0]), v1 = to_float(values[1]);
+                    float v2 = to_float(values[2]), v3 = to_float(values[3]);
+                    float v4 = to_float(values[4]), v5 = to_float(values[5]);
+                    float v6 = to_float(values[6]), v7 = to_float(values[7]);
+                    float w0 = to_float(values1[0]), w1 = to_float(values1[1]);
+                    float w2 = to_float(values1[2]), w3 = to_float(values1[3]);
+                    float w4 = to_float(values1[4]), w5 = to_float(values1[5]);
+                    float w6 = to_float(values1[6]), w7 = to_float(values1[7]);
+                    if (!is_q && key_mean != nullptr) {
+                        const int64_t mean_base = (b * heads + head) * HeadDim + d;
+                        v0 -= to_float(key_mean[mean_base + 0]);
+                        v1 -= to_float(key_mean[mean_base + 1]);
+                        v2 -= to_float(key_mean[mean_base + 2]);
+                        v3 -= to_float(key_mean[mean_base + 3]);
+                        v4 -= to_float(key_mean[mean_base + 4]);
+                        v5 -= to_float(key_mean[mean_base + 5]);
+                        v6 -= to_float(key_mean[mean_base + 6]);
+                        v7 -= to_float(key_mean[mean_base + 7]);
+                        w0 -= to_float(key_mean[mean_base + 8]);
+                        w1 -= to_float(key_mean[mean_base + 9]);
+                        w2 -= to_float(key_mean[mean_base + 10]);
+                        w3 -= to_float(key_mean[mean_base + 11]);
+                        w4 -= to_float(key_mean[mean_base + 12]);
+                        w5 -= to_float(key_mean[mean_base + 13]);
+                        w6 -= to_float(key_mean[mean_base + 14]);
+                        w7 -= to_float(key_mean[mean_base + 15]);
+                    }
+                    const float iscale = inv_scale[r] * extra_scale;
+                    out0.x = float_to_int8(v0 * iscale);
+                    out0.y = float_to_int8(v1 * iscale);
+                    out0.z = float_to_int8(v2 * iscale);
+                    out0.w = float_to_int8(v3 * iscale);
+                    out1.x = float_to_int8(v4 * iscale);
+                    out1.y = float_to_int8(v5 * iscale);
+                    out1.z = float_to_int8(v6 * iscale);
+                    out1.w = float_to_int8(v7 * iscale);
+                    out2.x = float_to_int8(w0 * iscale);
+                    out2.y = float_to_int8(w1 * iscale);
+                    out2.z = float_to_int8(w2 * iscale);
+                    out2.w = float_to_int8(w3 * iscale);
+                    out3.x = float_to_int8(w4 * iscale);
+                    out3.y = float_to_int8(w5 * iscale);
+                    out3.z = float_to_int8(w6 * iscale);
+                    out3.w = float_to_int8(w7 * iscale);
+                    *reinterpret_cast<char4*>(output + out_off) = out0;
+                    *reinterpret_cast<char4*>(output + out_off + 4) = out1;
+                    *reinterpret_cast<char4*>(output + out_off + 8) = out2;
+                    *reinterpret_cast<char4*>(output + out_off + 12) = out3;
                 }
-                const float iscale = inv_scale[r] * extra_scale;
-                out0.x = float_to_int8(v0 * iscale);
-                out0.y = float_to_int8(v1 * iscale);
-                out0.z = float_to_int8(v2 * iscale);
-                out0.w = float_to_int8(v3 * iscale);
-                out1.x = float_to_int8(v4 * iscale);
-                out1.y = float_to_int8(v5 * iscale);
-                out1.z = float_to_int8(v6 * iscale);
-                out1.w = float_to_int8(v7 * iscale);
-                out2.x = float_to_int8(w0 * iscale);
-                out2.y = float_to_int8(w1 * iscale);
-                out2.z = float_to_int8(w2 * iscale);
-                out2.w = float_to_int8(w3 * iscale);
-                out3.x = float_to_int8(w4 * iscale);
-                out3.y = float_to_int8(w5 * iscale);
-                out3.z = float_to_int8(w6 * iscale);
-                out3.w = float_to_int8(w7 * iscale);
-                *reinterpret_cast<char4*>(output + out_off) = out0;
-                *reinterpret_cast<char4*>(output + out_off + 4) = out1;
-                *reinterpret_cast<char4*>(output + out_off + 8) = out2;
-                *reinterpret_cast<char4*>(output + out_off + 12) = out3;
             }
         }
-        __syncthreads();  // 防下轮 blk 的 pass1 覆盖 shared_data (上轮 pass2 未读完)
     }
 }
 
@@ -2007,8 +2049,9 @@ std::vector<Tensor> quant_qk_int8_gfx110x(
     // 大 block quant (对齐 triton BLK): 每 block 处理 BLK 行, 每 MIN_BLK 行一组
     // 独立 scale (RATIO 组) + 多累加器 ILP —— MIN_BLK 粒度 (scale 语义) 不变
     // 实测 (同进程 A/B): D=64 用 BLK_Q=128/BLK_K=64 最优 (SDXL07 -19%, SDXL13 -18%);
-    // D=128 旧逻辑已达 ~100GB/s (接近带宽上限), 大 block (128/64 或 64/32) 均 +1~3%
-    // (32KB LDS / 额外 blockReduce barrier), 故 D=128 保持旧逻辑 (BLK=MIN_BLK)
+    // D=128 旧逻辑 (LDS 往返 + 标量逐 RATIO 归约) 大 block 128/64 或 64/32 均 +1~3%,
+    // 故曾保持 MIN_BLK; 改寄存器缓存 + 向量归约 (blockReduceMaxVec) 后, D=128
+    // BLK 128/64 实测 -6~9% (block 数减少、barrier 不随 RATIO 增加), 故 auto 下 D=128 也用 128/64
     // SAGEATTN_QUANT_BLK: 1=auto (按 head_dim), 128=强制 128/64, 64=强制 64/32, 0=旧逻辑
     const int blk_sel = getenv("SAGEATTN_QUANT_BLK") ? atoi(getenv("SAGEATTN_QUANT_BLK")) : 1;
     constexpr int BLK_Q64 = 128;
@@ -2019,8 +2062,7 @@ std::vector<Tensor> quant_qk_int8_gfx110x(
     if (blk_sel == 128) { blk_q = BLK_Q64; blk_k = BLK_K64; }
     else if (blk_sel == 64) { blk_q = BLK_Q128; blk_k = BLK_K128; }
     else if (blk_sel == 0) { blk_q = MIN_BLK_Q; blk_k = MIN_BLK_K; }
-    else if (head_dim == 64) { blk_q = BLK_Q64; blk_k = BLK_K64; }
-    else { blk_q = MIN_BLK_Q; blk_k = MIN_BLK_K; }
+    else { blk_q = BLK_Q64; blk_k = BLK_K64; }
     const int q_blocks = (q_len + blk_q - 1) / blk_q;
     const int k_blocks = (kv_len + blk_k - 1) / blk_k;
     // 多 group 合并: 每 block 顺序处理 groups_per_block 个连续大 block (实验选项, 默认 1)
@@ -2104,9 +2146,11 @@ Tensor qk_int8_sv_bf16_attn_gfx110x_t(
     // 每 warp 32 行 kernel (BM 128, 4 warps, 2 子块共享 k_frag): D=64 self 默认启用 (实测快 7-10%)
     // SAGEATTN_INT8_32=0 可关闭
     const bool use_32w = getenv("SAGEATTN_INT8_32") ? atoi(getenv("SAGEATTN_INT8_32")) != 0 : true;
-    // 实验: SAGEATTN_INT8_BN128 覆盖 D=128 的 BN (0=默认64, 16/32)
-    // BN=64 实测相对 triton 更优 (Anima01 1.038->1.02, Anima03 1.051->0.99, Anima05 1.045->1.02):
-    // kv-tile 数减半 -> barrier/ k_tile 填充减半
+    // 实验: SAGEATTN_INT8_BN128 覆盖 D=128 的 BN (0/32=默认32, 16/64/128)
+    // BN=32 为默认 (2026-09 同进程 A/B 实测): cross D128 Anima02 -9%/AnimaCX03 -6%,
+    // self Anima01 -3.5%, 长序列 (6144/9216/VAE16384) 中性;
+    // 旧默认 BN=64 只在 kv-tile 数减半的 barrier 维度占优, 但 score_cache 寄存器多
+    // (4x8 float/线程) 拖累占用; BN=16 差 (kv-tile 数翻倍每 tile 空转)
     const int bn128_ov = getenv("SAGEATTN_INT8_BN128") ? atoi(getenv("SAGEATTN_INT8_BN128")) : 0;
     // D=128 int8 self-attn 的 BM 选择 (2026-09 实测):
     //   kv_len 4096: BM=64 略优 (0.6%);  6144: BM=128 优 2.8%;  9216: 优 3.7%;  16384(VAE): 优 5.6%
@@ -2263,8 +2307,11 @@ Tensor qk_int8_sv_bf16_attn_gfx110x_t(
                 } else if (bn128_ov == 32) { \
                     if (is_causal) { LAUNCH_ATTN_T(128, true, 64, 32, VT, OT, wpe128); } \
                     else { LAUNCH_ATTN_T(128, false, 64, 32, VT, OT, wpe128); } \
-                } else if (is_causal) { LAUNCH_ATTN_T(128, true, 64, 64, VT, OT, wpe128); } \
-                else { LAUNCH_ATTN_T(128, false, 64, 64, VT, OT, wpe128); } \
+                } else if (bn128_ov == 64) { \
+                    if (is_causal) { LAUNCH_ATTN_T(128, true, 64, 64, VT, OT, wpe128); } \
+                    else { LAUNCH_ATTN_T(128, false, 64, 64, VT, OT, wpe128); } \
+                } else if (is_causal) { LAUNCH_ATTN_T(128, true, 64, 32, VT, OT, wpe128); } \
+                else { LAUNCH_ATTN_T(128, false, 64, 32, VT, OT, wpe128); } \
             } \
         } while(0)
 
