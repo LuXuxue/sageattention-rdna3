@@ -56,6 +56,8 @@ Tensor new_empty_like(const Tensor& like, std::initializer_list<int64_t> sizes, 
 hipStream_t current_hip_stream(const Tensor& tensor) {
     int32_t device_index = tensor.get_device_index();
     void* stream = nullptr;
+    // aoti_torch_get_current_stream returns an opaque StreamHandle, not a
+    // raw HIP stream; the CUDA variant returns the actual cudaStream_t.
     TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_index, &stream));
     return reinterpret_cast<hipStream_t>(stream);
 }
@@ -2419,7 +2421,18 @@ Tensor fp16_attn_gfx110x_t(
             }
         }
     } else {
-        LAUNCH_FP16_BN(128, 64, 16);
+        // LAUNCH_FP16_BN(128, 64, 16);
+        // big2cater's fix:
+        // D=128 direct path. Default (BM=128, BN=16) was tuned on 780M;
+        // env SAGEATTN_FP16_BM / SAGEATTN_FP16_BN select alternatives at
+        // runtime for per-GPU (gfx1100) sweep experiments.
+        if (bn_ov == 32) { LAUNCH_FP16_BN(128, 64, 32); }
+        else if (bn_ov == 64) { LAUNCH_FP16_BN(128, 64, 64); }
+        else if (bn_ov == 128) { LAUNCH_FP16_BN(128, 64, 128); }
+        else if (bm_ov == 32) { LAUNCH_FP16_BN(128, 32, 16); }
+        else if (bm_ov == 128) { LAUNCH_FP16_BN(128, 128, 16); }
+        else if (bm_ov == 64) { LAUNCH_FP16_BN(128, 64, 16); }
+        else { LAUNCH_FP16_BN(128, 64, 16); }
     }
     #undef LAUNCH_FP16_T
     #undef LAUNCH_FP16_BN
@@ -2517,7 +2530,16 @@ Tensor bf16_attn_gfx110x_t(
             }
         }
     } else {
-        LAUNCH_BF16_BN(128, 64, 16);
+        // LAUNCH_BF16_BN(128, 64, 16);
+        // big2cater's fix:
+        // D=128 bf16 direct path; runtime BM/BN override for gfx1100 sweep.
+        if (bn_ov == 32) { LAUNCH_BF16_BN(128, 64, 32); }
+        else if (bn_ov == 64) { LAUNCH_BF16_BN(128, 64, 64); }
+        else if (bn_ov == 128) { LAUNCH_BF16_BN(128, 64, 128); }
+        else if (bm_ov == 32) { LAUNCH_BF16_BN(128, 32, 16); }
+        else if (bm_ov == 128) { LAUNCH_BF16_BN(128, 128, 16); }
+        else if (bm_ov == 64) { LAUNCH_BF16_BN(128, 64, 16); }
+        else { LAUNCH_BF16_BN(128, 64, 16); }
     }
     #undef LAUNCH_BF16_T
     #undef LAUNCH_BF16_BN
