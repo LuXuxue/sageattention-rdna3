@@ -307,6 +307,92 @@ class TestSageAttnEdgeCases:
         assert_close(out, ref, torch.float16)
 
 
+class TestSageAttnInt8KScale:
+    """k_scale per-column (per-16-row group) 回归测试。
+
+    所有 int8 kernel 的 QK 曾只按 BN-tile 读一次 k_scale (per-32), 而 k_scale 实际按
+    MIN_BLK_K=16 行分组。BN=32 的 tile 横跨两个 scale group, 导致每个 tile 的后 16 列
+    被错误乘了前 16 列的 scale → cos≈0.96-0.97。
+    该 bug 曾因测试覆盖不全而漏检:
+      - D=64: 测试最大 N=2048 (旧阈值下走 direct, 不触 int8), int8 只在 >2048 才进
+        (而未测); 现在默认 int8 用于短序列 (N<=768), 需显式强制覆盖。
+      - D=128 BN=32: 旧默认走 v3 BN=16 (准确), BN=32 只经 env 可达, 故同 bug 从未被
+        默认测试覆盖; 现在 v4 BM=64 BN=32 是默认, 必须回归。
+
+    测试策略: 用 monkeypatch 强制 int8 路径 (DIRECT_THRESHOLD_*=0), 覆盖各布局/长短序列,
+    确保 BN=32 (kv>77) 与 k_scale 16 行分组边界均被验证。
+    """
+
+    @pytest.mark.parametrize("head_dim", [64, 128])
+    @pytest.mark.parametrize("seq_len", [256, 512, 1024, 2048])
+    def test_int8_forced_hnd(self, sageattn, monkeypatch, head_dim, seq_len):
+        """HND + 强制 int8 (阈值为 0), 短到中长序列。修复前 cos≈0.96 (k_scale bug)。"""
+        # 强制 int8 路径 (无论 D 的默认阈值如何)
+        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D64", "0")
+        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D128", "0")
+        batch, heads = 1, 4
+        q = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
+        v = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
+
+        out = sageattn(q, k, v, tensor_layout="HND", is_causal=False)
+        ref = reference_attention(q, k, v, is_causal=False)
+        cos = cosine_similarity(out, ref)
+        # 修复前 cos≈0.96; 修复后 >0.9995。用 0.99 判定 (含 int8 量化误差余量)。
+        assert cos > 0.99, f"HND D={head_dim} N={seq_len} int8 cosine similarity {cos} too low (k_scale per-column bug?)"
+
+    @pytest.mark.parametrize("head_dim", [64, 128])
+    @pytest.mark.parametrize("seq_len", [512, 1024])
+    def test_int8_forced_nhd(self, sageattn, monkeypatch, head_dim, seq_len):
+        """NHD + 强制 int8, 验证 k_scale per-column 在 NHD 布局同样正确。"""
+        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D64", "0")
+        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D128", "0")
+        batch, heads = 1, 4
+        q = torch.randn(batch, seq_len, heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(batch, seq_len, heads, head_dim, dtype=torch.float16, device="cuda")
+        v = torch.randn(batch, seq_len, heads, head_dim, dtype=torch.float16, device="cuda")
+
+        out = sageattn(q, k, v, tensor_layout="NHD", is_causal=False)
+        q_hnd = q.transpose(1, 2)
+        k_hnd = k.transpose(1, 2)
+        v_hnd = v.transpose(1, 2)
+        ref = reference_attention(q_hnd, k_hnd, v_hnd, is_causal=False).transpose(1, 2)
+        cos = cosine_similarity(out, ref)
+        assert cos > 0.99, f"NHD D={head_dim} N={seq_len} int8 cosine similarity {cos} too low (k_scale per-column bug?)"
+
+    @pytest.mark.parametrize("head_dim", [64, 128])
+    def test_int8_forced_long(self, sageattn, monkeypatch, head_dim):
+        """强制 int8 + 长序列 (曾漏检的原始场景): D=64 N=4096 修复前 cos≈0.968,
+        D=128 N=4096 (BN=32) 修复前 cos≈0.973。"""
+        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D64", "0")
+        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D128", "0")
+        batch, heads, seq_len = 1, 4, 4096
+        q = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
+        v = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
+
+        out = sageattn(q, k, v, tensor_layout="HND", is_causal=False)
+        ref = reference_attention(q, k, v, is_causal=False)
+        cos = cosine_similarity(out, ref)
+        assert cos > 0.99, f"HND D={head_dim} N=4096 long int8 cosine similarity {cos} too low (k_scale per-column bug?)"
+
+    @pytest.mark.parametrize("head_dim", [64, 128])
+    def test_int8_forced_bf16(self, sageattn, monkeypatch, head_dim):
+        """强制 int8 + bf16, 验证 k_scale per-column 在 bf16 输入 dtype 同样正确。"""
+        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D64", "0")
+        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D128", "0")
+        batch, heads, seq_len = 1, 4, 1024
+        q = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.bfloat16, device="cuda")
+        k = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.bfloat16, device="cuda")
+        v = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.bfloat16, device="cuda")
+
+        out = sageattn(q, k, v, tensor_layout="HND", is_causal=False)
+        ref = reference_attention(q, k, v, is_causal=False)
+        cos = cosine_similarity(out, ref)
+        # bf16 精度较低, 放宽到 0.98 (与 assert_close 一致)
+        assert cos > 0.98, f"HND D={head_dim} N=1024 bf16 int8 cosine similarity {cos} too low"
+
+
 class TestSageAttnMaxErr:
     """int8 / fp16-direct 路径 MaxErr 回归测试。
 

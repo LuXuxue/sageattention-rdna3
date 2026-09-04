@@ -156,10 +156,18 @@ def sageattn(
     #   D=64 cross (q<kv):    q=3072/kv=4096 仍 direct 优3%              -> 6144
     #   D=128 self/causal:    kv=2048 direct 优5%, 2560 int8 优5%        -> 2048
     #   D=128 cross q<<kv:    q=512/1024 vs kv=4096 direct 优25%/8%, q=2048(=kv/2) int8 优5% -> q<kv/2 且 kv<=4096
+    arch = getattr(torch.cuda.get_device_properties(torch.cuda.current_device()), 'gcnArchName', None)
     if headdim == 64:
+        # gfx1103:
         # HND 布局 D=64 self 的 int8 平衡点降至 ~2048 (HND 扫描: 2048 direct 优3.7%,
         # 2304 int8 优0.4%), NHD (benchmark/实际应用) 保持 3072; env 可覆盖
-        d64_default = 2048 if tensor_layout == "HND" else 3072
+        # gfx1035:
+        # D=64 self int8 vs direct threshold: benchmarks show crossover at ~768 HND, ~1024 NHD
+        # (N=512 int8 7.4x faster; N=1024 direct 1.2x faster). int8 for short, direct for long.
+        if arch.startswith('gfx103'):
+            d64_default = 768 if tensor_layout == "HND" else 1024
+        else:
+            d64_default = 2048 if tensor_layout == "HND" else 3072
         thr_d64 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64", str(d64_default)) or d64_default)
         if is_causal:
             use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64_CAUSAL", "6144") or 6144))
@@ -167,13 +175,23 @@ def sageattn(
             # cross-attn: q 短时 direct 省辅助收益大 (q=3072/kv=4096 仍优 3%)
             use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64_CROSS", "6144") or 6144))
         else:
-            use_direct = (kv_len_actual <= thr_d64)
+            # gfx1035: D=64 self: int8 faster for short (N≤threshold), direct faster for long
+            if arch.startswith('gfx103'):
+                use_direct = (kv_len_actual > thr_d64)
+            else:
+                use_direct = (kv_len_actual <= thr_d64)
+
     else:
-        thr_d128 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128", "2048") or 2048)
+        if arch.startswith('gfx103'):
+            thr_d128 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128", "9999999") or 9999999)
+        else:
+            thr_d128 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128", "2048") or 2048)
         if q_len * 2 < kv_len_actual:
             # cross 且 q 明显短: direct 优 (q=512/1024 vs kv=4096 优 8-25%; q=2048=kv/2 时 int8 优)
             use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128_CROSS", "4096") or 4096))
         else:
+            # gfx1035: D=128 self: direct 恒优于 int8 (~1.8x)。
+            # 故 self 默认恒走 direct; 可用 SAGEATTN_DIRECT_THRESHOLD_D128 覆盖。
             use_direct = (kv_len_actual <= thr_d128)
 
     if use_direct:
