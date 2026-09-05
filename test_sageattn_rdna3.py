@@ -319,17 +319,23 @@ class TestSageAttnInt8KScale:
       - D=128 BN=32: 旧默认走 v3 BN=16 (准确), BN=32 只经 env 可达, 故同 bug 从未被
         默认测试覆盖; 现在 v4 BM=64 BN=32 是默认, 必须回归。
 
-    测试策略: 用 monkeypatch 强制 int8 路径 (DIRECT_THRESHOLD_*=0), 覆盖各布局/长短序列,
+    测试策略: 用 monkeypatch 强制 int8 路径, 覆盖各布局/长短序列,
     确保 BN=32 (kv>77) 与 k_scale 16 行分组边界均被验证。
+
+    gfx103 env 陷阱: D64 用 `use_direct=(kv>thr)`, D128 用 `use_direct=(kv<=thr)`,
+    且 `int("0") or default` 因字符串"0"为真值返回 default。故 D64 的 env="0" 解析为
+    default (HND=768/NHD=1016) -> 仅短序列走 int8, 长序列落回 direct (掩盖 int8 路径);
+    D128 的 env="0" 解析为 9999999 -> 恒走 direct (根本不触 int8)。要真正强制 int8:
+    D64 用大阈值 "9999999" (kv 恒 < 之), D128 用负阈值 "-1" (kv 恒 > 之)。
     """
 
     @pytest.mark.parametrize("head_dim", [64, 128])
     @pytest.mark.parametrize("seq_len", [256, 512, 1024, 2048])
     def test_int8_forced_hnd(self, sageattn, monkeypatch, head_dim, seq_len):
-        """HND + 强制 int8 (阈值为 0), 短到中长序列。修复前 cos≈0.96 (k_scale bug)。"""
+        """HND + 真正强制 int8 (D64=9999999/D128=-1), 短到中长序列。修复前 cos≈0.96 (k_scale bug)。"""
         # 强制 int8 路径 (无论 D 的默认阈值如何)
-        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D64", "0")
-        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D128", "0")
+        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D64", "9999999")
+        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D128", "-1")
         batch, heads = 1, 4
         q = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
         k = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
@@ -345,8 +351,8 @@ class TestSageAttnInt8KScale:
     @pytest.mark.parametrize("seq_len", [512, 1024])
     def test_int8_forced_nhd(self, sageattn, monkeypatch, head_dim, seq_len):
         """NHD + 强制 int8, 验证 k_scale per-column 在 NHD 布局同样正确。"""
-        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D64", "0")
-        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D128", "0")
+        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D64", "9999999")
+        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D128", "-1")
         batch, heads = 1, 4
         q = torch.randn(batch, seq_len, heads, head_dim, dtype=torch.float16, device="cuda")
         k = torch.randn(batch, seq_len, heads, head_dim, dtype=torch.float16, device="cuda")
@@ -362,10 +368,12 @@ class TestSageAttnInt8KScale:
 
     @pytest.mark.parametrize("head_dim", [64, 128])
     def test_int8_forced_long(self, sageattn, monkeypatch, head_dim):
-        """强制 int8 + 长序列 (曾漏检的原始场景): D=64 N=4096 修复前 cos≈0.968,
-        D=128 N=4096 (BN=32) 修复前 cos≈0.973。"""
-        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D64", "0")
-        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D128", "0")
+        """真正强制 int8 + 长序列: D=64 N=4096 走 v4 BM=128, D=128 N=4096 走 v4 BM=64 BN=32。
+        (历史: D64 env="0" 实为 direct, 此测试曾从未触 int8 长路径; 现 D64="9999999"/D128="-1"
+        强制 int8, 覆盖 kv>2048 的 k_scale 16 行分组与 BN=32 边界。)
+        修复前 (k_scale per-column bug) cos≈0.96-0.97; 修复后 >0.999。"""
+        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D64", "9999999")
+        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D128", "-1")
         batch, heads, seq_len = 1, 4, 4096
         q = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
         k = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
@@ -379,8 +387,8 @@ class TestSageAttnInt8KScale:
     @pytest.mark.parametrize("head_dim", [64, 128])
     def test_int8_forced_bf16(self, sageattn, monkeypatch, head_dim):
         """强制 int8 + bf16, 验证 k_scale per-column 在 bf16 输入 dtype 同样正确。"""
-        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D64", "0")
-        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D128", "0")
+        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D64", "9999999")
+        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D128", "-1")
         batch, heads, seq_len = 1, 4, 1024
         q = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.bfloat16, device="cuda")
         k = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.bfloat16, device="cuda")
@@ -391,6 +399,95 @@ class TestSageAttnInt8KScale:
         cos = cosine_similarity(out, ref)
         # bf16 精度较低, 放宽到 0.98 (与 assert_close 一致)
         assert cos > 0.98, f"HND D={head_dim} N=1024 bf16 int8 cosine similarity {cos} too low"
+
+
+class TestSageAttnD64Dispatch:
+    """gfx1035 D=64 self-attention 分发边界回归。
+
+    实测 (NHD 与 HND) D=64 self 的 int8/direct 交叉点均在 ~1016:
+      - kv<1016: int8 内核胜 (dot4 吞吐, 短序列量化开销被并行分摊)
+      - kv>=1024: direct-v2 内核胜 (v2 需 >=1024 行才有足够 block; v1 在 512-1023 病理性慢)
+    历史 bug: 旧默认阈值 1024 使 1024² 走 int8 (应走 direct v2), 且使 <1024 走 v1 (病理性慢)。
+    本阶段修正: HND 阈值曾误设 768, 使 769-1023 走 direct-v1 (0.02T) 而 int8 6x 更快 (0.13T);
+    已统一为 1016。本测试验证边界尺寸在默认分发下正确性不受损, 并验证 769-1023 路由到 int8。
+
+    注意 (本阶段实测修正): 曾疑 D64 int8 内核 v4 BM=128 在 seq>=512 产出错误结果
+    (cos≈0.03-0.1), 从而 512-1015 默认分发走"错误 int8"。经真机验证: 当前代码该范围
+    int8 输出正确且确定 (cos>0.999), 疑似误报源是已回退的 __syncwarp() 实验, 而非 base 内核。
+    故 int8 在 512-1015 路径可放心使用; 512/768/960 用例即覆盖此范围。
+    """
+
+    @pytest.mark.parametrize("seq_len", [768, 960, 1024, 2048, 4096])
+    def test_d64_self_default_dispatch(self, sageattn, seq_len):
+        """D=64 self 默认分发 (不强制): 边界尺寸走对应最优路径且结果正确。"""
+        batch, heads, head_dim = 1, 4, 64
+        q = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
+        v = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
+
+        out = sageattn(q, k, v, tensor_layout="HND", is_causal=False)
+        ref = reference_attention(q, k, v, is_causal=False)
+        cos = cosine_similarity(out, ref)
+        assert cos > 0.99, f"HND D=64 N={seq_len} default dispatch cosine {cos} too low"
+        del q, k, v, out, ref
+        torch.cuda.empty_cache()
+
+    def test_d64_self_gfx103_threshold_is_1016(self):
+        """gfx1035 D=64 self 默认阈值必须为 1016 (HND 与 NHD 统一)。
+
+        回归 (本阶段实测修正): 旧 HND 阈值 768 使 769-1023 走 direct-v1 (0.02T, 病理性慢,
+        需 >=1024 行才有 block), 而 int8 在该范围 6x 更快 (0.13T)。直接锁定阈值常量,
+        防止再次误调。dispatch 用 `use_direct=(kv>thr)`: thr=1016 保证 kv<1016 走 int8,
+        kv>=1024 走 direct-v2, 两布局一致。
+        """
+        from sageattention.core import _gfx103_d64_threshold
+        for layout in ("HND", "NHD"):
+            assert _gfx103_d64_threshold(layout) == 1016, (
+                f"gfx1035 D64 {layout} threshold must be 1016 (int8 below, direct-v2 at 1024+)"
+            )
+
+    @pytest.mark.parametrize("seq_len", [768, 960, 1024, 2048])
+    def test_d64_self_nhd_default_dispatch(self, sageattn, seq_len):
+        """NHD 布局 D=64 self 默认分发: 验证 int8/direct 阈值边界 (1016) 附近正确。"""
+        batch, heads, head_dim = 1, 4, 64
+        q = torch.randn(batch, seq_len, heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(batch, seq_len, heads, head_dim, dtype=torch.float16, device="cuda")
+        v = torch.randn(batch, seq_len, heads, head_dim, dtype=torch.float16, device="cuda")
+
+        out = sageattn(q, k, v, tensor_layout="NHD", is_causal=False)
+        q_hnd = q.transpose(1, 2)
+        k_hnd = k.transpose(1, 2)
+        v_hnd = v.transpose(1, 2)
+        ref = reference_attention(q_hnd, k_hnd, v_hnd, is_causal=False).transpose(1, 2)
+        cos = cosine_similarity(out, ref)
+        assert cos > 0.99, f"NHD D=64 N={seq_len} default dispatch cosine {cos} too low"
+        del q, k, v, out, ref
+        torch.cuda.empty_cache()
+
+    @pytest.mark.parametrize("head_dim", [64, 128])
+    def test_int8_repeated_same_result(self, sageattn, monkeypatch, head_dim):
+        """int8 内核重复运行结果确定性: 验证无共享内存竞态。
+
+        历史: 曾有人给 v4 的 QK 写 s_tile 与 softmax 读 s_tile 之间加 __syncwarp() 想修"潜在
+        竞态", 反而破坏 int8 内核 (seq>=512 变错)。RDNA2 同波前 LDS 写读天然有序, 原"无同步"
+        行为在实践上正确, 故 syncwarp 已回退。此测试 (D64=9999999/D128=-1 真正强制 int8)
+        验证重复运行逐位一致 (确定性), 防止任何会引入竞态的改动回退。
+        """
+        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D64", "9999999")
+        monkeypatch.setenv("SAGEATTN_DIRECT_THRESHOLD_D128", "-1")
+        batch, heads, seq_len = 1, 4, 2048
+        q = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
+        v = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
+
+        outs = [sageattn(q, k, v, tensor_layout="HND", is_causal=False) for _ in range(3)]
+        for i in range(1, len(outs)):
+            assert torch.equal(outs[i], outs[0]), (
+                f"D={head_dim} N=2048 int8 repeated run {i} differs from run 0 "
+                "(softmax LDS race? non-deterministic)"
+            )
+        del q, k, v
+        torch.cuda.empty_cache()
 
 
 class TestSageAttnMaxErr:

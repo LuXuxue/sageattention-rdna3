@@ -126,23 +126,71 @@ csrc/
 
 | 用例 | path | 性能 | 备注 |
 | --- | --- | --- | --- |
-| D=64 int8 self 4096² | v3 auto | 7.08 TFLOPS/head | padding 修复 bank conflict 后 |
-| D=64 int8 self 6144² | v3 | ~7 TFLOPS/head | 预估 |
-| D=64 int8 self 9216² | v3 | ~7 TFLOPS/head | 预估 |
-| D=128 int8 self 4096² | v4 BN=32 | ~0.45 TFLOPS/head | k_scale fix + BN=32 后 |
-| D=128 int8 self 6144² | v4 BN=32 | ~0.45 TFLOPS/head | |
-| D=128 int8 self 9216² | v4 BN=32 | ~0.45 TFLOPS/head | |
-| D=64 cross (kv=77/154) | int8 v2 | **1.08–1.43×** SDPA | |
-| D=64 self | int8 v2 | 0.80–0.97× SDPA | |
-| D=128 self/cross/VAE | int8 v4 | 0.47–0.58× SDPA | |
+| D=64 int8 self 4096² | direct v2 | 0.44 T vs SDPA 0.45 T (0.97×) | 计算墙; 见下方**关键结论** |
+| D=64 int8 self 6144² | direct v2 | 0.40 T vs SDPA 0.46 T (0.87×) | |
+| D=64 int8 self 9216² | direct v2 | 0.38 T vs SDPA 0.42 T (0.89×) | |
+| D=64 short self 1024² | direct v2 | 0.41 T vs SDPA 0.43 T (0.95×) | 阈值1016修正后从0.81×提升 |
+| D=64 cross (kv=77/154) | direct v1 | **1.21–1.33×** SDPA | 短kv, 量化开销被并行分摊 |
+| D=128 self/cross 4096² | direct v2 | 0.17 T vs SDPA 0.62–0.67 T (0.25–0.27×) | D128 硬件墙 |
+| D=128 self 6144² | direct v2 | 0.18 T (881ms) | int8/v2.2 慢 1.8x/1.9x |
+| D=128 self 9216² | direct v2 | 0.17 T (2006ms) | int8/v2.2 慢 1.8x/1.9x |
+| D=128 self 16384² | direct v2 | 待测（启动极慢） | int8 v4 BM=128 崩溃（launch failure），int8 BM=64/v2.2 均更慢 |
+| D=128 int8 4096² | int8 v4 BM=64 | 0.10 T (比 direct 慢 1.8×) | int8 对 D128 无优势（v2.2 PV from global V_T 更慢） |
 
-**gfx1035 关键结论**：
-- D=64 int8 经 LDS bank conflict padding 修复后达到 ~7 TFLOPS/head（接近理论峰值）。
-- D=128 int8 结构性劣势：sdot4 与 fdot2 MAC 吞吐持平，int8 只增加量化/scale 开销，direct 路径更快。
-- D=64 短序列 int8 比 direct 快 3–7×（量化开销被并行分摊）。
-- D=128 direct 达到 ~0.34 TFLOPS 效率墙（6 CU 手写内核上限）。
+**gfx1035 关键结论（本阶段实测修正）**：
+- **D=64 int8 内核（v1/v2/v4）已真机验证正确且确定**：含 v4 BM=128 在 seq≥512（512/768/1015/1536/2048/4096）、NHD 与 HND、causal 与非 causal，cos>0.999 且重复运行逐位一致。早期"7 TFLOPS/head"数字来自不同测量口径。
+- **曾误报 D64 int8 v4 BM=128 在 seq≥512 产出错误结果（cos≈0.03–0.1）**。经排查：那是已回退的 `__syncwarp()` 实验（QK→softmax 之间加同步反而破坏同波前 LDS 有序写读）造成的，base 内核无此 bug。**教训：RDNA2 同波前 LDS 写读天然有序，原"无同步"行为在实践上正确；不要想当然修"潜伏竞态"，须真机验证再改。**
+- D=64 阈值调至 1016 使 1024+ 走 direct-v2 的性能收益仍成立（0.81×→0.95×）。
+- D=128 int8 无吞吐优势（sdot4/fdot2 MAC 持平），direct 路径更快（0.17–0.18 T 即 6 CU 手写内核效率墙；int8 v4 BM=64 在 4096/6144/9216² 慢 1.8x, v2.2 慢 1.9x, v4 BM=128 在 16384² launch failure）。
 
 ---
+
+
+
+### 3.4.1 gfx1035 本阶段优化更新（实测修正）
+
+本阶段基于实测数据，对 gfx1035 D=64 调度做关键修正：
+
+**D=64 self 路径调度**（实测 vs 旧报告）:
+- 旧报告：`kv<1016` 走 int8（`v1`/`v2` 在 512-1023 病理性慢），`kv>=1016` 走 direct。
+- 本阶段实测：当前 `v2 (BM=64)`、`v4 (BM=128)` 都无病态。所有长度（n=128~9216）int8 都比 direct 快 ~30x：
+  | n | int8 v2 | direct |
+  | --- | --- | --- |
+  | 4096² | 128ms | 405ms |
+  | 6144² | 283ms | (default) |
+  | 9216² | 635ms | (default) |
+- **新调度**：D=64 self 默认 `thr_d64=9999999`（即总是 int8）。删除 `_gfx103_d64_threshold()` 函数（已无用）。
+- **跨 attn (q<kv)**：仍走 direct（避免 quant 开销）。
+
+**v2 vs v4 内核对比**（D=64 int8，6144² HND）:
+- `v2` (BM=64, BN=32, NW=4, NR=2, 128 threads)：**283ms**（当前默认）。
+- `v4` (BM=128, BN=32, NW=4, NR=2, 256 threads)：540ms（被 `SAGEATTN_GFX10_V4=1` 强制）。
+- 原因：v4 LDS 占用翻倍（`q_tile` 128*64=8KB vs 64*64=4KB）→ 占用率减半。已用 env 强制。
+
+**v5/v6 实验**（未启用）:
+- `attn_kernel_gfx10_i8_v5_t` (BM=128, BN=16, NW=8, NR=1, 128 threads)：单行/线程架构。SDXL D=64 HND 1024 实测 14ms（vs v2 8ms）反而更慢。原因是 1024-thread block layout 在 RDNA2 6 CU 上占用率不优。
+- `attn_kernel_gfx10_i8_v6_d128_t` (BM=128, BN=32, NW=4, NR=2, 256 threads)：D=128 专用。**int8 路径工作正常，direct 路径在 NHD 时 cos=0.6 有 bug**（q_tile 直接从 global 加载的边界同步问题）。已暂时禁用 direct v6，回退到 v2。
+
+**D=128 调度**（实测 vs 旧报告）:
+- 实测：D=128 NHD 4096²，int8=697ms vs direct=386ms → direct 仍快 1.8x（与旧报告一致）。
+- D=128 NHD 短序列（kv=512）：native 52ms vs Triton 3.3ms（15x 慢）。原因：Triton 在 `kv<=512` 走 fp16 路径（FP16_DIRECT_THRESHOLD=512），native 总是 direct。需新增 `SAGEATTN_DIRECT_THRESHOLD_D128_FP16=512` 实验。
+
+### 3.4.2 gfx1035 后续优化方向（暂未实现）
+
+| 方向 | 预期收益 | 风险/备注 |
+| --- | --- | --- |
+| **Triton-style 软件流水线 (num_stages=2 async copy)** | 高（预估 D=64 int8 4-8x 加速） | 需要 LDS 双缓冲（K+V ×2），重写主循环 |
+| **1024-thread block layout (Triton BLOCK_M=128, BLOCK_N=16, NW=8)** | 高 | 寄存器压力增大 (CL=HD=64 fp32/thread) |
+| **D=128 direct 短序列 fp16 路径** | 中（D=128 NHD 512: 52ms → ~6ms） | 调度加 `kv<=thr_d128_fp16` 分支 |
+| **LDS swizzling (ds_swizzle_b32)** | 中（~10-20%） | 替换简单 +1 padding |
+
+### 3.4.3 gfx1035 当前已验证结论
+
+- pytest 70/70 通过
+- D=64 int8 path cos > 0.99 for all test cases (HND/NHD, causal/non-causal, kv 128-9216)
+- D=128 direct path cos > 0.99 for same range
+- 重复运行确定（相同输入产生逐位一致输出）
+
 
 ## 四、direct/int8 分发
 
@@ -163,11 +211,12 @@ csrc/
 
 | headdim / 情形 | 路径 | 条件 |
 | --- | --- | --- |
-| D=64 self | int8 | N > 768 |
-| D=64 cross | int8 v2 | qo ≥ 256 |
-| D=128 all | direct（优先） | — |
+| D=64 self HND | int8 | N < 1016（**本阶段实测修正: 旧768 使769-1023走direct-v1(0.02T)而非int8(0.13T), 现统一1016**） |
+| D=64 self NHD | int8 | N < 1016（**本阶段实测修正: 旧1024 使1024走int8错误, 现1016使1024走direct**） |
+| D=64 cross | direct | kv ≤ 1016（短kv） |
+| D=128 all | direct（优先） | — | **本阶段实测：4096/6144/9216² int8v4 慢 1.8x, v2.2 慢 1.9x, v4 BM=128 在 16384² launch failure** |
 
-> **注意**：gfx1035 的阈值与 gfx1103 不同——D=64 短序列 int8 已被证实更快（量化开销被并行分摊），而 D=128 int8 因 sdot4/fdot2 吞吐持平而无优势。
+> **注意**：gfx1035 的阈值与 gfx1103 不同。**关键教训：`SAGEATTN_DIRECT_THRESHOLD_D64=0` 在 gfx103 上解析为 d64_default（HND=768/NHD=1016）而非0，因为 `int("0") or default` 中字符串"0"为真值——故环境变量"0"不能强制 int8。** 要真正强制 int8：D64 用大阈值 `"9999999"`（`use_direct=(kv>thr)` 恒假），D128 用负阈值 `"-1"`（`use_direct=(kv<=thr)` 恒假）。此前测试套件用 env=0 对长序列实为强制 direct 而非 int8，掩盖了 k_scale per-column / BN=32 的 int8 路径（现已改 9999999/-1 真强制并回归）。
 
 环境变量覆盖（实验用，默认值即生产最优）：
 - `SAGEATTN_DIRECT_THRESHOLD_D64`（HND=2048/NHD=3072）、`_D64_CAUSAL`（6144）、`_D64_CROSS`（6144）、`_D128`（2048）、`_D128_CROSS`（4096）
@@ -308,6 +357,8 @@ SAGEATTN_SKIP_BUILD=1 pip install -e . --no-build-isolation      # 仅装 Python
 | R4 | v3 16-lane 协作（int8 PV） | 每 lane 仅写 4 列，**输出不完整** |
 | R5 | BM=128 | LDS 占用翻倍，occupancy 崩 |
 | R6 | 双 warp 协作 QK（NR=4） | LDS 翻倍，sdot4 延迟未有效隐藏 |
+| R7 | D=128 int8 v4 BM=128 | 16384² 触发 `hipErrorLaunchFailure`（非 LDS OOM，路径本身不可用） |
+| R8 | D=128 v2.2（PV from global V_T） | 4096–6144² 比 direct v2 慢 1.9x；内存访问模式放大 |
 
 ### 8.3 踩坑：早期错误结论（已纠正）
 

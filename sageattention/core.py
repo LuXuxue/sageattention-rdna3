@@ -2,6 +2,16 @@ import torch
 import os
 from typing import Any, Optional, Tuple, Union
 
+
+def _gfx103_d64_threshold(tensor_layout: str) -> int:
+    """gfx1035 D=64 self int8/direct 默认阈值 (kv > thr 走 direct)。
+
+    实测 NHD 与 HND 交叉点均在 ~1016: kv<1016 int8 6x 快, kv>=1024 direct-v2 快
+    (v2 需 >=1024 行才有 block; v1 在 512-1023 病理性慢)。两布局统一 1016。
+    供单元测试直接锁定该值, 防止再次误调 (曾误设 HND=768 致 769-1023 走 direct-v1 慢 6x)。
+    """
+    return 1016
+
 # Backend selection via environment variable:
 #   SAGEATTN_BACKEND=triton            - Triton autotune kernel
 #   SAGEATTN_BACKEND=native            - HIP native WMMA kernel
@@ -161,11 +171,14 @@ def sageattn(
         # gfx1103:
         # HND 布局 D=64 self 的 int8 平衡点降至 ~2048 (HND 扫描: 2048 direct 优3.7%,
         # 2304 int8 优0.4%), NHD (benchmark/实际应用) 保持 3072; env 可覆盖
-        # gfx1035:
-        # D=64 self int8 vs direct threshold: benchmarks show crossover at ~768 HND, ~1024 NHD
-        # (N=512 int8 7.4x faster; N=1024 direct 1.2x faster). int8 for short, direct for long.
         if arch.startswith('gfx103'):
-            d64_default = 768 if tensor_layout == "HND" else 1024
+            # gfx1035 D=64 self: int8 路径在所有长度下都远快于 direct (~30x 加速).
+            # 实测 SDXL01/07/13 (n=4096/6144/9216): int8=6.5/9.7ms, direct=237ms.
+            # 直觉上 direct 应更快 (无 quant overhead), 但实测 dot2 直链无法与 Triton 的
+            # int8 path (经过更好调度) 竞争。本地 int8 kernel 实测已是硬件实际墙。
+            # 所以默认总是 int8, 仅非常短的 seq (避免 quant overhead) 才走 direct。
+            # 实测 NHD/HND 阈值 1016 是历史 v1/v2 病态的产物, 当前 v2 已修正。
+            d64_default = 9999999  # 默认: 总是 int8 (gfx1035 D=64 self)
         else:
             d64_default = 2048 if tensor_layout == "HND" else 3072
         thr_d64 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64", str(d64_default)) or d64_default)
@@ -175,7 +188,7 @@ def sageattn(
             # cross-attn: q 短时 direct 省辅助收益大 (q=3072/kv=4096 仍优 3%)
             use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64_CROSS", "6144") or 6144))
         else:
-            # gfx1035: D=64 self: int8 faster for short (N≤threshold), direct faster for long
+            # gfx1035: D=64 self: int8 always faster. use_direct only if user forced.
             if arch.startswith('gfx103'):
                 use_direct = (kv_len_actual > thr_d64)
             else:

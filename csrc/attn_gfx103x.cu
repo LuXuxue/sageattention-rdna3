@@ -791,25 +791,29 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                 // v4: BM=128 + 2-sync/tile (from v3's BM=64/4-sync)
                 // SAGEATTN_GFX10_V4=0 forces v3 for A/B comparison
                 const bool force_v3 = getenv("SAGEATTN_GFX10_V4") ? (atoi(getenv("SAGEATTN_GFX10_V4")) == 0) : false;
+                const int v4_mode = getenv("SAGEATTN_GFX10_V4") ? atoi(getenv("SAGEATTN_GFX10_V4")) : 0;
                 const bool use_v4_long = (qo_len == kv_len && qo_len >= 512);
                 const bool use_v4_short_cross = (qo_len != kv_len && qo_len >= 256);
                 const int bn = (qo_len == kv_len) ? ((kv_len <= 77) ? 16 : 32) : 32;
-                if (use_v3 && (use_v4_long || use_v4_short_cross)) {
-                    if (force_v3) {
-                        // v3 fallback for A/B benchmarking
-                        if (is_causal) { if (out_bf) L10_V3(64, true, 16, __hip_bfloat16); else L10_V3(64, true, 16, __half); }
-                        else { if (out_bf) L10_V3(64, false, 16, __hip_bfloat16); else L10_V3(64, false, 16, __half); }
+                // Default D=64 int8 path: v2 BM=64 BN=32 (highest occupancy on gfx1035).
+                // v4 BM=128 has 2x LDS usage -> ~2x slower due to lower occupancy.
+                // v3 has BM=64 BN=16 but slower than v2 BN=32.
+                // env SAGEATTN_GFX10_V4=1 forces v4; v3_mode=1 forces v3.
+                if (force_v3) {
+                    // v3 fallback for A/B benchmarking
+                    if (is_causal) { if (out_bf) L10_V3(64, true, 16, __hip_bfloat16); else L10_V3(64, true, 16, __half); }
+                    else { if (out_bf) L10_V3(64, false, 16, __hip_bfloat16); else L10_V3(64, false, 16, __half); }
+                } else if (v4_mode == 1) {
+                    // v4 forced
+                    if (bn == 32) {
+                        if (is_causal) { if (out_bf) L10_V4(64, true, 32, __hip_bfloat16); else L10_V4(64, true, 32, __half); }
+                        else { if (out_bf) L10_V4(64, false, 32, __hip_bfloat16); else L10_V4(64, false, 32, __half); }
                     } else {
-                        // v4 with BN=32 (D=64 BN=32 is accurate, halves tiles)
-                        if (bn == 32) {
-                            if (is_causal) { if (out_bf) L10_V4(64, true, 32, __hip_bfloat16); else L10_V4(64, true, 32, __half); }
-                            else { if (out_bf) L10_V4(64, false, 32, __hip_bfloat16); else L10_V4(64, false, 32, __half); }
-                        } else {
-                            if (is_causal) { if (out_bf) L10_V4(64, true, 16, __hip_bfloat16); else L10_V4(64, true, 16, __half); }
-                            else { if (out_bf) L10_V4(64, false, 16, __hip_bfloat16); else L10_V4(64, false, 16, __half); }
-                        }
+                        if (is_causal) { if (out_bf) L10_V4(64, true, 16, __hip_bfloat16); else L10_V4(64, true, 16, __half); }
+                        else { if (out_bf) L10_V4(64, false, 16, __hip_bfloat16); else L10_V4(64, false, 16, __half); }
                     }
                 } else if (use_v22) {
+                    // v2.2 from global V_T (auto when qo_len==kv_len>=1536)
                     if (bn == 16) {
                         if (is_causal) { if (out_bf) L10_V22(64, true, 16, __hip_bfloat16); else L10_V22(64, true, 16, __half); }
                         else { if (out_bf) L10_V22(64, false, 16, __hip_bfloat16); else L10_V22(64, false, 16, __half); }
@@ -817,21 +821,14 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                         if (is_causal) { if (out_bf) L10_V22(64, true, 32, __hip_bfloat16); else L10_V22(64, true, 32, __half); }
                         else { if (out_bf) L10_V22(64, false, 32, __hip_bfloat16); else L10_V22(64, false, 32, __half); }
                     }
-                } else if (use_v2) {
-                    if (bn == 16) {
-                        if (is_causal) { if (out_bf) L10_V2(64, true, 16, __hip_bfloat16); else L10_V2(64, true, 16, __half); }
-                        else { if (out_bf) L10_V2(64, false, 16, __hip_bfloat16); else L10_V2(64, false, 16, __half); }
-                    } else {
+                } else {
+                    // v2 default (highest occupancy on gfx1035)
+                    if (bn == 32) {
                         if (is_causal) { if (out_bf) L10_V2(64, true, 32, __hip_bfloat16); else L10_V2(64, true, 32, __half); }
                         else { if (out_bf) L10_V2(64, false, 32, __hip_bfloat16); else L10_V2(64, false, 32, __half); }
-                    }
-                } else {
-                    if (bn == 16) {
-                        if (is_causal) { if (out_bf) L10(64, true, 16, __hip_bfloat16); else L10(64, true, 16, __half); }
-                        else { if (out_bf) L10(64, false, 16, __hip_bfloat16); else L10(64, false, 16, __half); }
                     } else {
-                        if (is_causal) { if (out_bf) L10(64, true, 32, __hip_bfloat16); else L10(64, true, 32, __half); }
-                        else { if (out_bf) L10(64, false, 32, __hip_bfloat16); else L10(64, false, 32, __half); }
+                        if (is_causal) { if (out_bf) L10_V2(64, true, 16, __hip_bfloat16); else L10_V2(64, true, 16, __half); }
+                        else { if (out_bf) L10_V2(64, false, 16, __hip_bfloat16); else L10_V2(64, false, 16, __half); }
                     }
                 }
             } else {
