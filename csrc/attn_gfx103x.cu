@@ -48,7 +48,7 @@ constexpr int MIN_BLK_K = 16;
 constexpr int LDS_PAD = 16;
 
 #include "mma_gfx10.h"
-#include "attn_gfx10_new.h"
+
 Tensor new_empty_like(const Tensor& like, std::initializer_list<int64_t> sizes, ScalarType dtype) {
     return torch::stable::new_empty(like, std::vector<int64_t>(sizes), std::make_optional(dtype));
 }
@@ -995,6 +995,74 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                         reinterpret_cast<const float*>(v_scale.data_ptr()), \
                         v_scale.stride(0), v_scale.stride(1)); \
                 } while (0)
+            // v9: 1-row-per-lane int8-QK + (optional) int8-PV. Env SAGEATTN_GFX10_V9=1.
+            // SAGEATTN_V9_IPV: 0=off (fp16 PV), 1=on (int8 PV), 2=auto (self long on)
+            #define L10_V9F(HD, C, BNV, BMM, ODT) \
+                do { \
+                    dim3 b10((BMM)); \
+                    dim3 g10((qo_len + (BMM) - 1) / (BMM), q_heads, batch); \
+                    const int v9_diag = []() { \
+                        const char* e = getenv("SAGEATTN_V7P_DIAG"); \
+                        return e ? atoi(e) : 0; \
+                    }(); \
+                    sageattn_gfx10::attn_kernel_gfx10_i9_t<HD, C, BNV, (BMM), ODT, false><<<g10, b10, 0, stream>>>( \
+                        reinterpret_cast<const int8_t*>(query.data_ptr()), \
+                        reinterpret_cast<const int8_t*>(key.data_ptr()), \
+                        reinterpret_cast<const __half*>(value.data_ptr()), \
+                        reinterpret_cast<ODT*>(output.data_ptr()), \
+                        reinterpret_cast<const float*>(q_scale.data_ptr()), \
+                        reinterpret_cast<const float*>(k_scale.data_ptr()), \
+                        batch, qo_len, kv_len, q_heads, kv_heads, \
+                        q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                        k_stride_b, k_stride_n, k_stride_h, \
+                        v_stride_b, v_stride_n, v_stride_h, \
+                        o_stride_b, o_stride_n, o_stride_h, \
+                        qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
+                        static_cast<int>(tensor_layout), v9_diag, 1, \
+                        nullptr, 0, 0); \
+                } while (0)
+            #define L10_V9I(HD, C, BNV, BMM, ODT) \
+                do { \
+                    dim3 b10((BMM)); \
+                    dim3 g10((qo_len + (BMM) - 1) / (BMM), q_heads, batch); \
+                    Tensor v_i8 = new_empty_like(value, {batch, kv_heads, kv_len, head_dim}, ScalarType::Char); \
+                    const int v_tiles = static_cast<int>((kv_len + 31) / 32); \
+                    Tensor v_sc = new_empty_like(value, {batch, kv_heads, v_tiles}, ScalarType::Float); \
+                    dim3 bv(256); \
+                    dim3 gv(v_tiles, kv_heads, batch); \
+                    v_tile_max_kernel<HD, 32><<<gv, bv, 0, stream>>>( \
+                        reinterpret_cast<const __half*>(value.data_ptr()), \
+                        reinterpret_cast<float*>(v_sc.data_ptr()), \
+                        batch, kv_heads, kv_len, v_stride_b, v_stride_n, v_stride_h); \
+                    v_tile_quant_kernel<HD, 32><<<gv, bv, 0, stream>>>( \
+                        reinterpret_cast<const __half*>(value.data_ptr()), \
+                        reinterpret_cast<float*>(v_sc.data_ptr()), \
+                        reinterpret_cast<int8_t*>(v_i8.data_ptr()), \
+                        batch, kv_heads, kv_len, v_stride_b, v_stride_n, v_stride_h); \
+                    const int64_t vi_stride_b = v_i8.stride(0); \
+                    const int64_t vi_stride_n = v_i8.stride(1); \
+                    const int64_t vi_stride_h = v_i8.stride(2); \
+                    const int v9_diag = []() { \
+                        const char* e = getenv("SAGEATTN_V7P_DIAG"); \
+                        return e ? atoi(e) : 0; \
+                    }(); \
+                    sageattn_gfx10::attn_kernel_gfx10_i9_t<HD, C, BNV, (BMM), ODT, true><<<g10, b10, 0, stream>>>( \
+                        reinterpret_cast<const int8_t*>(query.data_ptr()), \
+                        reinterpret_cast<const int8_t*>(key.data_ptr()), \
+                        reinterpret_cast<const __half*>(v_i8.data_ptr()), \
+                        reinterpret_cast<ODT*>(output.data_ptr()), \
+                        reinterpret_cast<const float*>(q_scale.data_ptr()), \
+                        reinterpret_cast<const float*>(k_scale.data_ptr()), \
+                        batch, qo_len, kv_len, q_heads, kv_heads, \
+                        q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                        k_stride_b, k_stride_n, k_stride_h, \
+                        vi_stride_b, vi_stride_n, vi_stride_h, \
+                        o_stride_b, o_stride_n, o_stride_h, \
+                        qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
+                        static_cast<int>(tensor_layout), v9_diag, 1, \
+                        reinterpret_cast<const float*>(v_sc.data_ptr()), \
+                        v_sc.stride(0), v_sc.stride(1)); \
+                } while (0)
             #define L10_V2F(HD, C, BN, ODT) \
                 do { \
                     dim3 b10(128); \
@@ -1034,6 +1102,24 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                         static_cast<int>(tensor_layout)); \
                 } while (0)
             if (head_dim == 64) {
+                // v9: 1-row-per-lane int8-QK + optional int8-PV. Env SAGEATTN_GFX10_V9=1.
+                // SAGEATTN_V9_BN: 16 or 32 (default 32). SAGEATTN_V9_IPV: 0=fp16 PV, 1=int8, 2=auto.
+                #define V9DISPATCH(HD_, BNV, BMM, IPV) \
+                    if (is_causal) { \
+                        if (out_bf) { if (IPV) L10_V9I(HD_, true, BNV, BMM, __hip_bfloat16); else L10_V9F(HD_, true, BNV, BMM, __hip_bfloat16); } \
+                        else { if (IPV) L10_V9I(HD_, true, BNV, BMM, __half); else L10_V9F(HD_, true, BNV, BMM, __half); } \
+                    } else { \
+                        if (out_bf) { if (IPV) L10_V9I(HD_, false, BNV, BMM, __hip_bfloat16); else L10_V9F(HD_, false, BNV, BMM, __hip_bfloat16); } \
+                        else { if (IPV) L10_V9I(HD_, false, BNV, BMM, __half); else L10_V9F(HD_, false, BNV, BMM, __half); } \
+                    }
+                const bool v9_mode = getenv("SAGEATTN_GFX10_V9") ? (atoi(getenv("SAGEATTN_GFX10_V9")) == 1) : false;
+                if (v9_mode) {
+                    const int v9_ipv = getenv("SAGEATTN_V9_IPV") ? atoi(getenv("SAGEATTN_V9_IPV")) : 2;
+                    const bool ipv_on = (v9_ipv == 1) || (v9_ipv == 2 && qo_len == kv_len && qo_len >= 512);
+                    const int v9_bn = getenv("SAGEATTN_V9_BN") ? atoi(getenv("SAGEATTN_V9_BN")) : 32;
+                    if (v9_bn == 16) { V9DISPATCH(64, 16, 128, ipv_on); } else { V9DISPATCH(64, 32, 128, ipv_on); }
+                } else {
+                // v4: BM=128 + 2-sync/tile (from v3's BM=64/4-sync)
                 // v4: BM=128 + 2-sync/tile (from v3's BM=64/4-sync)
                 // SAGEATTN_GFX10_V4=0 forces v3 for A/B comparison
                 const bool force_v3 = getenv("SAGEATTN_GFX10_V4") ? (atoi(getenv("SAGEATTN_GFX10_V4")) == 0) : false;
@@ -1118,6 +1204,13 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                         else { if (out_bf) L10_V22(64, false, 32, __hip_bfloat16); else L10_V22(64, false, 32, __half); }
                     }
                 } else {
+// gfx1035 D=64 default: v8 BM=128 BN=32 native V (2.3-6x faster than v2/v8-BN16).
+                    // Override with SAGEATTN_GFX10_V8_D64=0 to restore the old v2 default.
+                    const bool v8d64_default = getenv("SAGEATTN_GFX10_V8_D64") ? (atoi(getenv("SAGEATTN_GFX10_V8_D64")) != 0) : true;
+                    if (v8d64_default) {
+                        if (is_causal) { if (out_bf) L10_V8P(64, true, 32, __hip_bfloat16, 1, 1); else L10_V8P(64, true, 32, __half, 1, 1); }
+                        else { if (out_bf) L10_V8P(64, false, 32, __hip_bfloat16, 1, 1); else L10_V8P(64, false, 32, __half, 1, 1); }
+                    } else {
                     // v2 default (highest occupancy on gfx1035)
                     if (bn == 32) {
                         if (is_causal) { if (out_bf) L10_V2(64, true, 32, __hip_bfloat16); else L10_V2(64, true, 32, __half); }
@@ -1127,9 +1220,18 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                         else { if (out_bf) L10_V2(64, false, 16, __hip_bfloat16); else L10_V2(64, false, 16, __half); }
                     }
                 }
-            } else {
+            }}} else {
                 // D=128 int8 (gfx1035):
-                
+
+                // v9 (SAGEATTN_GFX10_V9=1): 1-row-per-lane int8-QK + int8-PV.
+                const bool v9_mode_d128 = getenv("SAGEATTN_GFX10_V9") ? (atoi(getenv("SAGEATTN_GFX10_V9")) == 1) : false;
+                if (v9_mode_d128) {
+                    const int v9_ipv = getenv("SAGEATTN_V9_IPV") ? atoi(getenv("SAGEATTN_V9_IPV")) : 2;
+                    const bool ipv_on = (v9_ipv == 1) || (v9_ipv == 2 && qo_len == kv_len && qo_len >= 512);
+                    const int v9_bn = getenv("SAGEATTN_V9_BN") ? atoi(getenv("SAGEATTN_V9_BN")) : 32;
+                    const int v9_bm = getenv("SAGEATTN_V9_BM") ? atoi(getenv("SAGEATTN_V9_BM")) : 64;
+                    if (v9_bn == 16) { if (v9_bm == 64) { V9DISPATCH(128, 16, 64, ipv_on); } else { V9DISPATCH(128, 16, 128, ipv_on); } } else { if (v9_bm == 64) { V9DISPATCH(128, 32, 64, ipv_on); } else { V9DISPATCH(128, 32, 128, ipv_on); } }
+                } else {                
                 //   v8 (BM=64/BN=32, env SAGEATTN_GFX10_V8_D128) is now the default:
                 //   ~3.7x faster than direct, ~6.7x faster than v4 (104 vs 386/696 ms @4096 self).
                 //   Legacy env-gated paths (exp_v4, exp_v2x, force_v22, force_v2) kept for
@@ -1266,9 +1368,11 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
             #undef L10_V2F
             #undef L10_V2X
             #undef L10_V7P
-            return output;
-}
-Tensor fp16_attn_gfx103x_t(
+        }
+        return output;
+        }
+
+        Tensor fp16_attn_gfx103x_t(
     Tensor query, Tensor key, Tensor value, Tensor output,
     int64_t tensor_layout, int64_t is_causal, double sm_scale, int64_t bm_sel) {
             const int64_t batch = query.size(0);

@@ -3195,4 +3195,237 @@ __global__ __attribute__((amdgpu_num_vgpr(224))) __launch_bounds__(BM, 1) void a
 }  // attn_kernel_gfx10_i8_v8r_t
 
 
+template <int HD, bool ISC, int BN, int BM, typename ODT, bool IPV = false>
+__global__ __attribute__((amdgpu_num_vgpr(224))) __launch_bounds__(BM, 1) void attn_kernel_gfx10_i9_t(
+    const int8_t* __restrict__ q, const int8_t* __restrict__ k,
+    const __half* __restrict__ v, ODT* __restrict__ out,
+    const float* __restrict__ q_scale, const float* __restrict__ k_scale,
+    int64_t batch, int64_t qo_len, int64_t kv_len,
+    int64_t q_heads, int64_t kv_heads,
+    int64_t q_stride_b, int64_t q_stride_n, int64_t q_stride_h,
+    int64_t q_stride_n_dir_unused,
+    int64_t k_stride_b, int64_t k_stride_n, int64_t k_stride_h,
+    int64_t v_stride_b, int64_t v_stride_n, int64_t v_stride_h,
+    int64_t o_stride_b, int64_t o_stride_n, int64_t o_stride_h,
+    int64_t qs_stride_b, int64_t qs_stride_h,
+    int64_t ks_stride_b, int64_t ks_stride_h,
+    int tensor_layout, int diag, int v_native,
+    const float* __restrict__ v_scale, int64_t vs_stride_b, int64_t vs_stride_h) {
+#if defined(__GFX10__)
+    constexpr int QUADS = HD / 4;       // int8 dwords per row
+    constexpr int NTHREAD = BM;         // 1 row per lane
+    constexpr int K_STRIDE = HD;
+    constexpr int V_STRIDE = BN;
+    constexpr int KS_TOTAL = BN * K_STRIDE;
+    constexpr int VS_TOTAL = HD * V_STRIDE;   // [HD][BN] transposed V tile
+    constexpr int VDSW = IPV ? 16 : 8;        // int8s per staging slot
+    static_assert(KS_TOTAL * 2 + VS_TOTAL * 2 * (int)sizeof(std::conditional_t<IPV, int8_t, __half>) <= 49152,
+                  "v9 LDS double-buffer budget");
+
+    __shared__ __attribute__((aligned(32))) int8_t k_buf[2][KS_TOTAL];
+    __shared__ __attribute__((aligned(32))) std::conditional_t<IPV, int8_t, __half> v_buf[2][VS_TOTAL];
+    const int8_t* v8p = reinterpret_cast<const int8_t*>(v);
+
+    const int tid = threadIdx.x;
+    const int64_t m = blockIdx.x * BM + tid;
+    const int64_t b = blockIdx.z;
+    const int64_t h = blockIdx.y;
+    const int64_t kvh = h / (q_heads / kv_heads);
+    const bool valid = (m < qo_len) && (h < q_heads);
+
+    const int diag_qk = diag & 1;
+    const int diag_sm = (diag >> 1) & 1;
+    const int diag_pv = (diag >> 2) & 1;
+    const int diag_st = (diag >> 3) & 1;
+    const int diag_wb = (diag >> 4) & 1;
+    (void)q_stride_n_dir_unused; (void)tensor_layout; (void)v_native;
+
+    // ---- Q row resident in registers ----
+    const float qsv = valid
+        ? q_scale[b * qs_stride_b + h * qs_stride_h + static_cast<int>(m / MIN_BLK_Q)] : 0.0f;
+    int q_reg[QUADS];
+    if (valid) {
+        const int64_t qb = b * q_stride_b + h * q_stride_h;
+        const int8_t* qrow = q + qb + m * q_stride_n;
+        #pragma unroll
+        for (int dq = 0; dq < QUADS; ++dq) q_reg[dq] = load_i8_quad(qrow + dq * 4);
+    } else {
+        #pragma unroll
+        for (int dq = 0; dq < QUADS; ++dq) q_reg[dq] = 0;
+    }
+
+    float acc[HD];
+    float row_m = -3.0e38f, row_l = 0.0f;
+    #pragma unroll
+    for (int c = 0; c < HD; ++c) acc[c] = 0.0f;
+
+    // ---- stage one K+V tile (global -> LDS) ----
+    auto stage_kv = [&](int dst, int64_t kb0) {
+        #pragma unroll 1
+        for (int i = tid; i < BN * QUADS; i += NTHREAD) {
+            const int r = i / QUADS, ck = i % QUADS;
+            const int64_t n = kb0 + r;
+            reinterpret_cast<int*>(&k_buf[dst][r * K_STRIDE + ck * 4])[0] =
+                (n < kv_len) ? load_i8_quad(k + b * k_stride_b + kvh * k_stride_h + n * k_stride_n + ck * 4) : 0;
+        }
+        #pragma unroll 1
+        for (int u = 0; u < (HD * BN / VDSW) / NTHREAD; ++u) {
+            const int slot = tid + u * NTHREAD;
+            if (slot < HD * BN / VDSW) {
+                const int n_local = slot / (HD / VDSW);
+                const int dg = slot % (HD / VDSW);
+                const int64_t n = kb0 + n_local;
+                if (n < kv_len && (dg * VDSW) < HD) {
+                    if (IPV) {
+                        const int8_t* src = v8p + b * v_stride_b + kvh * v_stride_n + n * v_stride_h + dg * VDSW;
+                        int4 val = *reinterpret_cast<const int4*>(src);
+                        #pragma unroll
+                        for (int jj = 0; jj < VDSW; ++jj)
+                            v_buf[dst][(dg * VDSW + jj) * V_STRIDE + n_local] = reinterpret_cast<const int8_t*>(&val)[jj];
+                    } else {
+                        const __half* src = v + b * v_stride_b + kvh * v_stride_n + n * v_stride_h + dg * VDSW;
+                        int4 val = *reinterpret_cast<const int4*>(src);
+                        #pragma unroll
+                        for (int jj = 0; jj < VDSW; ++jj)
+                            v_buf[dst][(dg * VDSW + jj) * V_STRIDE + n_local] = reinterpret_cast<__half*>(&val)[jj];
+                    }
+                }
+            }
+        }
+    };
+
+    // prologue: stage tile 0
+    stage_kv(0, 0);
+    __syncthreads();
+
+    #pragma unroll 1
+    for (int64_t kb = 0; kb < kv_len; kb += BN) {
+        const int buf = static_cast<int>((kb / BN) & 1);
+        const int64_t nb = kb + BN;
+
+        // issue next tile's global loads (overlaps current tile compute)
+        if ((nb < kv_len) && !diag_st) {
+            stage_kv(buf ^ 1, nb);
+        }
+
+        // ---- QK: BN key scores for this lane's row ----
+        float scr[BN];
+        {
+            #pragma unroll
+            for (int j0 = 0; j0 < BN; j0 += 4) {
+                int s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+                if (!diag_qk)
+                #pragma unroll
+                for (int dq = 0; dq < QUADS; dq += 4) {
+                    const int4 k0 = *reinterpret_cast<const int4*>(&k_buf[buf][(j0 + 0) * K_STRIDE + dq * 4]);
+                    const int4 k1 = *reinterpret_cast<const int4*>(&k_buf[buf][(j0 + 1) * K_STRIDE + dq * 4]);
+                    const int4 k2 = *reinterpret_cast<const int4*>(&k_buf[buf][(j0 + 2) * K_STRIDE + dq * 4]);
+                    const int4 k3 = *reinterpret_cast<const int4*>(&k_buf[buf][(j0 + 3) * K_STRIDE + dq * 4]);
+                    s0 = sdot4_i32_i8(q_reg[dq + 0], k0.x, s0); s0 = sdot4_i32_i8(q_reg[dq + 1], k0.y, s0);
+                    s0 = sdot4_i32_i8(q_reg[dq + 2], k0.z, s0); s0 = sdot4_i32_i8(q_reg[dq + 3], k0.w, s0);
+                    s1 = sdot4_i32_i8(q_reg[dq + 0], k1.x, s1); s1 = sdot4_i32_i8(q_reg[dq + 1], k1.y, s1);
+                    s1 = sdot4_i32_i8(q_reg[dq + 2], k1.z, s1); s1 = sdot4_i32_i8(q_reg[dq + 3], k1.w, s1);
+                    s2 = sdot4_i32_i8(q_reg[dq + 0], k2.x, s2); s2 = sdot4_i32_i8(q_reg[dq + 1], k2.y, s2);
+                    s2 = sdot4_i32_i8(q_reg[dq + 2], k2.z, s2); s2 = sdot4_i32_i8(q_reg[dq + 3], k2.w, s2);
+                    s3 = sdot4_i32_i8(q_reg[dq + 0], k3.x, s3); s3 = sdot4_i32_i8(q_reg[dq + 1], k3.y, s3);
+                    s3 = sdot4_i32_i8(q_reg[dq + 2], k3.z, s3); s3 = sdot4_i32_i8(q_reg[dq + 3], k3.w, s3);
+                }
+                for (int tj = 0; tj < 4; ++tj) {
+                    int s = (tj == 0) ? s0 : (tj == 1) ? s1 : (tj == 2) ? s2 : s3;
+                    const int64_t n = kb + j0 + tj;
+                    const float ksj = k_scale[b * ks_stride_b + kvh * ks_stride_h + static_cast<int>(n / MIN_BLK_K)];
+                    float sc = static_cast<float>(s) * (qsv * ksj);
+                    if ((!valid) || (ISC && n > m) || (n >= kv_len)) sc = -3.0e38f;
+                    scr[j0 + tj] = sc;
+                }
+            }
+        }
+
+        // ---- softmax (row-local) ----
+        if (!diag_sm) {
+            float lm = scr[0];
+            #pragma unroll
+            for (int j = 1; j < BN; ++j) lm = fmaxf(lm, scr[j]);
+            float gm = fmaxf(row_m, lm);
+            float alpha = (row_l > 0.0f) ? exp2f(row_m - gm) : 0.0f;
+            row_m = gm;
+            row_l *= alpha;
+            #pragma unroll
+            for (int c = 0; c < HD; ++c) acc[c] *= alpha;
+            float ps = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < BN; ++j) { float p = exp2f(scr[j] - row_m); scr[j] = p; ps += p; }
+            row_l += ps;
+        }
+
+        // ---- PV ----
+        if (!diag_pv) {
+            if (IPV) {
+                const float vs = (v_scale
+                    ? v_scale[b * vs_stride_b + kvh * vs_stride_h + static_cast<int>(kb / BN)] : 127.0f * 127.0f)
+                    * (1.0f / (127.0f * 127.0f));
+                unsigned p8[BN / 4];
+                #pragma unroll
+                for (int j = 0; j < BN; j += 4) {
+                    unsigned w = 0;
+                    #pragma unroll
+                    for (int jj = 0; jj < 4; ++jj) {
+                        int pi = static_cast<int>(scr[j + jj] * 127.0f + 0.5f);
+                        if (pi < 0) pi = 0;
+                        if (pi > 127) pi = 127;
+                        w |= static_cast<unsigned>(pi) << (jj * 8);
+                    }
+                    p8[j / 4] = w;
+                }
+                #pragma unroll 4
+                for (int c0 = 0; c0 < HD; ++c0) {
+                    int ai = 0;
+                    #pragma unroll
+                    for (int kk = 0; kk < BN / 16; ++kk) {
+                        const int4 vi = *reinterpret_cast<const int4*>(&v_buf[buf][c0 * V_STRIDE + kk * 16]);
+                        ai = sdot4_i32_i8(static_cast<int>(p8[kk * 4 + 0]), vi.x, ai);
+                        ai = sdot4_i32_i8(static_cast<int>(p8[kk * 4 + 1]), vi.y, ai);
+                        ai = sdot4_i32_i8(static_cast<int>(p8[kk * 4 + 2]), vi.z, ai);
+                        ai = sdot4_i32_i8(static_cast<int>(p8[kk * 4 + 3]), vi.w, ai);
+                    }
+                    acc[c0] += static_cast<float>(ai) * vs;
+                }
+            } else {
+                unsigned p2[BN / 2];
+                #pragma unroll
+                for (int j = 0; j < BN; j += 2)
+                    p2[j / 2] = __half_as_ushort(__float2half(scr[j])) |
+                                (static_cast<unsigned>(__half_as_ushort(__float2half(scr[j + 1]))) << 16);
+                #pragma unroll 4
+                for (int c0 = 0; c0 < HD; c0 += 2) {
+                    #pragma unroll
+                    for (int jj = 0; jj < BN; jj += 8) {
+                        const int4 va = *reinterpret_cast<const int4*>(&v_buf[buf][(c0 + 0) * V_STRIDE + jj]);
+                        const int4 vb = *reinterpret_cast<const int4*>(&v_buf[buf][(c0 + 1) * V_STRIDE + jj]);
+                        acc[c0 + 0] = fdot2_f32_f16(p2[(jj >> 1) + 0], va.x, acc[c0 + 0]);
+                        acc[c0 + 0] = fdot2_f32_f16(p2[(jj >> 1) + 1], va.y, acc[c0 + 0]);
+                        acc[c0 + 0] = fdot2_f32_f16(p2[(jj >> 1) + 2], va.z, acc[c0 + 0]);
+                        acc[c0 + 0] = fdot2_f32_f16(p2[(jj >> 1) + 3], va.w, acc[c0 + 0]);
+                        acc[c0 + 1] = fdot2_f32_f16(p2[(jj >> 1) + 0], vb.x, acc[c0 + 1]);
+                        acc[c0 + 1] = fdot2_f32_f16(p2[(jj >> 1) + 1], vb.y, acc[c0 + 1]);
+                        acc[c0 + 1] = fdot2_f32_f16(p2[(jj >> 1) + 2], vb.z, acc[c0 + 1]);
+                        acc[c0 + 1] = fdot2_f32_f16(p2[(jj >> 1) + 3], vb.w, acc[c0 + 1]);
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- writeback ----
+    if (valid && !diag_wb) {
+        const float inv = 1.0f / row_l;
+        const int64_t base = b * o_stride_b + m * o_stride_n + h * o_stride_h;
+        #pragma unroll
+        for (int c = 0; c < HD; ++c)
+            out[base + c] = gfx10_out_convert<ODT>(acc[c] * inv);
+    }
+#endif
+}  // attn_kernel_gfx10_i9_t
+
+
 }  // namespace sageattn_gfx10

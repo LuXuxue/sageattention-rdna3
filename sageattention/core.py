@@ -247,7 +247,11 @@ def sageattn(
         # D=128 v8 gate (attn_gfx103x.cu L10_V8P v_native=1) also requires the natural
         # [B,H,N,D] V layout: without this, core passes V_T but the kernel reads native.
         v8_d128_native = (headdim == 128) and (os.getenv("SAGEATTN_GFX10_V8_D128", "1") != "0")
-        v8_native = (v8_enabled or v8_d128_native) and os.getenv("SAGEATTN_GFX10_V8_VT", "0") != "1"
+        # gfx1035 D=64: v8 (BM=128/BN=32) is 6x faster than the old v2 default and 2.3x
+        # faster than v8-BN=16; make it the default (native V layout) unless user forces V_T.
+        v8_d64_native = (headdim == 64) and arch.startswith("gfx103") and \
+            os.getenv("SAGEATTN_GFX10_V8_D64", "1") != "0"
+        v8_native = (v8_enabled or v8_d128_native or v8_d64_native) and os.getenv("SAGEATTN_GFX10_V8_VT", "0") != "1"
         if v8_native:
             # v8 native 布局: kernel 直接读 HND 自然 [B,H,N,D] V (d-contiguous 全 sector)。
             # HND 输入直接透传; NHD 输入先 permute+contiguous 转成 HND 自然布局 (一次拷贝,
