@@ -49,3 +49,6 @@ Tensor mean_seq_gfx103x(Tensor input, int64_t tensor_layout);
 
 // V [B,N,H,D] -> V_T [B,H,D,N] (contiguous), 供无 LDS PV 模式
 Tensor v_transpose_gfx103x(Tensor value, Tensor value_t, int64_t tensor_layout);
+
+// TEMPORARY: fetch the int8-PV debug dump (diag bit 5, env SAGEATTN_GFX10_IPV_DBG)
+Tensor ipv_dbg_fetch_gfx103x(Tensor like);

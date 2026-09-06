@@ -183,7 +183,12 @@ def sageattn(
             d64_default = 2048 if tensor_layout == "HND" else 3072
         thr_d64 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64", str(d64_default)) or d64_default)
         if is_causal:
+            v7p_forced = (os.getenv("SAGEATTN_GFX10_V7P") not in [None, "", "0"]) or \
+                         (os.getenv("SAGEATTN_GFX10_V8") not in [None, "", "0"])
             use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64_CAUSAL", "6144") or 6144))
+            if v7p_forced:
+                # v7p/v8 int8 kernel 实测与 Triton 同水平 (~1.1-1.3x), causal 也强制走 int8
+                use_direct = False
         elif q_len < kv_len_actual:
             # cross-attn: q 短时 direct 省辅助收益大 (q=3072/kv=4096 仍优 3%)
             use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64_CROSS", "6144") or 6144))
@@ -196,15 +201,16 @@ def sageattn(
 
     else:
         if arch.startswith('gfx103'):
-            thr_d128 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128", "9999999") or 9999999)
+            # gfx1035 D=128: int8 v8 kernel now beats direct everywhere (~1.8-3.7x).
+            # default: always int8 (thr=0). Set SAGEATTN_DIRECT_THRESHOLD_D128 to force direct.
+            thr_d128 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128", "0") or 0)
         else:
             thr_d128 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128", "2048") or 2048)
         if q_len * 2 < kv_len_actual:
             # cross 且 q 明显短: direct 优 (q=512/1024 vs kv=4096 优 8-25%; q=2048=kv/2 时 int8 优)
             use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128_CROSS", "4096") or 4096))
         else:
-            # gfx1035: D=128 self: direct 恒优于 int8 (~1.8x)。
-            # 故 self 默认恒走 direct; 可用 SAGEATTN_DIRECT_THRESHOLD_D128 覆盖。
+            # gfx1035: D=128 self: int8 always faster (v8 ~3.7x vs direct). Direct only if forced.
             use_direct = (kv_len_actual <= thr_d128)
 
     if use_direct:
@@ -237,16 +243,35 @@ def sageattn(
         #   省掉 v.to(fp16) 独立 kernel 的一次额外全局读写往返)
         #   输出由 kernel 直接写 bf16 (o 复用, 省 o.to(bf16) 转换 kernel, 且单次舍入精度更好)
         v_for_attn = v
-        # V 全局转置 (V_T [B,H,D,N]) + 无 LDS PV: 需配套 -DSAGEATTN_VT_GLOBAL=1 编译 (setup.py 默认)
-        # n 维 padding 到 64 倍数, 防 v_frag_t 32B 直读越界 (见 direct 路径注释)
-        kv_heads_n = k.size(1) if tensor_layout == "HND" else k.size(2)
-        padded_n = ((kv_len_actual + 63) // 64) * 64
-        v_t = torch.empty(
-            q.size(0), kv_heads_n, headdim, padded_n,
-            device=q.device, dtype=torch.float16
-        )
-        ops.v_transpose(v_for_attn, v_t, layout_code)
-        v_for_attn = v_t
+        v8_enabled = (os.getenv("SAGEATTN_GFX10_V8", "0") != "0" and int(os.getenv("SAGEATTN_GFX10_V8", "0") or 0) == 1) or (os.getenv("SAGEATTN_GFX10_V8R", "0") == "1")
+        # D=128 v8 gate (attn_gfx103x.cu L10_V8P v_native=1) also requires the natural
+        # [B,H,N,D] V layout: without this, core passes V_T but the kernel reads native.
+        v8_d128_native = (headdim == 128) and (os.getenv("SAGEATTN_GFX10_V8_D128", "1") != "0")
+        v8_native = (v8_enabled or v8_d128_native) and os.getenv("SAGEATTN_GFX10_V8_VT", "0") != "1"
+        if v8_native:
+            # v8 native 布局: kernel 直接读 HND 自然 [B,H,N,D] V (d-contiguous 全 sector)。
+            # HND 输入直接透传; NHD 输入先 permute+contiguous 转成 HND 自然布局 (一次拷贝,
+            # 胜过 V_T 的 n-contiguous 慢读 2.4x)。bf16 输入先转 fp16 (int8 路径 V 恒 fp16)。
+            if tensor_layout == "NHD":
+                v16 = v if v.dtype == torch.float16 else v.to(torch.float16)
+                v_for_attn = v16.permute(0, 2, 1, 3).contiguous()
+            elif v.dtype != torch.float16:
+                # HND natural but bf16: convert to fp16 (kernel reads __half*).
+                v_for_attn = v.to(torch.float16)
+            # else: v 已是 HND 自然布局 (contiguous) 且 fp16, 直接透传
+        else:
+            # V 全局转置 (V_T [B,H,D,N]) + 无 LDS PV: 需配套 -DSAGEATTN_VT_GLOBAL=1 编译 (setup.py 默认)
+            # n 维 padding 到 64 倍数, 防 v_frag_t 32B 直读越界 (见 direct 路径注释)
+            # v8 默认走 native V 布局 (v_native=1, 免转置, 全 sector 直读): V_T 方案实测
+            # 2.4x 慢 (31.7ms vs 18.4ms @ H=8), 故 v8 不用 V_T; 可用 SAGEATTN_GFX10_V8_VT=1 回退。
+            kv_heads_n = k.size(1) if tensor_layout == "HND" else k.size(2)
+            padded_n = ((kv_len_actual + 63) // 64) * 64
+            v_t = torch.empty(
+                q.size(0), kv_heads_n, headdim, padded_n,
+                device=q.device, dtype=torch.float16
+            )
+            ops.v_transpose(v_for_attn, v_t, layout_code)
+            v_for_attn = v_t
         o_int8 = o
 
         # 默认 smooth_k=False (跳过 mean kernel): 实测 randn 下精度不降反升 (减 mean

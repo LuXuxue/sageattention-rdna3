@@ -406,7 +406,9 @@ __global__ void v_transpose_kernel(
         __syncthreads();  // 下一个 tile 复用 LDS
     }
 }
-}  // namespace
+// TEMPORARY: fetch the int8-PV debug dump (diag bit 5, env SAGEATTN_GFX10_IPV_DBG)
+// (definition placed after ipv_dbg_fetch_kernel; see further below)
+}// namespace
 
 
 Tensor v_transpose_gfx103x(Tensor value, Tensor value_t, int64_t tensor_layout) {
@@ -588,6 +590,102 @@ std::vector<Tensor> quant_qk_int8_gfx103x(
     return {q_int8, q_scale, k_int8, k_scale};
 }
 
+// ---------------------------------------------------------------------------
+// int8-PV: V quantized to int8 per 32-key tile (per (batch, kv_head, tile)) so
+// each [D][BN] V tile gets one fp32 scale. Two passes: tile max, then quantize.
+// Operates on the natural [B,H,N,D] fp16 V (layout passed in v_stride_b/n/h).
+// ---------------------------------------------------------------------------
+// TEMPORARY IPV debug: device buffers dumped via ipv_dbg_fetch (env
+// SAGEATTN_GFX10_IPV_DBG sets diag bit 5 in the host dispatch).
+__device__ unsigned g_ipv_dbg[4096];
+__device__ unsigned g_ipv_once;
+
+__global__ void ipv_dbg_zero_kernel() {
+    for (int i = threadIdx.x; i < 4096; i += 256) g_ipv_dbg[i] = 0u;
+    if (threadIdx.x == 0) g_ipv_once = 777u;
+}
+__global__ void ipv_dbg_fetch_kernel(int* out) {
+    for (int i = threadIdx.x; i < 4096; i += 256) out[i] = static_cast<int>(g_ipv_dbg[i]);
+}
+
+// TEMPORARY: fetch the int8-PV debug dump (diag bit 5, env SAGEATTN_GFX10_IPV_DBG)
+Tensor ipv_dbg_fetch_gfx103x(Tensor like) {
+    Tensor t = new_empty_like(like, {4096}, ScalarType::Int);
+    ipv_dbg_fetch_kernel<<<8, 256, 0, current_hip_stream(like)>>>(reinterpret_cast<int*>(t.data_ptr()));
+    return t;
+}
+template <int HD, int BN, int NT = 256>
+__global__ void v_tile_max_kernel(
+    const __half* __restrict__ v, float* __restrict__ v_scale,
+    int64_t batch, int64_t kv_heads, int64_t kv_len,
+    int64_t v_stride_b, int64_t v_stride_n, int64_t v_stride_h) {
+    const int64_t n0 = static_cast<int64_t>(blockIdx.x) * BN;
+    const int64_t h = blockIdx.y;
+    const int64_t b = blockIdx.z;
+    int ni = n0 < kv_len ? static_cast<int>((kv_len - n0 < BN) ? (kv_len - n0) : BN) : 0;
+    float m = 0.0f;
+    // stride semantics match the v8 native V decode (proven fp16 path):
+    // head index -> v_stride_n, sequence index -> v_stride_h.
+    const __half* row = v + b * v_stride_b + h * v_stride_n;
+    for (int i = threadIdx.x; i < HD * ni; i += NT) {
+        const int n = i / HD;
+        m = fmaxf(m, fabsf(__half2float(row[(n0 + n) * v_stride_h + (i % HD)])));
+    }
+    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0 && g_ipv_once == 777u) {
+        g_ipv_dbg[3000] = *reinterpret_cast<const unsigned*>(&m);
+        g_ipv_dbg[3001] = *reinterpret_cast<const unsigned*>(&v_stride_n);
+        g_ipv_dbg[3002] = *reinterpret_cast<const unsigned*>(&v_stride_h);
+    }
+    // full block tree-reduce of per-thread partials (lane-0-only reduce is WRONG)
+    __shared__ float shm[NT];
+    shm[threadIdx.x] = m;
+    __syncthreads();
+    #pragma unroll
+    for (int s = NT / 2; s >= 1; s >>= 1) {
+        if (threadIdx.x < s) shm[threadIdx.x] = fmaxf(shm[threadIdx.x], shm[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const int tiles = (kv_len + BN - 1) / BN;
+        v_scale[(b * kv_heads + h) * tiles + blockIdx.x] = shm[0];
+        if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && g_ipv_once == 777u) {
+            m = shm[0];
+            g_ipv_dbg[3016] = *reinterpret_cast<const unsigned*>(&m);
+            for (int c = 0; c < 32; ++c) {
+                const float fv = __half2float(row[c]);
+                g_ipv_dbg[3020 + c] = *reinterpret_cast<const unsigned*>(&fv);
+            }
+        }
+    }
+}
+
+template <int HD, int BN, int NT = 256>
+__global__ void v_tile_quant_kernel(
+    const __half* __restrict__ v, const float* __restrict__ v_scale,
+    int8_t* __restrict__ v_i8,
+    int64_t batch, int64_t kv_heads, int64_t kv_len,
+    int64_t v_stride_b, int64_t v_stride_n, int64_t v_stride_h) {
+    const int64_t n0 = static_cast<int64_t>(blockIdx.x) * BN;
+    const int64_t h = blockIdx.y;
+    const int64_t b = blockIdx.z;
+    const int tiles = (kv_len + BN - 1) / BN;
+    const float sc = v_scale[(b * kv_heads + h) * tiles + blockIdx.x];
+    const float inv = (sc > 0.0f) ? (127.0f / sc) : 0.0f;
+    int ni = n0 < kv_len ? static_cast<int>((kv_len - n0 < BN) ? (kv_len - n0) : BN) : 0;
+    // stride semantics match the v8 native V decode (proven fp16 path):
+    // head index -> v_stride_n, sequence index -> v_stride_h.
+    const __half* row = v + b * v_stride_b + h * v_stride_n;
+    int8_t* i8row = v_i8 + b * kv_heads * (kv_len * HD) + h * (kv_len * HD);
+    for (int i = threadIdx.x; i < HD * ni; i += NT) {
+        const int n = i / HD;
+        const int d = i % HD;
+        float f = __half2float(row[(n0 + n) * v_stride_h + d]) * inv;
+        int x = static_cast<int>(fabsf(f) + 0.5f);
+        if (x > 127) x = 127;
+        i8row[(n0 + n) * HD + d] = (f < 0.0f) ? static_cast<int8_t>(-x) : static_cast<int8_t>(x);
+    }
+}
+
 Tensor qk_int8_sv_bf16_attn_gfx103x_t(
     Tensor query, Tensor key, Tensor value, Tensor output,
     Tensor q_scale, Tensor k_scale,
@@ -749,6 +847,154 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                         qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
                         static_cast<int>(tensor_layout)); \
                 } while (0)
+            #define L10_V7P(HD, C, ODT) \
+                do { \
+                    dim3 b10(HD == 64 ? 128 : 64); \
+                    dim3 g10((qo_len + (HD == 64 ? 127 : 63)) / (HD == 64 ? 128 : 64), q_heads, batch); \
+                    const int v7p_diag = []() { \
+                        const char* e = getenv("SAGEATTN_V7P_DIAG"); \
+                        return e ? atoi(e) : 0; \
+                    }(); \
+                    sageattn_gfx10::attn_kernel_gfx10_i8_v7p_t<HD, C, 16, (HD == 64 ? 128 : 64), ODT><<<g10, b10, 0, stream>>>( \
+                        reinterpret_cast<const int8_t*>(query.data_ptr()), \
+                        reinterpret_cast<const int8_t*>(key.data_ptr()), \
+                        reinterpret_cast<const __half*>(value.data_ptr()), \
+                        reinterpret_cast<ODT*>(output.data_ptr()), \
+                        reinterpret_cast<const float*>(q_scale.data_ptr()), \
+                        reinterpret_cast<const float*>(k_scale.data_ptr()), \
+                        batch, qo_len, kv_len, q_heads, kv_heads, \
+                        q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                        k_stride_b, k_stride_n, k_stride_h, \
+                        v_stride_b, v_stride_n, v_stride_h, \
+                        o_stride_b, o_stride_n, o_stride_h, \
+                        qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
+                        static_cast<int>(tensor_layout), v7p_diag); \
+                } while (0)
+            #define L10_V8P(HD, C, BNV, ODT, HG, VN) \
+                do { \
+                    dim3 b10((HD == 64 ? 128 : 64)); \
+                    dim3 g10((qo_len + (HD == 64 ? 127 : 63)) / (HD == 64 ? 128 : 64), \
+                             (q_heads + HG - 1) / HG, batch); \
+                    const int v8_diag = []() { \
+                        const char* e = getenv("SAGEATTN_V7P_DIAG"); \
+                        return e ? atoi(e) : 0; \
+                    }(); \
+                    sageattn_gfx10::attn_kernel_gfx10_i8_v8_t<HD, C, BNV, (HD == 64 ? 128 : 64), HG, ODT><<<g10, b10, 0, stream>>>( \
+                        reinterpret_cast<const int8_t*>(query.data_ptr()), \
+                        reinterpret_cast<const int8_t*>(key.data_ptr()), \
+                        reinterpret_cast<const __half*>(value.data_ptr()), \
+                        reinterpret_cast<ODT*>(output.data_ptr()), \
+                        reinterpret_cast<const float*>(q_scale.data_ptr()), \
+                        reinterpret_cast<const float*>(k_scale.data_ptr()), \
+                        batch, qo_len, kv_len, q_heads, kv_heads, \
+                        q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                        k_stride_b, k_stride_n, k_stride_h, \
+                        v_stride_b, v_stride_n, v_stride_h, \
+                        o_stride_b, o_stride_n, o_stride_h, \
+                        qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
+                        static_cast<int>(tensor_layout), v8_diag, (VN), nullptr, 0, 0); \
+                } while (0)
+            #define L10_V8PB128SB(HD, C, BNV, ODT, HG, VN) \
+                do { \
+                    dim3 b10(128); \
+                    dim3 g10((qo_len + 127) / 128, (q_heads + HG - 1) / HG, batch); \
+                    const int v8_diag = []() { \
+                        const char* e = getenv("SAGEATTN_V7P_DIAG"); \
+                        return e ? atoi(e) : 0; \
+                    }(); \
+                    sageattn_gfx10::attn_kernel_gfx10_i8_v8_t<HD, C, BNV, 128, HG, ODT, false><<<g10, b10, 0, stream>>>( \
+                        reinterpret_cast<const int8_t*>(query.data_ptr()), \
+                        reinterpret_cast<const int8_t*>(key.data_ptr()), \
+                        reinterpret_cast<const __half*>(value.data_ptr()), \
+                        reinterpret_cast<ODT*>(output.data_ptr()), \
+                        reinterpret_cast<const float*>(q_scale.data_ptr()), \
+                        reinterpret_cast<const float*>(k_scale.data_ptr()), \
+                        batch, qo_len, kv_len, q_heads, kv_heads, \
+                        q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                        k_stride_b, k_stride_n, k_stride_h, \
+                        v_stride_b, v_stride_n, v_stride_h, \
+                        o_stride_b, o_stride_n, o_stride_h, \
+                        qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
+                        static_cast<int>(tensor_layout), v8_diag, (VN), nullptr, 0, 0); \
+                } while (0)
+            #define L10_V8PB128(HD, C, BNV, ODT, HG, VN) \
+                do { \
+                    dim3 b10(128); \
+                    dim3 g10((qo_len + 127) / 128, (q_heads + HG - 1) / HG, batch); \
+                    const int v8_diag = []() { \
+                        const char* e = getenv("SAGEATTN_V7P_DIAG"); \
+                        return e ? atoi(e) : 0; \
+                    }(); \
+                    sageattn_gfx10::attn_kernel_gfx10_i8_v8_t<HD, C, BNV, 128, HG, ODT><<<g10, b10, 0, stream>>>( \
+                        reinterpret_cast<const int8_t*>(query.data_ptr()), \
+                        reinterpret_cast<const int8_t*>(key.data_ptr()), \
+                        reinterpret_cast<const __half*>(value.data_ptr()), \
+                        reinterpret_cast<ODT*>(output.data_ptr()), \
+                        reinterpret_cast<const float*>(q_scale.data_ptr()), \
+                        reinterpret_cast<const float*>(k_scale.data_ptr()), \
+                        batch, qo_len, kv_len, q_heads, kv_heads, \
+                        q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                        k_stride_b, k_stride_n, k_stride_h, \
+                        v_stride_b, v_stride_n, v_stride_h, \
+                        o_stride_b, o_stride_n, o_stride_h, \
+                        qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
+                        static_cast<int>(tensor_layout), v8_diag, (VN), nullptr, 0, 0); \
+                } while (0)
+            #define L10_V8PBM(HD, C, BNV, ODT, HG, VN, BMM) \
+                do { \
+                    dim3 b10((BMM)); \
+                    dim3 g10((qo_len + (BMM) - 1) / (BMM), (q_heads + HG - 1) / HG, batch); \
+                    const int v8_diag = []() { \
+                        const char* e = getenv("SAGEATTN_V7P_DIAG"); \
+                        return e ? atoi(e) : 0; \
+                    }(); \
+                    sageattn_gfx10::attn_kernel_gfx10_i8_v8_t<HD, C, BNV, (BMM), HG, ODT><<<g10, b10, 0, stream>>>( \
+                        reinterpret_cast<const int8_t*>(query.data_ptr()), \
+                        reinterpret_cast<const int8_t*>(key.data_ptr()), \
+                        reinterpret_cast<const __half*>(value.data_ptr()), \
+                        reinterpret_cast<ODT*>(output.data_ptr()), \
+                        reinterpret_cast<const float*>(q_scale.data_ptr()), \
+                        reinterpret_cast<const float*>(k_scale.data_ptr()), \
+                        batch, qo_len, kv_len, q_heads, kv_heads, \
+                        q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                        k_stride_b, k_stride_n, k_stride_h, \
+                        v_stride_b, v_stride_n, v_stride_h, \
+                        o_stride_b, o_stride_n, o_stride_h, \
+                        qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
+                        static_cast<int>(tensor_layout), v8_diag, (VN), nullptr, 0, 0); \
+                } while (0)
+            // int8-PV variant: V is a pre-quantized int8 [B,H,N,D] tensor (v8_vint8),
+            // staged to LDS as int8; P quantized to [0,127]; v_scale[] per-tile fp32.
+            #define L10_V8PBM_IPV(HD, C, BNV, ODT, HG, VN, BMM) \
+                do { \
+                    dim3 b10((BMM)); \
+                    dim3 g10((qo_len + (BMM) - 1) / (BMM), (q_heads + HG - 1) / HG, batch); \
+                    const int64_t vi_stride_b = v_int8.stride(0); \
+                    const int64_t vi_stride_n = v_int8.stride(1); \
+                    const int64_t vi_stride_h = v_int8.stride(2); \
+                    const int v8_diag = []() { \
+                        const char* e = getenv("SAGEATTN_V7P_DIAG"); \
+                        int d = e ? atoi(e) : 0; \
+                        if (getenv("SAGEATTN_GFX10_IPV_DBG")) d |= 32; \
+                        return d; \
+                    }(); \
+                    sageattn_gfx10::attn_kernel_gfx10_i8_v8_t<HD, C, BNV, (BMM), HG, ODT, true><<<g10, b10, 0, stream>>>( \
+                        reinterpret_cast<const int8_t*>(query.data_ptr()), \
+                        reinterpret_cast<const int8_t*>(key.data_ptr()), \
+                        reinterpret_cast<const __half*>(v_int8.data_ptr()), \
+                        reinterpret_cast<ODT*>(output.data_ptr()), \
+                        reinterpret_cast<const float*>(q_scale.data_ptr()), \
+                        reinterpret_cast<const float*>(k_scale.data_ptr()), \
+                        batch, qo_len, kv_len, q_heads, kv_heads, \
+                        q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                        k_stride_b, k_stride_n, k_stride_h, \
+                        vi_stride_b, vi_stride_n, vi_stride_h, \
+                        o_stride_b, o_stride_n, o_stride_h, \
+                        qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
+                        static_cast<int>(tensor_layout), v8_diag, (VN), \
+                        reinterpret_cast<const float*>(v_scale.data_ptr()), \
+                        v_scale.stride(0), v_scale.stride(1)); \
+                } while (0)
             #define L10_V2F(HD, C, BN, ODT) \
                 do { \
                     dim3 b10(128); \
@@ -799,7 +1045,57 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                 // v4 BM=128 has 2x LDS usage -> ~2x slower due to lower occupancy.
                 // v3 has BM=64 BN=16 but slower than v2 BN=32.
                 // env SAGEATTN_GFX10_V4=1 forces v4; v3_mode=1 forces v3.
-                if (force_v3) {
+                // SAGEATTN_GFX10_V7P: Triton-style 2-stage SW pipeline (BM=128/BN=16),
+                // mirrors the Triton int8 kernel. Env-gated for A/B benchmark only.
+                const bool v7p_mode = getenv("SAGEATTN_GFX10_V7P") ? (atoi(getenv("SAGEATTN_GFX10_V7P")) == 1) : false;
+                const bool v8_mode = getenv("SAGEATTN_GFX10_V8") ? (atoi(getenv("SAGEATTN_GFX10_V8")) == 1) : false;
+                const bool v8r_mode = getenv("SAGEATTN_GFX10_V8R") ? (atoi(getenv("SAGEATTN_GFX10_V8R")) == 1) : false;
+                if (v8_mode) {
+                    // v8: int4-vectorized staging. v_native=1 (default): natural [B,H,N,D]
+                    // V (d-contiguous full-sector reads, 18ms @ H=8); V_T n-contiguous is
+                    // 2.4x slower (31.7ms), so V_T is only kept for V7P/V2 paths.
+                    const int v8_vt = getenv("SAGEATTN_GFX10_V8_VT") ? (atoi(getenv("SAGEATTN_GFX10_V8_VT")) == 1) : 0;
+                    const int v8_bn = getenv("SAGEATTN_V8_BN") ? atoi(getenv("SAGEATTN_V8_BN")) : 16;
+                    #define L10_V8PB(BNV) \
+                        if (is_causal) { if (out_bf) L10_V8P(64, true, BNV, __hip_bfloat16, 1, v8_vt ? 0 : 1); \
+                                      else L10_V8P(64, true, BNV, __half, 1, v8_vt ? 0 : 1); } \
+                        else { if (out_bf) L10_V8P(64, false, BNV, __hip_bfloat16, 1, v8_vt ? 0 : 1); \
+                             else L10_V8P(64, false, BNV, __half, 1, v8_vt ? 0 : 1); }
+                    if (v8_bn == 32) { L10_V8PB(32); } else { L10_V8PB(16); }
+                    #undef L10_V8PB
+                } else if (v8r_mode) {
+                    // v8r-v3: row-per-thread PV (16 keys/lane, BM=128, NTHREAD=128).
+                    // HD=64, BN=16 only.
+                    #define L10_V8R(ISCV, ODT) \
+                        do { \
+                            dim3 b10(128); \
+                            dim3 g10((qo_len + 127) / 128, q_heads, batch); \
+                            const int v8r_diag = []() { \
+                                const char* e = getenv("SAGEATTN_V7P_DIAG"); \
+                                return e ? atoi(e) : 0; \
+                            }(); \
+                            sageattn_gfx10::attn_kernel_gfx10_i8_v8r_t<64, ISCV, 16, 128, ODT><<<g10, b10, 0, stream>>>( \
+                                reinterpret_cast<const int8_t*>(query.data_ptr()), \
+                                reinterpret_cast<const int8_t*>(key.data_ptr()), \
+                                reinterpret_cast<const __half*>(value.data_ptr()), \
+                                reinterpret_cast<ODT*>(output.data_ptr()), \
+                                reinterpret_cast<const float*>(q_scale.data_ptr()), \
+                                reinterpret_cast<const float*>(k_scale.data_ptr()), \
+                                batch, qo_len, kv_len, q_heads, kv_heads, \
+                                q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                                k_stride_b, k_stride_n, k_stride_h, \
+                                v_stride_b, v_stride_n, v_stride_h, \
+                                o_stride_b, o_stride_n, o_stride_h, \
+                                qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
+                                static_cast<int>(tensor_layout), v8r_diag, 1); \
+                        } while (0)
+                    if (is_causal) { if (out_bf) { L10_V8R(true, __hip_bfloat16); } else { L10_V8R(true, __half); } } \
+                    else { if (out_bf) { L10_V8R(false, __hip_bfloat16); } else { L10_V8R(false, __half); } }
+                    #undef L10_V8R
+                } else if (v7p_mode) {
+                    if (is_causal) { if (out_bf) L10_V7P(64, true, __hip_bfloat16); else L10_V7P(64, true, __half); }
+                    else { if (out_bf) L10_V7P(64, false, __hip_bfloat16); else L10_V7P(64, false, __half); }
+                } else if (force_v3) {
                     // v3 fallback for A/B benchmarking
                     if (is_causal) { if (out_bf) L10_V3(64, true, 16, __hip_bfloat16); else L10_V3(64, true, 16, __half); }
                     else { if (out_bf) L10_V3(64, false, 16, __hip_bfloat16); else L10_V3(64, false, 16, __half); }
@@ -833,8 +1129,9 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                 }
             } else {
                 // D=128 int8 (gfx1035):
-                //   V4 BM=64 (L10_V4B64) is the default: BN=32 for kv>77, BN=16 for kv<=77.
-                //   ~15% faster than V3 BN=16, now accurate (per-column k_scale fix).
+                
+                //   v8 (BM=64/BN=32, env SAGEATTN_GFX10_V8_D128) is now the default:
+                //   ~3.7x faster than direct, ~6.7x faster than v4 (104 vs 386/696 ms @4096 self).
                 //   Legacy env-gated paths (exp_v4, exp_v2x, force_v22, force_v2) kept for
                 //   benchmarking. If env flags set, they take priority.
                 const bool force_v2   = (v2_mode == 1);
@@ -842,7 +1139,82 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                 const bool exp_v2x = getenv("SAGEATTN_EXP_PVFP32") ? atoi(getenv("SAGEATTN_EXP_PVFP32")) == 1 : false;
                 const bool exp_v4 = getenv("SAGEATTN_EXP_V4_D128") ? atoi(getenv("SAGEATTN_EXP_V4_D128")) == 1 : false;
                 const int bn = (kv_len <= 77) ? 16 : 32;
-                if (exp_v4) {
+                // SAGEATTN_GFX10_V7P: Triton-style 2-stage SW pipeline (BM=64/BN=16 for D=128).
+                const bool v7p_mode = getenv("SAGEATTN_GFX10_V7P") ? (atoi(getenv("SAGEATTN_GFX10_V7P")) == 1) : false;
+                // SAGEATTN_GFX10_V8_D128: v8 row-per-thread int8-QK kernel at HD=128 (default ON
+                // for gfx103x; set to 0 to fall back to v4). Int8 QK (4 MAC/inst) targets
+                // the fp16 D=128 self gap (direct path is fdot2-throughput-bound).
+                const bool v8d128_mode = getenv("SAGEATTN_GFX10_V8_D128") ? (atoi(getenv("SAGEATTN_GFX10_V8_D128")) == 1) : true;
+                // SAGEATTN_GFX10_V8_D128_BM: block rows (64/128/256, default 64).
+                // SAGEATTN_GFX10_V8_D128_BN: keys per tile (16/32, default 32).
+                // SAGEATTN_GFX10_V8_D128_PV8: int8-PV (ON=1, default 0). Forces BN=32.
+                int v8d128_bm = 64, v8d128_bnv = 32;
+                if (getenv("SAGEATTN_GFX10_V8_D128_BM")) { int e = atoi(getenv("SAGEATTN_GFX10_V8_D128_BM")); if (e == 64 || e == 128 || e == 256) v8d128_bm = e; }
+                if (getenv("SAGEATTN_GFX10_V8_D128_BN")) { int e = atoi(getenv("SAGEATTN_GFX10_V8_D128_BN")); if (e == 16 || e == 32) v8d128_bnv = e; }
+                const bool pv8_mode = getenv("SAGEATTN_GFX10_V8_D128_PV8") ? (atoi(getenv("SAGEATTN_GFX10_V8_D128_PV8")) == 1) : false;
+                if (v8d128_mode) {
+                    if (pv8_mode) {
+                        // V int8 quant per 32-key tile, then the int8-PV kernel (BN=32).
+                        if (getenv("SAGEATTN_GFX10_IPV_DBG")) {
+                            ipv_dbg_zero_kernel<<<1, 256, 0, stream>>>();
+                            fprintf(stderr, "[qpv] sb=%lld sn=%lld sh=%lld kv=%lld h=%lld\n",
+                                    (long long)v_stride_b, (long long)v_stride_n, (long long)v_stride_h,
+                                    (long long)kv_len, (long long)q_heads);
+                        }
+                        Tensor v_int8 = new_empty_like(value, {batch, kv_heads, kv_len, head_dim}, ScalarType::Char);
+                        const int v_tiles = static_cast<int>((kv_len + 31) / 32);
+                        Tensor v_scale = new_empty_like(value, {batch, kv_heads, v_tiles}, ScalarType::Float);
+                        dim3 bv(256);
+                        dim3 gv(v_tiles, kv_heads, batch);
+                        v_tile_max_kernel<128, 32><<<gv, bv, 0, stream>>>(
+                            reinterpret_cast<const __half*>(value.data_ptr()),
+                            reinterpret_cast<float*>(v_scale.data_ptr()),
+                            batch, kv_heads, kv_len, v_stride_b, v_stride_n, v_stride_h);
+                        v_tile_quant_kernel<128, 32><<<gv, bv, 0, stream>>>(
+                            reinterpret_cast<const __half*>(value.data_ptr()),
+                            reinterpret_cast<float*>(v_scale.data_ptr()),
+                            reinterpret_cast<int8_t*>(v_int8.data_ptr()),
+                            batch, kv_heads, kv_len, v_stride_b, v_stride_n, v_stride_h);
+                        // int8 tensor is contiguous [B,H,N,D]: real byte strides set inside macro.
+                        if (v8d128_bm == 128) {
+                            if (is_causal) { if (out_bf) L10_V8PBM_IPV(128, true, 32, __hip_bfloat16, 1, 1, 128); else L10_V8PBM_IPV(128, true, 32, __half, 1, 1, 128); }
+                            else { if (out_bf) L10_V8PBM_IPV(128, false, 32, __hip_bfloat16, 1, 1, 128); else L10_V8PBM_IPV(128, false, 32, __half, 1, 1, 128); }
+                        } else if (v8d128_bm == 256) {
+                            if (is_causal) { if (out_bf) L10_V8PBM_IPV(128, true, 32, __hip_bfloat16, 1, 1, 256); else L10_V8PBM_IPV(128, true, 32, __half, 1, 1, 256); }
+                            else { if (out_bf) L10_V8PBM_IPV(128, false, 32, __hip_bfloat16, 1, 1, 256); else L10_V8PBM_IPV(128, false, 32, __half, 1, 1, 256); }
+                        } else {
+                            if (is_causal) { if (out_bf) L10_V8PBM_IPV(128, true, 32, __hip_bfloat16, 1, 1, 64); else L10_V8PBM_IPV(128, true, 32, __half, 1, 1, 64); }
+                            else { if (out_bf) L10_V8PBM_IPV(128, false, 32, __hip_bfloat16, 1, 1, 64); else L10_V8PBM_IPV(128, false, 32, __half, 1, 1, 64); }
+                        }
+                    } else {
+                    if (v8d128_bnv == 32) {
+                        if (v8d128_bm == 64) {
+                            if (is_causal) { if (out_bf) L10_V8PBM(128, true, 32, __hip_bfloat16, 1, 1, 64); else L10_V8PBM(128, true, 32, __half, 1, 1, 64); }
+                            else { if (out_bf) L10_V8PBM(128, false, 32, __hip_bfloat16, 1, 1, 64); else L10_V8PBM(128, false, 32, __half, 1, 1, 64); }
+                        } else if (v8d128_bm == 256) {
+                            if (is_causal) { if (out_bf) L10_V8PBM(128, true, 32, __hip_bfloat16, 1, 1, 256); else L10_V8PBM(128, true, 32, __half, 1, 1, 256); }
+                            else { if (out_bf) L10_V8PBM(128, false, 32, __hip_bfloat16, 1, 1, 256); else L10_V8PBM(128, false, 32, __half, 1, 1, 256); }
+                        } else {
+                            if (is_causal) { if (out_bf) L10_V8PBM(128, true, 32, __hip_bfloat16, 1, 1, 128); else L10_V8PBM(128, true, 32, __half, 1, 1, 128); }
+                            else { if (out_bf) L10_V8PBM(128, false, 32, __hip_bfloat16, 1, 1, 128); else L10_V8PBM(128, false, 32, __half, 1, 1, 128); }
+                        }
+                    } else {
+                        if (v8d128_bm == 64) {
+                            if (is_causal) { if (out_bf) L10_V8PBM(128, true, 16, __hip_bfloat16, 1, 1, 64); else L10_V8PBM(128, true, 16, __half, 1, 1, 64); }
+                            else { if (out_bf) L10_V8PBM(128, false, 16, __hip_bfloat16, 1, 1, 64); else L10_V8PBM(128, false, 16, __half, 1, 1, 64); }
+                        } else if (v8d128_bm == 256) {
+                            if (is_causal) { if (out_bf) L10_V8PBM(128, true, 16, __hip_bfloat16, 1, 1, 256); else L10_V8PBM(128, true, 16, __half, 1, 1, 256); }
+                            else { if (out_bf) L10_V8PBM(128, false, 16, __hip_bfloat16, 1, 1, 256); else L10_V8PBM(128, false, 16, __half, 1, 1, 256); }
+                        } else {
+                            if (is_causal) { if (out_bf) L10_V8PBM(128, true, 16, __hip_bfloat16, 1, 1, 128); else L10_V8PBM(128, true, 16, __half, 1, 1, 128); }
+                            else { if (out_bf) L10_V8PBM(128, false, 16, __hip_bfloat16, 1, 1, 128); else L10_V8PBM(128, false, 16, __half, 1, 1, 128); }
+                        }
+                    }
+                    }
+                } else if (v7p_mode) {
+                    if (is_causal) { if (out_bf) L10_V7P(128, true, __hip_bfloat16); else L10_V7P(128, true, __half); }
+                    else { if (out_bf) L10_V7P(128, false, __hip_bfloat16); else L10_V7P(128, false, __half); }
+                } else if (exp_v4) {
                     if (bn == 16) {
                         if (is_causal) { if (out_bf) L10_V4B64(128, true, 16, __hip_bfloat16); else L10_V4B64(128, true, 16, __half); }
                         else { if (out_bf) L10_V4B64(128, false, 16, __hip_bfloat16); else L10_V4B64(128, false, 16, __half); }
@@ -893,6 +1265,7 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
             #undef L10_V4B64
             #undef L10_V2F
             #undef L10_V2X
+            #undef L10_V7P
             return output;
 }
 Tensor fp16_attn_gfx103x_t(

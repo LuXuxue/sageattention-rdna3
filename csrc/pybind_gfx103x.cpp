@@ -35,6 +35,7 @@ STABLE_TORCH_LIBRARY(sageattention, m) {
           ") -> Tensor[]");
     m.def("mean_seq(Tensor input, int tensor_layout) -> Tensor");
     m.def("v_transpose(Tensor value, Tensor(a!) value_t, int tensor_layout) -> Tensor");
+    m.def("ipv_dbg_fetch(Tensor like) -> Tensor");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(sageattention, CUDA, m) {
@@ -44,4 +45,5 @@ STABLE_TORCH_LIBRARY_IMPL(sageattention, CUDA, m) {
     m.impl("quant_qk_int8", TORCH_BOX(quant_qk_int8_gfx103x));
     m.impl("mean_seq", TORCH_BOX(mean_seq_gfx103x));
     m.impl("v_transpose", TORCH_BOX(v_transpose_gfx103x));
+    m.impl("ipv_dbg_fetch", TORCH_BOX(ipv_dbg_fetch_gfx103x));
 }
