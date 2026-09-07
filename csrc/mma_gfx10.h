@@ -3196,7 +3196,7 @@ __global__ __attribute__((amdgpu_num_vgpr(224))) __launch_bounds__(BM, 1) void a
 
 
 template <int HD, bool ISC, int BN, int BM, typename ODT, bool IPV = false>
-__global__ __attribute__((amdgpu_num_vgpr(224))) __launch_bounds__(BM, 1) void attn_kernel_gfx10_i9_t(
+__global__ __attribute__((amdgpu_num_vgpr(160))) __launch_bounds__(BM, 2) void attn_kernel_gfx10_i9_t(
     const int8_t* __restrict__ q, const int8_t* __restrict__ k,
     const __half* __restrict__ v, ODT* __restrict__ out,
     const float* __restrict__ q_scale, const float* __restrict__ k_scale,
@@ -3414,6 +3414,9 @@ __global__ __attribute__((amdgpu_num_vgpr(224))) __launch_bounds__(BM, 1) void a
                 }
             }
         }
+        // All threads must finish staging the next tile (and reading the current one)
+        // before the double-buffer flips; otherwise we race the LDS write/read.
+        __syncthreads();
     }
 
     // ---- writeback ----
@@ -3426,6 +3429,257 @@ __global__ __attribute__((amdgpu_num_vgpr(224))) __launch_bounds__(BM, 1) void a
     }
 #endif
 }  // attn_kernel_gfx10_i9_t
+
+// =============================================================================
+// v10: register-tiled PV (Triton-style tt.dot clone). Same QK/softmax as v9,
+// but P (fp16) is staged to LDS and PV is a cross-lane tiled GEMM: each lane
+// owns a 2-row x (HD/2)-dim output microtile, keys are paired into fdot2
+// operands, and V values LDS-read once are broadcast/reused across the
+// wavefront's row groups (TM independent accumulator chains per lane -> ILP to
+// hide LDS latency). P is stored transposed [BN][BM] so PV loads are
+// bank-conflict-free.
+// =============================================================================
+template <int HD, bool C, int BN, int BM, typename ODT, int TM = 2>
+__global__ __attribute__((amdgpu_num_vgpr(224))) __launch_bounds__(BM, 1) void attn_kernel_gfx10_i10_t(
+    const int8_t* __restrict__ q, const int8_t* __restrict__ k,
+    const __half* __restrict__ v, ODT* __restrict__ out,
+    const float* __restrict__ q_scale, const float* __restrict__ k_scale,
+    int64_t batch, int64_t qo_len, int64_t kv_len,
+    int64_t q_heads, int64_t kv_heads,
+    int64_t q_stride_b, int64_t q_stride_n, int64_t q_stride_h,
+    int64_t q_stride_n_dir_unused,
+    int64_t k_stride_b, int64_t k_stride_n, int64_t k_stride_h,
+    int64_t v_stride_b, int64_t v_stride_n, int64_t v_stride_h,
+    int64_t o_stride_b, int64_t o_stride_n, int64_t o_stride_h,
+    int64_t qs_stride_b, int64_t qs_stride_h,
+    int64_t ks_stride_b, int64_t ks_stride_h,
+    int tensor_layout, int diag, int v_native,
+    const float* __restrict__ v_scale, int64_t vs_stride_b, int64_t vs_stride_h) {
+#if defined(__GFX10__)
+    constexpr int QUADS = HD / 4;       // int8 dwords per row
+    constexpr int NTHREAD = BM;
+    constexpr int K_STRIDE = HD;
+    constexpr int V_STRIDE = BN;
+    constexpr int KS_TOTAL = BN * K_STRIDE;
+    constexpr int VS_TOTAL = HD * V_STRIDE;   // [HD][BN] transposed V tile
+    constexpr int VDSW = 8;                   // fp16 staging slots
+    // PV register tiling: TM rows x TD dims per lane.
+    constexpr int TD = HD / TM;               // dims per lane (dgo groups)
+    constexpr int NROWG = BM / TM;            // row groups (PV lanes along rows)
+    constexpr int NDMG = HD / TD;             // dim groups (== NTHREAD / NROWG)
+    static_assert(NROWG * NDMG == NTHREAD, "v10 lane tiling must fill the block");
+    static_assert(NROWG * NDMG == BM, "v10 lane tiling must fill the block");
+    static_assert(BN % 2 == 0, "v10 requires even BN");
+    static_assert(KS_TOTAL * 2 + VS_TOTAL * 2 * (int)sizeof(__half) + BM * BN * (int)sizeof(__half)
+                  + BM * 2 * (int)sizeof(float) <= 49152, "v10 LDS budget");
+
+    __shared__ __attribute__((aligned(32))) int8_t k_buf[2][KS_TOTAL];
+    __shared__ __attribute__((aligned(32))) __half v_buf[2][VS_TOTAL];
+    __shared__ __attribute__((aligned(32))) __half p_buf[BN * BM];   // transposed P [k][m]
+    __shared__ __attribute__((aligned(32))) float alpha_buf[BM];     // per-row rescale per tile
+    __shared__ __attribute__((aligned(32))) float l_buf[BM];         // final row sums
+
+    const int tid = threadIdx.x;
+    const int64_t m = blockIdx.x * BM + tid;
+    const int64_t b = blockIdx.z;
+    const int64_t h = blockIdx.y;
+    const int64_t kvh = h / (q_heads / kv_heads);
+    const bool valid = (m < qo_len) && (h < q_heads);
+
+    const int diag_qk = diag & 1;
+    const int diag_sm = (diag >> 1) & 1;
+    const int diag_pv = (diag >> 2) & 1;
+    const int diag_st = (diag >> 3) & 1;
+    const int diag_wb = (diag >> 4) & 1;
+    (void)q_stride_n_dir_unused; (void)tensor_layout; (void)v_native;
+    (void)v_scale; (void)vs_stride_b; (void)vs_stride_h;
+
+    // ---- Q row resident in registers (QK row owned by lane == tid) ----
+    const float qsv = valid
+        ? q_scale[b * qs_stride_b + h * qs_stride_h + static_cast<int>(m / MIN_BLK_Q)] : 0.0f;
+    int q_reg[QUADS];
+    if (valid) {
+        const int64_t qb = b * q_stride_b + h * q_stride_h;
+        const int8_t* qrow = q + qb + m * q_stride_n;
+        #pragma unroll
+        for (int dq = 0; dq < QUADS; ++dq) q_reg[dq] = load_i8_quad(qrow + dq * 4);
+    } else {
+        #pragma unroll
+        for (int dq = 0; dq < QUADS; ++dq) q_reg[dq] = 0;
+    }
+
+    float acc[TM][TD];
+    float row_m = -3.0e38f, row_l = 0.0f;
+    #pragma unroll
+    for (int u = 0; u < TM; ++u)
+        #pragma unroll
+        for (int dd = 0; dd < TD; ++dd) acc[u][dd] = 0.0f;
+
+    auto stage_kv = [&](int dst, int64_t kb0) {
+        #pragma unroll 1
+        for (int i = tid; i < BN * QUADS; i += NTHREAD) {
+            const int r = i / QUADS, ck = i % QUADS;
+            const int64_t n = kb0 + r;
+            reinterpret_cast<int*>(&k_buf[dst][r * K_STRIDE + ck * 4])[0] =
+                (n < kv_len) ? load_i8_quad(k + b * k_stride_b + kvh * k_stride_h + n * k_stride_n + ck * 4) : 0;
+        }
+        #pragma unroll 1
+        for (int u = 0; u < (HD * BN / VDSW) / NTHREAD; ++u) {
+            const int slot = tid + u * NTHREAD;
+            if (slot < HD * BN / VDSW) {
+                // slot = dg*BN + n_local: consecutive threads write consecutive
+                // n_local (LDS banks, stride 1) instead of strided dg (bank alias).
+                const int n_local = slot % BN;
+                const int dg = slot / BN;
+                const int64_t n = kb0 + n_local;
+                if ((dg * VDSW) < HD) {
+                    if (n < kv_len) {
+                        const __half* src = v + b * v_stride_b + kvh * v_stride_n + n * v_stride_h + dg * VDSW;
+                        int4 val = *reinterpret_cast<const int4*>(src);
+                        #pragma unroll
+                        for (int jj = 0; jj < VDSW; ++jj)
+                            v_buf[dst][(dg * VDSW + jj) * V_STRIDE + n_local] = reinterpret_cast<__half*>(&val)[jj];
+                    } else {
+                        #pragma unroll
+                        for (int jj = 0; jj < VDSW; ++jj)
+                            v_buf[dst][(dg * VDSW + jj) * V_STRIDE + n_local] = __half{0};
+                    }
+                }
+            }
+        }
+    };
+
+    // prologue: stage tile 0
+    stage_kv(0, 0);
+    __syncthreads();
+
+    #pragma unroll 1
+    for (int64_t kb = 0; kb < kv_len; kb += BN) {
+        const int buf = static_cast<int>((kb / BN) & 1);
+        const int64_t nb = kb + BN;
+
+        if ((nb < kv_len) && !diag_st) {
+            stage_kv(buf ^ 1, nb);
+        }
+
+        // ---- QK: BN key scores for this lane's row ----
+        float scr[BN];
+        {
+            #pragma unroll
+            for (int j0 = 0; j0 < BN; j0 += 4) {
+                int s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+                if (!diag_qk)
+                #pragma unroll
+                for (int dq = 0; dq < QUADS; dq += 4) {
+                    const int4 k0 = *reinterpret_cast<const int4*>(&k_buf[buf][(j0 + 0) * K_STRIDE + dq * 4]);
+                    const int4 k1 = *reinterpret_cast<const int4*>(&k_buf[buf][(j0 + 1) * K_STRIDE + dq * 4]);
+                    const int4 k2 = *reinterpret_cast<const int4*>(&k_buf[buf][(j0 + 2) * K_STRIDE + dq * 4]);
+                    const int4 k3 = *reinterpret_cast<const int4*>(&k_buf[buf][(j0 + 3) * K_STRIDE + dq * 4]);
+                    s0 = sdot4_i32_i8(q_reg[dq + 0], k0.x, s0); s0 = sdot4_i32_i8(q_reg[dq + 1], k0.y, s0);
+                    s0 = sdot4_i32_i8(q_reg[dq + 2], k0.z, s0); s0 = sdot4_i32_i8(q_reg[dq + 3], k0.w, s0);
+                    s1 = sdot4_i32_i8(q_reg[dq + 0], k1.x, s1); s1 = sdot4_i32_i8(q_reg[dq + 1], k1.y, s1);
+                    s1 = sdot4_i32_i8(q_reg[dq + 2], k1.z, s1); s1 = sdot4_i32_i8(q_reg[dq + 3], k1.w, s1);
+                    s2 = sdot4_i32_i8(q_reg[dq + 0], k2.x, s2); s2 = sdot4_i32_i8(q_reg[dq + 1], k2.y, s2);
+                    s2 = sdot4_i32_i8(q_reg[dq + 2], k2.z, s2); s2 = sdot4_i32_i8(q_reg[dq + 3], k2.w, s2);
+                    s3 = sdot4_i32_i8(q_reg[dq + 0], k3.x, s3); s3 = sdot4_i32_i8(q_reg[dq + 1], k3.y, s3);
+                    s3 = sdot4_i32_i8(q_reg[dq + 2], k3.z, s3); s3 = sdot4_i32_i8(q_reg[dq + 3], k3.w, s3);
+                }
+                for (int tj = 0; tj < 4; ++tj) {
+                    int s = (tj == 0) ? s0 : (tj == 1) ? s1 : (tj == 2) ? s2 : s3;
+                    const int64_t n = kb + j0 + tj;
+                    const float ksj = k_scale[b * ks_stride_b + kvh * ks_stride_h + static_cast<int>(n / MIN_BLK_K)];
+                    float sc = static_cast<float>(s) * (qsv * ksj);
+                    if ((!valid) || (C && n > m) || (n >= kv_len)) sc = -3.0e38f;
+                    scr[j0 + tj] = sc;
+                }
+            }
+        }
+
+        // ---- softmax (row-local) + P/alpha staging to LDS ----
+        float P_al = 1.0f;
+        {
+            if (!diag_sm) {
+                float lm = scr[0];
+                #pragma unroll
+                for (int j = 1; j < BN; ++j) lm = fmaxf(lm, scr[j]);
+                float gm = fmaxf(row_m, lm);
+                float alpha = (row_l > 0.0f) ? exp2f(row_m - gm) : 0.0f;
+                P_al = alpha;
+                row_m = gm;
+                row_l *= alpha;
+                float ps = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < BN; ++j) { float p = exp2f(scr[j] - row_m); p_buf[j * BM + (int)(m % BM)] = __float2half(p); ps += p; }
+                row_l += ps;
+            } else {
+                #pragma unroll
+                for (int j = 0; j < BN; ++j) p_buf[j * BM + (int)(m % BM)] = __float2half(scr[j]);
+            }
+            alpha_buf[m % BM] = P_al;
+            l_buf[m % BM] = row_l;
+        }
+
+        // PV lanes must see this tile's P/alpha before the tiled GEMM
+        __syncthreads();
+
+        // ---- PV: register-tiled GEMM ----
+        if (!diag_pv) {
+            const int rg = tid % NROWG;
+            const int dgo = tid / NROWG;
+            const int r0 = rg * TM;
+            #pragma unroll
+            for (int u = 0; u < TM; ++u) {
+                const float al = alpha_buf[r0 + u];
+                #pragma unroll
+                for (int dd = 0; dd < TD; ++dd) acc[u][dd] *= al;
+            }
+            #pragma unroll
+            for (int kp = 0; kp < BN / 2; ++kp) {
+                const int k = kp * 2;
+                unsigned pp[TM];
+                #pragma unroll
+                for (int up = 0; up < TM / 2; ++up) {
+                    // 2 halfs at p_buf[k*BM + r0+up*2] = rows {r0+2up, r0+2up+1} of key k
+                    const unsigned pk0 = *reinterpret_cast<const unsigned*>(&p_buf[k * BM + r0 + up * 2]);
+                    const unsigned pk1 = *reinterpret_cast<const unsigned*>(&p_buf[(k + 1) * BM + r0 + up * 2]);
+                    pp[up * 2]     = (pk0 & 0xffffu) | ((pk1 & 0xffffu) << 16);   // (k,r0+2up),(k+1,r0+2up)
+                    pp[up * 2 + 1] = (pk0 >> 16)      | (pk1 & 0xffff0000u);      // (k,r0+2up+1),(k+1,r0+2up+1)
+                }
+                #pragma unroll
+                for (int dd = 0; dd < TD; ++dd) {
+                    const int d = dgo * TD + dd;
+                    const unsigned vv = *reinterpret_cast<const unsigned*>(&v_buf[buf][d * V_STRIDE + k]);
+                    #pragma unroll
+                    for (int u = 0; u < TM; ++u)
+                        acc[u][dd] = fdot2_f32_f16(pp[u], vv, acc[u][dd]);
+                }
+            }
+        }
+
+        // All threads must finish staging the next tile (and reading the current one)
+        // before the double-buffer flips.
+        __syncthreads();
+    }
+
+    // ---- writeback: lane writes its 2-row x TD-dim slices ----
+    if (!diag_wb) {
+        const int rg = tid % NROWG;
+        const int dgo = tid / NROWG;
+        const int r0 = rg * TM;
+        #pragma unroll
+        for (int u = 0; u < TM; ++u) {
+            const int64_t row = blockIdx.x * BM + r0 + u;
+            if ((row < qo_len) && (h < q_heads)) {
+                const float inv = 1.0f / l_buf[r0 + u];
+                const int64_t base = b * o_stride_b + row * o_stride_n + h * o_stride_h;
+                #pragma unroll
+                for (int dd = 0; dd < TD; ++dd)
+                    out[base + dgo * TD + dd] = gfx10_out_convert<ODT>(acc[u][dd] * inv);
+            }
+        }
+    }
+#endif
+}  // attn_kernel_gfx10_i10_t
 
 
 }  // namespace sageattn_gfx10

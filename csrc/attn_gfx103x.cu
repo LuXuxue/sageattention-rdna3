@@ -1063,6 +1063,33 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                         reinterpret_cast<const float*>(v_sc.data_ptr()), \
                         v_sc.stride(0), v_sc.stride(1)); \
                 } while (0)
+            // v10: register-tiled PV (Triton-style). Env SAGEATTN_GFX10_V10=1.
+            // SAGEATTN_V10_BN: 16 or 32 (default 16).
+            // SAGEATTN_V10_TM: rows/lane for PV tiling (2/4/8, default 2).
+            #define L10_V10F(HD, C, BNV, BMM, ODT, TMV) \
+                do { \
+                    dim3 b10((BMM)); \
+                    dim3 g10((qo_len + (BMM) - 1) / (BMM), q_heads, batch); \
+                    const int v10_diag = []() { \
+                        const char* e = getenv("SAGEATTN_V7P_DIAG"); \
+                        return e ? atoi(e) : 0; \
+                    }(); \
+                    sageattn_gfx10::attn_kernel_gfx10_i10_t<HD, C, BNV, (BMM), ODT, TMV><<<g10, b10, 0, stream>>>( \
+                        reinterpret_cast<const int8_t*>(query.data_ptr()), \
+                        reinterpret_cast<const int8_t*>(key.data_ptr()), \
+                        reinterpret_cast<const __half*>(value.data_ptr()), \
+                        reinterpret_cast<ODT*>(output.data_ptr()), \
+                        reinterpret_cast<const float*>(q_scale.data_ptr()), \
+                        reinterpret_cast<const float*>(k_scale.data_ptr()), \
+                        batch, qo_len, kv_len, q_heads, kv_heads, \
+                        q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                        k_stride_b, k_stride_n, k_stride_h, \
+                        v_stride_b, v_stride_n, v_stride_h, \
+                        o_stride_b, o_stride_n, o_stride_h, \
+                        qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
+                        static_cast<int>(tensor_layout), v10_diag, 1, \
+                        nullptr, 0, 0); \
+                } while (0)
             #define L10_V2F(HD, C, BN, ODT) \
                 do { \
                     dim3 b10(128); \
@@ -1119,24 +1146,68 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                     const int v9_bn = getenv("SAGEATTN_V9_BN") ? atoi(getenv("SAGEATTN_V9_BN")) : 32;
                     if (v9_bn == 16) { V9DISPATCH(64, 16, 128, ipv_on); } else { V9DISPATCH(64, 32, 128, ipv_on); }
                 } else {
-                // v4: BM=128 + 2-sync/tile (from v3's BM=64/4-sync)
-                // v4: BM=128 + 2-sync/tile (from v3's BM=64/4-sync)
-                // SAGEATTN_GFX10_V4=0 forces v3 for A/B comparison
+                // Mode chain for D=64 (legacy + v10):
+                // v2/v3/v4/v7p/v8/v8r are the historical kernels; v10 adds a
+                // register-tiled PV (Triton-style). All env-gated for A/B.
                 const bool force_v3 = getenv("SAGEATTN_GFX10_V4") ? (atoi(getenv("SAGEATTN_GFX10_V4")) == 0) : false;
                 const int v4_mode = getenv("SAGEATTN_GFX10_V4") ? atoi(getenv("SAGEATTN_GFX10_V4")) : 0;
                 const bool use_v4_long = (qo_len == kv_len && qo_len >= 512);
                 const bool use_v4_short_cross = (qo_len != kv_len && qo_len >= 256);
                 const int bn = (qo_len == kv_len) ? ((kv_len <= 77) ? 16 : 32) : 32;
-                // Default D=64 int8 path: v2 BM=64 BN=32 (highest occupancy on gfx1035).
-                // v4 BM=128 has 2x LDS usage -> ~2x slower due to lower occupancy.
-                // v3 has BM=64 BN=16 but slower than v2 BN=32.
-                // env SAGEATTN_GFX10_V4=1 forces v4; v3_mode=1 forces v3.
-                // SAGEATTN_GFX10_V7P: Triton-style 2-stage SW pipeline (BM=128/BN=16),
-                // mirrors the Triton int8 kernel. Env-gated for A/B benchmark only.
                 const bool v7p_mode = getenv("SAGEATTN_GFX10_V7P") ? (atoi(getenv("SAGEATTN_GFX10_V7P")) == 1) : false;
                 const bool v8_mode = getenv("SAGEATTN_GFX10_V8") ? (atoi(getenv("SAGEATTN_GFX10_V8")) == 1) : false;
                 const bool v8r_mode = getenv("SAGEATTN_GFX10_V8R") ? (atoi(getenv("SAGEATTN_GFX10_V8R")) == 1) : false;
-                if (v8_mode) {
+                const bool v10_mode = getenv("SAGEATTN_GFX10_V10") ? (atoi(getenv("SAGEATTN_GFX10_V10")) == 1) : (!is_causal);
+                if (v10_mode) {
+                    // register-tiled PV (Triton-style). SAGEATTN_V10_BN: 16 or 32.
+                    const int v10_bn = getenv("SAGEATTN_V10_BN") ? atoi(getenv("SAGEATTN_V10_BN")) : 32;
+                    const int v10_tm = getenv("SAGEATTN_V10_TM") ? atoi(getenv("SAGEATTN_V10_TM")) : 8;
+                    if (is_causal) {
+                        if (v10_bn == 32) {
+                            if (out_bf) {
+                                if (v10_tm == 4) L10_V10F(64, true, 32, 128, __hip_bfloat16, 4);
+                                else if (v10_tm == 8) L10_V10F(64, true, 32, 128, __hip_bfloat16, 8);
+                                else L10_V10F(64, true, 32, 128, __hip_bfloat16, 2);
+                            } else {
+                                if (v10_tm == 4) L10_V10F(64, true, 32, 128, __half, 4);
+                                else if (v10_tm == 8) L10_V10F(64, true, 32, 128, __half, 8);
+                                else L10_V10F(64, true, 32, 128, __half, 2);
+                            }
+                        } else {
+                            if (out_bf) {
+                                if (v10_tm == 4) L10_V10F(64, true, 16, 128, __hip_bfloat16, 4);
+                                else if (v10_tm == 8) L10_V10F(64, true, 16, 128, __hip_bfloat16, 8);
+                                else L10_V10F(64, true, 16, 128, __hip_bfloat16, 2);
+                            } else {
+                                if (v10_tm == 4) L10_V10F(64, true, 16, 128, __half, 4);
+                                else if (v10_tm == 8) L10_V10F(64, true, 16, 128, __half, 8);
+                                else L10_V10F(64, true, 16, 128, __half, 2);
+                            }
+                        }
+                    } else {
+                        if (v10_bn == 32) {
+                            if (out_bf) {
+                                if (v10_tm == 4) L10_V10F(64, false, 32, 128, __hip_bfloat16, 4);
+                                else if (v10_tm == 8) L10_V10F(64, false, 32, 128, __hip_bfloat16, 8);
+                                else L10_V10F(64, false, 32, 128, __hip_bfloat16, 2);
+                            } else {
+                                if (v10_tm == 4) L10_V10F(64, false, 32, 128, __half, 4);
+                                else if (v10_tm == 8) L10_V10F(64, false, 32, 128, __half, 8);
+                                else L10_V10F(64, false, 32, 128, __half, 2);
+                            }
+                        } else {
+                            if (out_bf) {
+                                if (v10_tm == 4) L10_V10F(64, false, 16, 128, __hip_bfloat16, 4);
+                                else if (v10_tm == 8) L10_V10F(64, false, 16, 128, __hip_bfloat16, 8);
+                                else L10_V10F(64, false, 16, 128, __hip_bfloat16, 2);
+                            } else {
+                                if (v10_tm == 4) L10_V10F(64, false, 16, 128, __half, 4);
+                                else if (v10_tm == 8) L10_V10F(64, false, 16, 128, __half, 8);
+                                else L10_V10F(64, false, 16, 128, __half, 2);
+                            }
+                        }
+                    }
+                } else if (v8_mode) {
                     // v8: int4-vectorized staging. v_native=1 (default): natural [B,H,N,D]
                     // V (d-contiguous full-sector reads, 18ms @ H=8); V_T n-contiguous is
                     // 2.4x slower (31.7ms), so V_T is only kept for V7P/V2 paths.
@@ -1223,6 +1294,109 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
             }}} else {
                 // D=128 int8 (gfx1035):
 
+                // v10 (SAGEATTN_GFX10_V10=1): register-tiled PV, same as D64.
+                // SAGEATTN_V10_BN (16/32), SAGEATTN_V10_BM_T (64/128), SAGEATTN_V10_TM (2/4/8).
+                const bool v10_mode_d128 = getenv("SAGEATTN_GFX10_V10") ? (atoi(getenv("SAGEATTN_GFX10_V10")) == 1) : (!is_causal);
+                if (v10_mode_d128) {
+                    // SAGEATTN_V10_D128_* override the shared SAGEATTN_V10_* when set,
+                    // so D64 (BN32/TM8) and D128 (BN16/BM128/TM8) can differ.
+                    const int v10_bn = getenv("SAGEATTN_V10_D128_BN") ? atoi(getenv("SAGEATTN_V10_D128_BN")) : (getenv("SAGEATTN_V10_BN") ? atoi(getenv("SAGEATTN_V10_BN")) : 16);
+                    const int v10_bm = getenv("SAGEATTN_V10_D128_BM") ? atoi(getenv("SAGEATTN_V10_D128_BM")) : (getenv("SAGEATTN_V10_BM") ? atoi(getenv("SAGEATTN_V10_BM")) : 128);
+                    const int v10_tm = getenv("SAGEATTN_V10_D128_TM") ? atoi(getenv("SAGEATTN_V10_D128_TM")) : (getenv("SAGEATTN_V10_TM") ? atoi(getenv("SAGEATTN_V10_TM")) : 8);
+                    if (v10_bm == 128) {
+                        if (v10_bn == 32) {
+                            if (is_causal) {
+                                if (out_bf) {
+                                    if (v10_tm == 4) L10_V10F(128, true, 32, 128, __hip_bfloat16, 4);
+                                    else if (v10_tm == 8) L10_V10F(128, true, 32, 128, __hip_bfloat16, 8);
+                                    else L10_V10F(128, true, 32, 128, __hip_bfloat16, 2);
+                                } else {
+                                    if (v10_tm == 4) L10_V10F(128, true, 32, 128, __half, 4);
+                                    else if (v10_tm == 8) L10_V10F(128, true, 32, 128, __half, 8);
+                                    else L10_V10F(128, true, 32, 128, __half, 2);
+                                }
+                            } else {
+                                if (out_bf) {
+                                    if (v10_tm == 4) L10_V10F(128, false, 32, 128, __hip_bfloat16, 4);
+                                    else if (v10_tm == 8) L10_V10F(128, false, 32, 128, __hip_bfloat16, 8);
+                                    else L10_V10F(128, false, 32, 128, __hip_bfloat16, 2);
+                                } else {
+                                    if (v10_tm == 4) L10_V10F(128, false, 32, 128, __half, 4);
+                                    else if (v10_tm == 8) L10_V10F(128, false, 32, 128, __half, 8);
+                                    else L10_V10F(128, false, 32, 128, __half, 2);
+                                }
+                            }
+                        } else {
+                            if (is_causal) {
+                                if (out_bf) {
+                                    if (v10_tm == 4) L10_V10F(128, true, 16, 128, __hip_bfloat16, 4);
+                                    else if (v10_tm == 8) L10_V10F(128, true, 16, 128, __hip_bfloat16, 8);
+                                    else L10_V10F(128, true, 16, 128, __hip_bfloat16, 2);
+                                } else {
+                                    if (v10_tm == 4) L10_V10F(128, true, 16, 128, __half, 4);
+                                    else if (v10_tm == 8) L10_V10F(128, true, 16, 128, __half, 8);
+                                    else L10_V10F(128, true, 16, 128, __half, 2);
+                                }
+                            } else {
+                                if (out_bf) {
+                                    if (v10_tm == 4) L10_V10F(128, false, 16, 128, __hip_bfloat16, 4);
+                                    else if (v10_tm == 8) L10_V10F(128, false, 16, 128, __hip_bfloat16, 8);
+                                    else L10_V10F(128, false, 16, 128, __hip_bfloat16, 2);
+                                } else {
+                                    if (v10_tm == 4) L10_V10F(128, false, 16, 128, __half, 4);
+                                    else if (v10_tm == 8) L10_V10F(128, false, 16, 128, __half, 8);
+                                    else L10_V10F(128, false, 16, 128, __half, 2);
+                                }
+                            }
+                        }
+                    } else {
+                        if (v10_bn == 32) {
+                            if (is_causal) {
+                                if (out_bf) {
+                                    if (v10_tm == 4) L10_V10F(128, true, 32, 64, __hip_bfloat16, 4);
+                                    else if (v10_tm == 8) L10_V10F(128, true, 32, 64, __hip_bfloat16, 8);
+                                    else L10_V10F(128, true, 32, 64, __hip_bfloat16, 2);
+                                } else {
+                                    if (v10_tm == 4) L10_V10F(128, true, 32, 64, __half, 4);
+                                    else if (v10_tm == 8) L10_V10F(128, true, 32, 64, __half, 8);
+                                    else L10_V10F(128, true, 32, 64, __half, 2);
+                                }
+                            } else {
+                                if (out_bf) {
+                                    if (v10_tm == 4) L10_V10F(128, false, 32, 64, __hip_bfloat16, 4);
+                                    else if (v10_tm == 8) L10_V10F(128, false, 32, 64, __hip_bfloat16, 8);
+                                    else L10_V10F(128, false, 32, 64, __hip_bfloat16, 2);
+                                } else {
+                                    if (v10_tm == 4) L10_V10F(128, false, 32, 64, __half, 4);
+                                    else if (v10_tm == 8) L10_V10F(128, false, 32, 64, __half, 8);
+                                    else L10_V10F(128, false, 32, 64, __half, 2);
+                                }
+                            }
+                        } else {
+                            if (is_causal) {
+                                if (out_bf) {
+                                    if (v10_tm == 4) L10_V10F(128, true, 16, 64, __hip_bfloat16, 4);
+                                    else if (v10_tm == 8) L10_V10F(128, true, 16, 64, __hip_bfloat16, 8);
+                                    else L10_V10F(128, true, 16, 64, __hip_bfloat16, 2);
+                                } else {
+                                    if (v10_tm == 4) L10_V10F(128, true, 16, 64, __half, 4);
+                                    else if (v10_tm == 8) L10_V10F(128, true, 16, 64, __half, 8);
+                                    else L10_V10F(128, true, 16, 64, __half, 2);
+                                }
+                            } else {
+                                if (out_bf) {
+                                    if (v10_tm == 4) L10_V10F(128, false, 16, 64, __hip_bfloat16, 4);
+                                    else if (v10_tm == 8) L10_V10F(128, false, 16, 64, __hip_bfloat16, 8);
+                                    else L10_V10F(128, false, 16, 64, __hip_bfloat16, 2);
+                                } else {
+                                    if (v10_tm == 4) L10_V10F(128, false, 16, 64, __half, 4);
+                                    else if (v10_tm == 8) L10_V10F(128, false, 16, 64, __half, 8);
+                                    else L10_V10F(128, false, 16, 64, __half, 2);
+                                }
+                            }
+                        }
+                    }
+                } else {
                 // v9 (SAGEATTN_GFX10_V9=1): 1-row-per-lane int8-QK + int8-PV.
                 const bool v9_mode_d128 = getenv("SAGEATTN_GFX10_V9") ? (atoi(getenv("SAGEATTN_GFX10_V9")) == 1) : false;
                 if (v9_mode_d128) {
@@ -1357,6 +1531,7 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                         if (is_causal) { if (out_bf) L10_V4B64(128, true, 32, __hip_bfloat16); else L10_V4B64(128, true, 32, __half); }
                         else { if (out_bf) L10_V4B64(128, false, 32, __hip_bfloat16); else L10_V4B64(128, false, 32, __half); }
                     }
+                }
                 }
             }
             #undef L10

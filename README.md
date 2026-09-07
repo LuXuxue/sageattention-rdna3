@@ -106,42 +106,12 @@ python test_sageattn_rdna3.py
 
 ## 测量方法论
 
-所有性能结论必须遵循（否则无效）：
 1. **同进程内交错轮转**：被测实现与参考实现在同一进程交替运行。
 2. **充分预热**：≥20 次 warmup。
 3. **取中位数**：≥50 次迭代取 median。
 4. **iGPU 波动**：共享内存 iGPU 长时间运行因温度/时钟下降，小 case 跨 run 波动可达 ±25%；**跨会话绝对时间不可比**，只有同会话内比率口径成立。
 5. **固定随机种子**：`torch.manual_seed(0)` 保证可复现。
 6. **正确性基准**：参考实现必须 `transpose(1,2)` 到与 kernel 输入一致的 HND/NHD 布局；早期多次因参考布局用错而误判。
-
-## 踩坑点
-
-### 通用
-
-1. **`__shfl_xor_sync` 延迟高**：编译为 ~6 VALU + 1 ds_bpermute（20–30 cycles），能用 permlanex16 / lane-reduce 替代就替代。
-2. **用 `exp2f`**：softmax 一律 `exp2f`（乘 log2e 预缩放），比 `expf` 快 ~1 cycle。
-3. **`getENV` deprecation 警告**（`_CRT_INSECURE_DEPRECATE`）在 Windows 无害，hipcc 不报 error。
-4. **自己做实验用独立扩展**：A/B 对比时按参数化模块名单独编译，避免 torch.ops 注册冲突与缓存。
-5. **iGPU 上并发 stream 无收益**：APU 共享内存带宽，vt‖quant 双 stream 重叠反而慢 7–14%。
-
-### gfx110x
-
-1. **permlanex16 参数格式**：`v_permlanex16_b32 %0, %1, %2, %3 op_sel:[1,0]`，`%2`/`%3` 为 s/n 字面量。
-2. **V_T n 维必须 padding 到 64 倍数**：否则最后 kv-tile 的 v_frag_t 32B 直读越界 → NaN。
-3. **16B 写回对齐**：q strides 须为 8 倍数，非 contiguous 输入触发 16B 写 UB。
-4. **`blockReduceMax` 循环调用必须自同步**：D=64 quant 的 RATIO 循环同 block 多次调用该共享归约，读/写之间无 barrier 会跨调用复用 shared 而产生**非确定性精度差（maxdiff≈1.2e-2）**；函数末尾补 `__syncthreads()` 即修复。
-5. **quant 的 Threads 必须与 dispatch `dim3 block()` 一致**：曾将 kernel 内 `constexpr Threads=512` 而 launch 仍 `block(256)`，导致 K/Q 各丢一半组、scale≈0、cos≈0.72 的确定性 bug。**保持 T=256**。
-6. **stable torch library 单次注册**：同名 schema 重复注册报错；靠 core.py 懒加载保证同进程只 import 一个 pyd。
-7. **`is_causal` 是运行时参数**：必须 host 端 if/else 生成编译期模板常量，不能直接当模板参数传。
-8. **namespace 边界**：host/dispatch/公共函数必须全局作用域，否则 pybind 链接 LNK2001。
-9. **`SAGEATTN_VT_GLOBAL=0` 不再维护**：删除/关闭该分支重建会硬崩溃；当前构建只支持 VT=1。
-
-### gfx103x
-
-1. **无 WMMA/MFMA**：矩阵乘走 V_DOT 链，每 lane 独立累加。
-2. **bf16 无硬件指令**：须 LDS 暂存转 fp16；增加 LDS 占用与转换开销。**triton bf16 路径硬崩**（不可捕获），需 pre-skip。
-3. **LDS 只有 64 KiB/CU**：BM=128 等会使 occupancy 崩溃，tile 选择须更保守。
-4. **LDS bank conflict 在 RDNA2 上惩罚极大**：未 padding 时 s_tile 8-way bank conflict 导致 8× 延迟，padding 仅 +512 bytes 即获得 5–20× 提升。
 
 ## 许可证
 

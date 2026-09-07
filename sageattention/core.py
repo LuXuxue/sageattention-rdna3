@@ -258,7 +258,12 @@ def sageattn(
             # 胜过 V_T 的 n-contiguous 慢读 2.4x)。bf16 输入先转 fp16 (int8 路径 V 恒 fp16)。
             if tensor_layout == "NHD":
                 v16 = v if v.dtype == torch.float16 else v.to(torch.float16)
-                v_for_attn = v16.permute(0, 2, 1, 3).contiguous()
+                if v16.is_contiguous():
+                    # 零拷贝 as_strided HND 视图 (省一次 0.12ms permute 拷贝)
+                    b_, n_, h_, d_ = v16.shape
+                    v_for_attn = v16.as_strided((b_, h_, n_, d_), (n_ * h_ * d_, d_, h_ * d_, 1))
+                else:
+                    v_for_attn = v16.permute(0, 2, 1, 3).contiguous()
             elif v.dtype != torch.float16:
                 # HND natural but bf16: convert to fp16 (kernel reads __half*).
                 v_for_attn = v.to(torch.float16)
