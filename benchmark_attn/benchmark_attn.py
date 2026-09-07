@@ -169,13 +169,6 @@ test_cases = [
     ("Anima04", 1, 16, 16, 6144, 512, 128, torch.bfloat16),
     ("Anima05", 1, 16, 16, 9216, 9216, 128, torch.bfloat16),
     ("Anima06", 1, 16, 16, 9216, 512, 128, torch.bfloat16),
-    
-    ("Anima01F", 1, 16, 16, 4096, 4096, 128, torch.float16),
-    ("Anima02F", 1, 16, 16, 4096, 512, 128, torch.float16),
-    ("Anima03F", 1, 16, 16, 6144, 6144, 128, torch.float16),
-    ("Anima04F", 1, 16, 16, 6144, 512, 128, torch.float16),
-    ("Anima05F", 1, 16, 16, 9216, 9216, 128, torch.float16),
-    ("Anima06F", 1, 16, 16, 9216, 512, 128, torch.float16),
 
     # 3. VAE
     # SDXL VAE (sdxl.vae.safetensors, LDM AutoencoderKL 结构):
@@ -193,7 +186,6 @@ test_cases = [
     #   1536x2304 -> latent 192x288  -> N = 55296
     ("SDXLVAE01", 1, 4, 4, 16384, 16384, 128, torch.float16),
     ("AnimaVAE01", 1, 3, 3, 16384, 16384, 128, torch.bfloat16),
-    ("AnimaVAE01F", 1, 3, 3, 16384, 16384, 128, torch.float16),
 
     # 4. Krea2，GQA: h_q = 48, h_kv = 12
     # 如启用，请根据实际模型精度修改最后一个 dtype 字段。
@@ -248,14 +240,14 @@ def run_benchmarks():
             sdpa_time = benchmark_single(sdpa_func, q, k, v)
             sdpa_tflops = calculate_tflops(b, h_q, sq, sk, d, sdpa_time)
             print(
-                f"{name:<15} | {dtype_str:<9} | {'SDPA(Base)':<10} | "
+                f"{name:<10} | {dtype_str:<9} | {'SDPA(Base)':<10} | "
                 f"{sdpa_time:<8.3f} | {sdpa_tflops:<6.2f} | "
                 f"{'Baseline':<8} | {'-':<8} | {'-':<10} | {'-':<8} | {'-':<6}"
             )
         except Exception as e:
             err_msg = str(e).replace("\n", " ")[:20]
             print(
-                f"{name:<15} | {dtype_str:<9} | {'SDPA(Base)':<10} | "
+                f"{name:<10} | {dtype_str:<9} | {'SDPA(Base)':<10} | "
                 f"{'Error':<8} | {'-':<6} | {'-':<8} | {'-':<8} | "
                 f"{'-':<10} | {'-':<8} | {err_msg:<6}"
             )
@@ -302,7 +294,7 @@ def run_benchmarks():
             err_msg = str(e).replace("\n", " ")[:20]
             for backend_name, _ in backends:
                 print(
-                    f"{name:<15} | {dtype_str:<9} | {backend_name:<10} | "
+                    f"{name:<10} | {dtype_str:<9} | {backend_name:<10} | "
                     f"{'Error':<8} | {'-':<6} | {'-':<8} | {'-':<8} | "
                     f"{'-':<10} | {'-':<8} | {err_msg:<6}"
                 )
@@ -326,7 +318,7 @@ def run_benchmarks():
                 status = "ERR"
 
             print(
-                f"{name:<15} | {dtype_str:<9} | {backend_name:<10} | "
+                f"{name:<10} | {dtype_str:<9} | {backend_name:<10} | "
                 f"{t:<8.3f} | {tflops:<6.2f} | "
                 f"{speedup_str:<8} | {max_err:<8.6f} | "
                 f"{mse_val:<10.8f} | {cos:<8.6f} | {status:<6}"
@@ -340,7 +332,7 @@ def run_benchmarks():
 
 if __name__ == "__main__":
     print(
-        f"{'Shape':<15} | {'Precision':<9} | {'Backend':<10} | "
+        f"{'Shape':<10} | {'Precision':<9} | {'Backend':<10} | "
         f"{'Time':<8} | {'TFLOPS':<6} | {'Speedup':<8} | "
         f"{'MaxErr':<8} | {'MSE':<10} | {'CosSim':<8} | {'Status':<6}"
     )

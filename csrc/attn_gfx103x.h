@@ -16,7 +16,8 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
     Tensor k_scale,
     int64_t tensor_layout,
     int64_t is_causal,
-    double sm_scale);
+    double sm_scale,
+    Tensor q_fp);
 
 Tensor fp16_attn_gfx103x_t(
     Tensor query,
@@ -43,7 +44,8 @@ std::vector<Tensor> quant_qk_int8_gfx103x(
     Tensor key,
     Tensor key_mean,
     int64_t tensor_layout,
-    double sm_scale);
+    double sm_scale,
+    int64_t skip_q);
 
 Tensor mean_seq_gfx103x(Tensor input, int64_t tensor_layout);
 

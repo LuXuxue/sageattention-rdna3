@@ -19,7 +19,7 @@ STABLE_TORCH_LIBRARY(sageattention, m) {
     m.def("qk_int8_sv_bf16_attn_t("
             "Tensor query, Tensor key, Tensor value, Tensor(a!) output, "
             "Tensor q_scale, Tensor k_scale, int tensor_layout, "
-            "int is_causal, float sm_scale"
+            "int is_causal, float sm_scale, Tensor q_fp"
           ") -> Tensor");
     m.def("fp16_attn_t("
             "Tensor query, Tensor key, Tensor value, Tensor(a!) output, "
@@ -31,7 +31,7 @@ STABLE_TORCH_LIBRARY(sageattention, m) {
           ") -> Tensor");
     m.def("quant_qk_int8("
             "Tensor query, Tensor key, Tensor key_mean, int tensor_layout, "
-            "float sm_scale"
+            "float sm_scale, int skip_q"
           ") -> Tensor[]");
     m.def("mean_seq(Tensor input, int tensor_layout) -> Tensor");
     m.def("v_transpose(Tensor value, Tensor(a!) value_t, int tensor_layout) -> Tensor");

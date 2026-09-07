@@ -3,15 +3,6 @@ import os
 from typing import Any, Optional, Tuple, Union
 
 
-def _gfx103_d64_threshold(tensor_layout: str) -> int:
-    """gfx1035 D=64 self int8/direct 默认阈值 (kv > thr 走 direct)。
-
-    实测 NHD 与 HND 交叉点均在 ~1016: kv<1016 int8 6x 快, kv>=1024 direct-v2 快
-    (v2 需 >=1024 行才有 block; v1 在 512-1023 病理性慢)。两布局统一 1016。
-    供单元测试直接锁定该值, 防止再次误调 (曾误设 HND=768 致 769-1023 走 direct-v1 慢 6x)。
-    """
-    return 1016
-
 # Backend selection via environment variable:
 #   SAGEATTN_BACKEND=triton            - Triton autotune kernel
 #   SAGEATTN_BACKEND=native            - HIP native WMMA kernel
@@ -185,7 +176,12 @@ def sageattn(
         if is_causal:
             v7p_forced = (os.getenv("SAGEATTN_GFX10_V7P") not in [None, "", "0"]) or \
                          (os.getenv("SAGEATTN_GFX10_V8") not in [None, "", "0"])
-            use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64_CAUSAL", "6144") or 6144))
+            # gfx1035: causal direct is pathologically slow (81ms @4096^2 D64 vs
+            # v10 int8 10.9ms full-tile, ~6ms with v10 diagonal early-termination);
+            # direct loses on every measured causal size (incl. kv=32..1536), so
+            # default to int8 on gfx103; non-gfx103 keeps the legacy 6144 balance.
+            causal_d64_thr = "0" if arch.startswith('gfx103') else "6144"
+            use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64_CAUSAL", causal_d64_thr) or causal_d64_thr))
             if v7p_forced:
                 # v7p/v8 int8 kernel 实测与 Triton 同水平 (~1.1-1.3x), causal 也强制走 int8
                 use_direct = False
@@ -291,13 +287,35 @@ def sageattn(
             k_mean = ops.mean_seq(k, layout_code)
         else:
             k_mean = torch.empty(0, device=q.device, dtype=q.dtype)
+        # v10 INQ (in-kernel Q int8 quant): for small kv the q8 prepass round-trip
+        # dominates end-to-end time, so the main kernel quantizes Q itself from the
+        # fp16/bf16 source and the prepass skips Q entirely. Gate must match the
+        # .cu dispatch (v10 on & !causal & kv<=1024 & !IPV) or the main kernel
+        # would read an empty q8 tensor -> garbage.
+        inq_env = os.getenv("SAGEATTN_V10_INQ")
+        v10_env = os.getenv("SAGEATTN_GFX10_V10")
+        ipv_env = os.getenv("SAGEATTN_V10_IPV")
+        v10_on = (v10_env == "1") or (v10_env in (None, "") and not is_causal)
+        ipv_on = (ipv_env == "1") or (ipv_env == "2" and q_len == kv_len_actual and q_len >= 512)
+        inq_wanted = (inq_env == "1") or (inq_env in (None, "", "2") and kv_len_actual <= 1024)
+        q_skip_inq = bool(
+            headdim in (64, 128) and not is_causal and v10_on and not ipv_on and inq_wanted
+            and q.is_contiguous()
+        )
+        q_for_inq = q
+        if q_skip_inq:
+            # zero-copy HND view of the fp16/bf16 Q for the in-kernel quantizer
+            # ([B,H,S,D] semantics, d-stride 1 -> contiguous row reads).
+            if tensor_layout == "NHD":
+                b_, s_, h_, d_ = q.shape
+                q_for_inq = q.as_strided((b_, h_, s_, d_), (s_ * h_ * d_, d_, h_ * d_, 1))
         q_int8, q_scale, k_int8, k_scale = ops.quant_qk_int8(
-            q, k, k_mean, layout_code, sm_scale
+            q, k, k_mean, layout_code, sm_scale, int(q_skip_inq)
         )
         ops.qk_int8_sv_bf16_attn_t(
             q_int8, k_int8, v_for_attn, o_int8,
             q_scale, k_scale,
-            layout_code, int(is_causal), sm_scale
+            layout_code, int(is_causal), sm_scale, q_for_inq
         )
 
     if input_dtype == torch.float32:

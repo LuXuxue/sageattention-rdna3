@@ -63,6 +63,32 @@ __device__ __forceinline__ unsigned load_h2_quad(const __half* p) {
     return *reinterpret_cast<const unsigned*>(p);
 }
 
+// ---------------------------------------------------------------------------
+// INQ (in-kernel Q int8 quant): mirror quant_qk_int8 rounding exactly.
+//   round-half-away + truncate-toward-zero + saturate [-128,127] (matches
+//   float_to_int8's v_cvt_i32_f32 path on gfx10).
+__device__ __forceinline__ int8_t gfx10_q8_round(float x) {
+    x += (x >= 0.0f) ? 0.5f : -0.5f;
+    int i = static_cast<int>(x);
+    if (i > 127) i = 127;
+    if (i < -128) i = -128;
+    return static_cast<int8_t>(i);
+}
+// pack 4 int8 (LE order = load_i8_quad byte order) into one dword
+__device__ __forceinline__ int gfx10_q8_pack(int8_t a, int8_t b, int8_t c, int8_t d) {
+    return (static_cast<int>(a) & 0xff) | ((static_cast<int>(b) & 0xff) << 8) |
+           ((static_cast<int>(c) & 0xff) << 16) | ((static_cast<int>(d) & 0xff) << 24);
+}
+// raw 2-byte element (fp16 or bf16 bit pattern) -> float
+__device__ __forceinline__ float gfx10_q8_2f(unsigned raw_half, bool bf16) {
+    if (bf16) {
+        __hip_bfloat16 b = *reinterpret_cast<const __hip_bfloat16*>(&raw_half);
+        return __bfloat162float(b);
+    }
+    __half h = *reinterpret_cast<const __half*>(&raw_half);
+    return __half2float(h);
+}
+
 // output dtype conversion
 template <typename ODT> __device__ __forceinline__ ODT gfx10_out_convert(float v);
 template <> __device__ __forceinline__ __half gfx10_out_convert<__half>(float v) { return __float2half_rn(v); }
@@ -3439,7 +3465,7 @@ __global__ __attribute__((amdgpu_num_vgpr(160))) __launch_bounds__(BM, 2) void a
 // hide LDS latency). P is stored transposed [BN][BM] so PV loads are
 // bank-conflict-free.
 // =============================================================================
-template <int HD, bool C, int BN, int BM, typename ODT, int TM = 2>
+template <int HD, bool C, int BN, int BM, typename ODT, int TM = 2, bool IPV = false, bool INQ = false>
 __global__ __attribute__((amdgpu_num_vgpr(224))) __launch_bounds__(BM, 1) void attn_kernel_gfx10_i10_t(
     const int8_t* __restrict__ q, const int8_t* __restrict__ k,
     const __half* __restrict__ v, ODT* __restrict__ out,
@@ -3454,7 +3480,8 @@ __global__ __attribute__((amdgpu_num_vgpr(224))) __launch_bounds__(BM, 1) void a
     int64_t qs_stride_b, int64_t qs_stride_h,
     int64_t ks_stride_b, int64_t ks_stride_h,
     int tensor_layout, int diag, int v_native,
-    const float* __restrict__ v_scale, int64_t vs_stride_b, int64_t vs_stride_h) {
+    const float* __restrict__ v_scale, int64_t vs_stride_b, int64_t vs_stride_h,
+    const void* __restrict__ q_fp, int q_src_bf16, float sm_scale_log2e) {
 #if defined(__GFX10__)
     constexpr int QUADS = HD / 4;       // int8 dwords per row
     constexpr int NTHREAD = BM;
@@ -3462,7 +3489,8 @@ __global__ __attribute__((amdgpu_num_vgpr(224))) __launch_bounds__(BM, 1) void a
     constexpr int V_STRIDE = BN;
     constexpr int KS_TOTAL = BN * K_STRIDE;
     constexpr int VS_TOTAL = HD * V_STRIDE;   // [HD][BN] transposed V tile
-    constexpr int VDSW = 8;                   // fp16 staging slots
+    constexpr int VDSW = IPV ? 16 : 8;        // int8 / fp16 staging slots
+    constexpr int RSTR = BN + 4;              // p8_buf padded row stride (mult of 4, odd dwords/row)
     // PV register tiling: TM rows x TD dims per lane.
     constexpr int TD = HD / TM;               // dims per lane (dgo groups)
     constexpr int NROWG = BM / TM;            // row groups (PV lanes along rows)
@@ -3470,14 +3498,19 @@ __global__ __attribute__((amdgpu_num_vgpr(224))) __launch_bounds__(BM, 1) void a
     static_assert(NROWG * NDMG == NTHREAD, "v10 lane tiling must fill the block");
     static_assert(NROWG * NDMG == BM, "v10 lane tiling must fill the block");
     static_assert(BN % 2 == 0, "v10 requires even BN");
-    static_assert(KS_TOTAL * 2 + VS_TOTAL * 2 * (int)sizeof(__half) + BM * BN * (int)sizeof(__half)
+    static_assert(KS_TOTAL * 2 + VS_TOTAL * 2 * (int)sizeof(std::conditional_t<IPV, int8_t, __half>)
+                  + (IPV ? BM * RSTR : BM * BN * (int)sizeof(__half))
                   + BM * 2 * (int)sizeof(float) <= 49152, "v10 LDS budget");
 
     __shared__ __attribute__((aligned(32))) int8_t k_buf[2][KS_TOTAL];
-    __shared__ __attribute__((aligned(32))) __half v_buf[2][VS_TOTAL];
-    __shared__ __attribute__((aligned(32))) __half p_buf[BN * BM];   // transposed P [k][m]
+    __shared__ __attribute__((aligned(32))) std::conditional_t<IPV, int8_t, __half> v_buf[2][VS_TOTAL];
+    __shared__ __attribute__((aligned(32))) __half p_buf[BN * BM];   // transposed P [k][m] (fp16 path)
+    __shared__ __attribute__((aligned(32))) int8_t p8_buf[BM * RSTR];// row-major P [m][n] (int8-PV path)
     __shared__ __attribute__((aligned(32))) float alpha_buf[BM];     // per-row rescale per tile
     __shared__ __attribute__((aligned(32))) float l_buf[BM];         // final row sums
+
+    const int8_t* v8p = IPV ? reinterpret_cast<const int8_t*>(v) : nullptr;
+    (void)v8p;
 
     const int tid = threadIdx.x;
     const int64_t m = blockIdx.x * BM + tid;
@@ -3493,19 +3526,69 @@ __global__ __attribute__((amdgpu_num_vgpr(224))) __launch_bounds__(BM, 1) void a
     const int diag_wb = (diag >> 4) & 1;
     (void)q_stride_n_dir_unused; (void)tensor_layout; (void)v_native;
     (void)v_scale; (void)vs_stride_b; (void)vs_stride_h;
+    (void)q_fp; (void)q_src_bf16; (void)sm_scale_log2e;
 
     // ---- Q row resident in registers (QK row owned by lane == tid) ----
-    const float qsv = valid
-        ? q_scale[b * qs_stride_b + h * qs_stride_h + static_cast<int>(m / MIN_BLK_Q)] : 0.0f;
+    // INQ: quantize fp16/bf16 Q in-kernel, skipping the q8 global prepass
+    // round-trip (big win when kv is small and the prepass dominates end-to-end
+    // time). Scale math mirrors quant_qk_int8: per MIN_BLK_Q=32-row subgroup,
+    // amax over the wave's 32 rows (lane==row => one wave == one subgroup),
+    // q8) = 127*q/amax, qsv = amax*sm_scale_log2e/127 stored in the kernel.
+    float qsv;
     int q_reg[QUADS];
-    if (valid) {
-        const int64_t qb = b * q_stride_b + h * q_stride_h;
-        const int8_t* qrow = q + qb + m * q_stride_n;
-        #pragma unroll
-        for (int dq = 0; dq < QUADS; ++dq) q_reg[dq] = load_i8_quad(qrow + dq * 4);
-    } else {
+    if constexpr (INQ) {
         #pragma unroll
         for (int dq = 0; dq < QUADS; ++dq) q_reg[dq] = 0;
+        const int64_t qb = b * q_stride_b + h * q_stride_h;
+        float row_amax = 1e-7f;
+        if (valid) {
+            const char* qrow = reinterpret_cast<const char*>(q_fp) + (qb + m * q_stride_n) * 2;
+            constexpr int NW = HD / 2;   // dwords (2 halves each)
+            #pragma unroll
+            for (int x = 0; x < NW; ++x) {
+                const unsigned u = reinterpret_cast<const unsigned*>(qrow)[x];
+                const float f0 = gfx10_q8_2f(u & 0xffffu, q_src_bf16 != 0);
+                const float f1 = gfx10_q8_2f(u >> 16, q_src_bf16 != 0);
+                row_amax = fmaxf(row_amax, fabsf(f0));
+                row_amax = fmaxf(row_amax, fabsf(f1));
+            }
+        }
+        // full-wave butterfly (32 lanes == one MIN_BLK_Q=32 row group)
+        #pragma unroll
+        for (int sh = 1; sh < 32; sh <<= 1)
+            row_amax = fmaxf(row_amax, __shfl_xor(row_amax, sh));
+        qsv = valid ? (row_amax * (1.0f / 127.0f) * sm_scale_log2e) : 0.0f;
+        if (valid) {
+            const char* qrow = reinterpret_cast<const char*>(q_fp) + (qb + m * q_stride_n) * 2;
+            constexpr int NW = HD / 2;
+            const float iscale = 127.0f / row_amax;
+            #pragma unroll
+            for (int dq = 0; dq < QUADS; ++dq) {
+                const unsigned a = reinterpret_cast<const unsigned*>(qrow)[2 * dq];
+                const unsigned b_ = reinterpret_cast<const unsigned*>(qrow)[2 * dq + 1];
+                const float f0 = gfx10_q8_2f(a & 0xffffu, q_src_bf16 != 0);
+                const float f1 = gfx10_q8_2f(a >> 16, q_src_bf16 != 0);
+                const float f2 = gfx10_q8_2f(b_ & 0xffffu, q_src_bf16 != 0);
+                const float f3 = gfx10_q8_2f(b_ >> 16, q_src_bf16 != 0);
+                q_reg[dq] = gfx10_q8_pack(
+                    gfx10_q8_round(f0 * iscale), gfx10_q8_round(f1 * iscale),
+                    gfx10_q8_round(f2 * iscale), gfx10_q8_round(f3 * iscale));
+            }
+        } else {
+            qsv = 0.0f;
+        }
+    } else {
+        qsv = valid
+            ? q_scale[b * qs_stride_b + h * qs_stride_h + static_cast<int>(m / MIN_BLK_Q)] : 0.0f;
+        if (valid) {
+            const int64_t qb = b * q_stride_b + h * q_stride_h;
+            const int8_t* qrow = q + qb + m * q_stride_n;
+            #pragma unroll
+            for (int dq = 0; dq < QUADS; ++dq) q_reg[dq] = load_i8_quad(qrow + dq * 4);
+        } else {
+            #pragma unroll
+            for (int dq = 0; dq < QUADS; ++dq) q_reg[dq] = 0;
+        }
     }
 
     float acc[TM][TD];
@@ -3534,15 +3617,24 @@ __global__ __attribute__((amdgpu_num_vgpr(224))) __launch_bounds__(BM, 1) void a
                 const int64_t n = kb0 + n_local;
                 if ((dg * VDSW) < HD) {
                     if (n < kv_len) {
-                        const __half* src = v + b * v_stride_b + kvh * v_stride_n + n * v_stride_h + dg * VDSW;
-                        int4 val = *reinterpret_cast<const int4*>(src);
-                        #pragma unroll
-                        for (int jj = 0; jj < VDSW; ++jj)
-                            v_buf[dst][(dg * VDSW + jj) * V_STRIDE + n_local] = reinterpret_cast<__half*>(&val)[jj];
+                        if constexpr (IPV) {
+                            const int8_t* src = v8p + b * v_stride_b + kvh * v_stride_n + n * v_stride_h + dg * VDSW;
+                            int4 val = *reinterpret_cast<const int4*>(src);
+                            #pragma unroll
+                            for (int jj = 0; jj < VDSW; ++jj)
+                                v_buf[dst][(dg * VDSW + jj) * V_STRIDE + n_local] = reinterpret_cast<const int8_t*>(&val)[jj];
+                        } else {
+                            const __half* src = v + b * v_stride_b + kvh * v_stride_n + n * v_stride_h + dg * VDSW;
+                            int4 val = *reinterpret_cast<const int4*>(src);
+                            #pragma unroll
+                            for (int jj = 0; jj < VDSW; ++jj)
+                                v_buf[dst][(dg * VDSW + jj) * V_STRIDE + n_local] = reinterpret_cast<__half*>(&val)[jj];
+                        }
                     } else {
                         #pragma unroll
                         for (int jj = 0; jj < VDSW; ++jj)
-                            v_buf[dst][(dg * VDSW + jj) * V_STRIDE + n_local] = __half{0};
+                            v_buf[dst][(dg * VDSW + jj) * V_STRIDE + n_local] =
+                                std::conditional_t<IPV, int8_t, __half>{0};
                     }
                 }
             }
@@ -3553,12 +3645,18 @@ __global__ __attribute__((amdgpu_num_vgpr(224))) __launch_bounds__(BM, 1) void a
     stage_kv(0, 0);
     __syncthreads();
 
+    // Causal: rows m in [m0, m0+BM) attend only n <= m, so kv tiles with
+    // kb >= m0+BM are entirely above the diagonal (every n > every m in this
+    // block) and are masked to -inf anyway. Clamp the tile loop to the block
+    // diagonal -> ~half the QK+PV work for causal self, ~half the K/V staging.
+    const int64_t kb_lim = C ? min(kv_len, min(qo_len, blockIdx.x * static_cast<int64_t>(BM) + BM)) : kv_len;
+
     #pragma unroll 1
-    for (int64_t kb = 0; kb < kv_len; kb += BN) {
+    for (int64_t kb = 0; kb < kb_lim; kb += BN) {
         const int buf = static_cast<int>((kb / BN) & 1);
         const int64_t nb = kb + BN;
 
-        if ((nb < kv_len) && !diag_st) {
+        if ((nb < kb_lim) && !diag_st) {
             stage_kv(buf ^ 1, nb);
         }
 
@@ -3609,11 +3707,46 @@ __global__ __attribute__((amdgpu_num_vgpr(224))) __launch_bounds__(BM, 1) void a
                 row_l *= alpha;
                 float ps = 0.0f;
                 #pragma unroll
-                for (int j = 0; j < BN; ++j) { float p = exp2f(scr[j] - row_m); p_buf[j * BM + (int)(m % BM)] = __float2half(p); ps += p; }
+                for (int j = 0; j < BN; ++j) { float p = exp2f(scr[j] - row_m); ps += p; }
                 row_l += ps;
+                if constexpr (IPV) {
+                    const int rowr = static_cast<int>(m % BM);
+                    #pragma unroll
+                    for (int j = 0; j < BN; j += 4) {
+                        unsigned w = 0;
+                        #pragma unroll
+                        for (int jj = 0; jj < 4; ++jj) {
+                            float p = exp2f(scr[j + jj] - row_m);
+                            int pi = static_cast<int>(p * 127.0f + 0.5f);
+                            if (pi < 0) pi = 0;
+                            if (pi > 127) pi = 127;
+                            w |= static_cast<unsigned>(pi) << (jj * 8);
+                        }
+                        *reinterpret_cast<unsigned*>(&p8_buf[rowr * RSTR + j]) = w;
+                    }
+                } else {
+                    #pragma unroll
+                    for (int j = 0; j < BN; ++j) p_buf[j * BM + (int)(m % BM)] = __float2half(exp2f(scr[j] - row_m));
+                }
             } else {
                 #pragma unroll
                 for (int j = 0; j < BN; ++j) p_buf[j * BM + (int)(m % BM)] = __float2half(scr[j]);
+                if constexpr (IPV) {
+                    const int rowr = static_cast<int>(m % BM);
+                    #pragma unroll
+                    for (int j = 0; j < BN; j += 4) {
+                        unsigned w = 0;
+                        #pragma unroll
+                        for (int jj = 0; jj < 4; ++jj) {
+                            float p = exp2f(scr[j + jj] - row_m);
+                            int pi = static_cast<int>(p * 127.0f + 0.5f);
+                            if (pi < 0) pi = 0;
+                            if (pi > 127) pi = 127;
+                            w |= static_cast<unsigned>(pi) << (jj * 8);
+                        }
+                        *reinterpret_cast<unsigned*>(&p8_buf[rowr * RSTR + j]) = w;
+                    }
+                }
             }
             alpha_buf[m % BM] = P_al;
             l_buf[m % BM] = row_l;
@@ -3633,25 +3766,59 @@ __global__ __attribute__((amdgpu_num_vgpr(224))) __launch_bounds__(BM, 1) void a
                 #pragma unroll
                 for (int dd = 0; dd < TD; ++dd) acc[u][dd] *= al;
             }
-            #pragma unroll
-            for (int kp = 0; kp < BN / 2; ++kp) {
-                const int k = kp * 2;
-                unsigned pp[TM];
+            if constexpr (IPV) {
+                // int8-PV: 4 keys per 32-bit P (row-major padded p8_buf) and V operand,
+                // sdot4 = 4 MAC/inst, V LDS bytes halved vs fp16. Per-32-key-tile v_scale[]
+                // folds in on each sdot4 (int32 -> float, fma with vs).
+                const float vs = (v_scale
+                    ? v_scale[b * vs_stride_b + kvh * vs_stride_h + static_cast<int>(kb / 32)] : 127.0f * 127.0f)
+                    * (1.0f / (127.0f * 127.0f));
+                int iacc[TM][TD];
                 #pragma unroll
-                for (int up = 0; up < TM / 2; ++up) {
-                    // 2 halfs at p_buf[k*BM + r0+up*2] = rows {r0+2up, r0+2up+1} of key k
-                    const unsigned pk0 = *reinterpret_cast<const unsigned*>(&p_buf[k * BM + r0 + up * 2]);
-                    const unsigned pk1 = *reinterpret_cast<const unsigned*>(&p_buf[(k + 1) * BM + r0 + up * 2]);
-                    pp[up * 2]     = (pk0 & 0xffffu) | ((pk1 & 0xffffu) << 16);   // (k,r0+2up),(k+1,r0+2up)
-                    pp[up * 2 + 1] = (pk0 >> 16)      | (pk1 & 0xffff0000u);      // (k,r0+2up+1),(k+1,r0+2up+1)
-                }
+                for (int u = 0; u < TM; ++u)
+                    #pragma unroll
+                    for (int dd = 0; dd < TD; ++dd) iacc[u][dd] = 0;
                 #pragma unroll
-                for (int dd = 0; dd < TD; ++dd) {
-                    const int d = dgo * TD + dd;
-                    const unsigned vv = *reinterpret_cast<const unsigned*>(&v_buf[buf][d * V_STRIDE + k]);
+                for (int kp = 0; kp < BN / 4; ++kp) {
+                    const int k = kp * 4;
+                    unsigned pp[TM];
                     #pragma unroll
                     for (int u = 0; u < TM; ++u)
-                        acc[u][dd] = fdot2_f32_f16(pp[u], vv, acc[u][dd]);
+                        pp[u] = *reinterpret_cast<const unsigned*>(&p8_buf[(r0 + u) * RSTR + k]);
+                    #pragma unroll
+                    for (int dd = 0; dd < TD; ++dd) {
+                        const int d = dgo * TD + dd;
+                        const int vv = *reinterpret_cast<const int*>(&v_buf[buf][d * V_STRIDE + k]);
+                        #pragma unroll
+                        for (int u = 0; u < TM; ++u)
+                            iacc[u][dd] = sdot4_i32_i8(static_cast<int>(pp[u]), vv, iacc[u][dd]);
+                    }
+                }
+                #pragma unroll
+                for (int u = 0; u < TM; ++u)
+                    #pragma unroll
+                    for (int dd = 0; dd < TD; ++dd) acc[u][dd] += static_cast<float>(iacc[u][dd]) * vs;
+            } else {
+                #pragma unroll
+                for (int kp = 0; kp < BN / 2; ++kp) {
+                    const int k = kp * 2;
+                    unsigned pp[TM];
+                    #pragma unroll
+                    for (int up = 0; up < TM / 2; ++up) {
+                        // 2 halfs at p_buf[k*BM + r0+up*2] = rows {r0+2up, r0+2up+1} of key k
+                        const unsigned pk0 = *reinterpret_cast<const unsigned*>(&p_buf[k * BM + r0 + up * 2]);
+                        const unsigned pk1 = *reinterpret_cast<const unsigned*>(&p_buf[(k + 1) * BM + r0 + up * 2]);
+                        pp[up * 2]     = (pk0 & 0xffffu) | ((pk1 & 0xffffu) << 16);   // (k,r0+2up),(k+1,r0+2up)
+                        pp[up * 2 + 1] = (pk0 >> 16)      | (pk1 & 0xffff0000u);      // (k,r0+2up+1),(k+1,r0+2up+1)
+                    }
+                    #pragma unroll
+                    for (int dd = 0; dd < TD; ++dd) {
+                        const int d = dgo * TD + dd;
+                        const unsigned vv = *reinterpret_cast<const unsigned*>(&v_buf[buf][d * V_STRIDE + k]);
+                        #pragma unroll
+                        for (int u = 0; u < TM; ++u)
+                            acc[u][dd] = fdot2_f32_f16(pp[u], vv, acc[u][dd]);
+                    }
                 }
             }
         }
