@@ -149,65 +149,41 @@ def sageattn(
         kv_len_actual = k.size(1)
         q_len = q.size(1)
 
-    # direct/int8 分发: 本质是"省 quant+mean 辅助(固定 0.4-0.6ms)" vs "i8 WMMA 2x 吞吐(与计算量成正比)"的权衡
-    # 计算量小(causal/cross 短 q)时 direct 胜; 计算量大(self 长序列)时 int8 胜。阈值扫描见 bench_threshold*.py:
-    #   D=64 self 非 causal: NHD kv=2560 direct 优0.4%, 3072 int8 优3.8% -> 3072;
-    #                        HND 平衡点降至 2048 (布局影响 stride/缓存, int8 更有利) -> 2048
-    #   D=64 causal:          kv=3072/4096 direct 优5%/2%, 6144 持平, 8192 int8 优5.5% -> 6144
-    #   D=64 cross (q<kv):    q=3072/kv=4096 仍 direct 优3%              -> 6144
-    #   D=128 self/causal:    kv=2048 direct 优5%, 2560 int8 优5%        -> 2048
-    #   D=128 cross q<<kv:    q=512/1024 vs kv=4096 direct 优25%/8%, q=2048(=kv/2) int8 优5% -> q<kv/2 且 kv<=4096
+    # gfx1035 (RDNA2 iGPU) dispatch policy (scanned 2026-09):
+    #   - int8 v10 (with INQ for non-causal kv<=1024) is the only path used by default.
+    #   - direct (V_T + fp16/bf16_attn_t) is 4-65x slower than int8 at every cross/self
+    #     shape measured (D64 HND q512/kv2048 direct=49.8ms vs int8=1.15ms; NHD same;
+    #     D128 cross similar 4.7-6.5x losses). Even the historical "small kv wins"
+    #     claim (kv<=6144/4096) does not hold on the current direct kernel.
+    #   - Causal direct is also 6-8x slower (core's own known issue).
+    #   - Therefore on gfx1035 the cross thresholds are forced to 0 (always int8) and
+    #     the direct path is no longer reachable from default dispatch.
+    #   - For gfx1103 (RDNA3) the existing direct/int8 balance is preserved.
     arch = getattr(torch.cuda.get_device_properties(torch.cuda.current_device()), 'gcnArchName', None)
+    is_gfx103 = isinstance(arch, str) and arch.startswith('gfx103')
     if headdim == 64:
-        # gfx1103:
-        # HND 布局 D=64 self 的 int8 平衡点降至 ~2048 (HND 扫描: 2048 direct 优3.7%,
-        # 2304 int8 优0.4%), NHD (benchmark/实际应用) 保持 3072; env 可覆盖
-        if arch.startswith('gfx103'):
-            # gfx1035 D=64 self: int8 路径在所有长度下都远快于 direct (~30x 加速).
-            # 实测 SDXL01/07/13 (n=4096/6144/9216): int8=6.5/9.7ms, direct=237ms.
-            # 直觉上 direct 应更快 (无 quant overhead), 但实测 dot2 直链无法与 Triton 的
-            # int8 path (经过更好调度) 竞争。本地 int8 kernel 实测已是硬件实际墙。
-            # 所以默认总是 int8, 仅非常短的 seq (避免 quant overhead) 才走 direct。
-            # 实测 NHD/HND 阈值 1016 是历史 v1/v2 病态的产物, 当前 v2 已修正。
-            d64_default = 9999999  # 默认: 总是 int8 (gfx1035 D=64 self)
+        # gfx1103 (RDNA3) keeps the historical cross thresholds; gfx1035 always int8
+        # (扫描 2026-09: direct 在所有 cross/self/causal 形状下 4-65x 慢于 int8)。
+        if is_gfx103:
+            use_direct = False
         else:
             d64_default = 2048 if tensor_layout == "HND" else 3072
-        thr_d64 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64", str(d64_default)) or d64_default)
-        if is_causal:
-            v7p_forced = (os.getenv("SAGEATTN_GFX10_V7P") not in [None, "", "0"]) or \
-                         (os.getenv("SAGEATTN_GFX10_V8") not in [None, "", "0"])
-            # gfx1035: causal direct is pathologically slow (81ms @4096^2 D64 vs
-            # v10 int8 10.9ms full-tile, ~6ms with v10 diagonal early-termination);
-            # direct loses on every measured causal size (incl. kv=32..1536), so
-            # default to int8 on gfx103; non-gfx103 keeps the legacy 6144 balance.
-            causal_d64_thr = "0" if arch.startswith('gfx103') else "6144"
-            use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64_CAUSAL", causal_d64_thr) or causal_d64_thr))
-            if v7p_forced:
-                # v7p/v8 int8 kernel 实测与 Triton 同水平 (~1.1-1.3x), causal 也强制走 int8
-                use_direct = False
-        elif q_len < kv_len_actual:
-            # cross-attn: q 短时 direct 省辅助收益大 (q=3072/kv=4096 仍优 3%)
-            use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64_CROSS", "6144") or 6144))
-        else:
-            # gfx1035: D=64 self: int8 always faster. use_direct only if user forced.
-            if arch.startswith('gfx103'):
-                use_direct = (kv_len_actual > thr_d64)
+            thr_d64 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64", str(d64_default)) or d64_default)
+            if is_causal:
+                use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64_CAUSAL", "6144") or 6144))
+            elif q_len < kv_len_actual:
+                use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D64_CROSS", "6144") or 6144))
             else:
                 use_direct = (kv_len_actual <= thr_d64)
-
     else:
-        if arch.startswith('gfx103'):
-            # gfx1035 D=128: int8 v8 kernel now beats direct everywhere (~1.8-3.7x).
-            # default: always int8 (thr=0). Set SAGEATTN_DIRECT_THRESHOLD_D128 to force direct.
-            thr_d128 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128", "0") or 0)
+        if is_gfx103:
+            use_direct = False
         else:
             thr_d128 = int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128", "2048") or 2048)
-        if q_len * 2 < kv_len_actual:
-            # cross 且 q 明显短: direct 优 (q=512/1024 vs kv=4096 优 8-25%; q=2048=kv/2 时 int8 优)
-            use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128_CROSS", "4096") or 4096))
-        else:
-            # gfx1035: D=128 self: int8 always faster (v8 ~3.7x vs direct). Direct only if forced.
-            use_direct = (kv_len_actual <= thr_d128)
+            if q_len * 2 < kv_len_actual:
+                use_direct = (kv_len_actual <= int(os.getenv("SAGEATTN_DIRECT_THRESHOLD_D128_CROSS", "4096") or 4096))
+            else:
+                use_direct = (kv_len_actual <= thr_d128)
 
     if use_direct:
         # V 直接交给 v_transpose: bf16 输入由 kernel 内部转 fp16 (省 v.to(fp16) 独立 kernel)
@@ -234,54 +210,23 @@ def sageattn(
                 layout_code, int(is_causal), sm_scale, bm_sel
             )
     else:
-        # int8 路径, V/OUT dtype 分离 (方案B):
-        #   V 转 fp16 并入 v_transpose (读 bf16 直接写 fp16 V_T, 一次 kernel 完成转置+转换,
-        #   省掉 v.to(fp16) 独立 kernel 的一次额外全局读写往返)
-        #   输出由 kernel 直接写 bf16 (o 复用, 省 o.to(bf16) 转换 kernel, 且单次舍入精度更好)
+        # int8 path. V is always native [B,H,N,D] (the v10 main kernel reads native
+        # V directly, no V_T transpose). NHD input V is exposed as a zero-copy
+        # HND view via as_strided (saves 0.12ms permute copy); HND is passed
+        # through unchanged. bf16 V is cast to fp16 once (kernel reads __half).
         v_for_attn = v
-        v8_enabled = (os.getenv("SAGEATTN_GFX10_V8", "0") != "0" and int(os.getenv("SAGEATTN_GFX10_V8", "0") or 0) == 1) or (os.getenv("SAGEATTN_GFX10_V8R", "0") == "1")
-        # D=128 v8 gate (attn_gfx103x.cu L10_V8P v_native=1) also requires the natural
-        # [B,H,N,D] V layout: without this, core passes V_T but the kernel reads native.
-        v8_d128_native = (headdim == 128) and (os.getenv("SAGEATTN_GFX10_V8_D128", "1") != "0")
-        # gfx1035 D=64: v8 (BM=128/BN=32) is 6x faster than the old v2 default and 2.3x
-        # faster than v8-BN=16; make it the default (native V layout) unless user forces V_T.
-        v8_d64_native = (headdim == 64) and arch.startswith("gfx103") and \
-            os.getenv("SAGEATTN_GFX10_V8_D64", "1") != "0"
-        v8_native = (v8_enabled or v8_d128_native or v8_d64_native) and os.getenv("SAGEATTN_GFX10_V8_VT", "0") != "1"
-        if v8_native:
-            # v8 native 布局: kernel 直接读 HND 自然 [B,H,N,D] V (d-contiguous 全 sector)。
-            # HND 输入直接透传; NHD 输入先 permute+contiguous 转成 HND 自然布局 (一次拷贝,
-            # 胜过 V_T 的 n-contiguous 慢读 2.4x)。bf16 输入先转 fp16 (int8 路径 V 恒 fp16)。
-            if tensor_layout == "NHD":
-                v16 = v if v.dtype == torch.float16 else v.to(torch.float16)
-                if v16.is_contiguous():
-                    # 零拷贝 as_strided HND 视图 (省一次 0.12ms permute 拷贝)
-                    b_, n_, h_, d_ = v16.shape
-                    v_for_attn = v16.as_strided((b_, h_, n_, d_), (n_ * h_ * d_, d_, h_ * d_, 1))
-                else:
-                    v_for_attn = v16.permute(0, 2, 1, 3).contiguous()
-            elif v.dtype != torch.float16:
-                # HND natural but bf16: convert to fp16 (kernel reads __half*).
-                v_for_attn = v.to(torch.float16)
-            # else: v 已是 HND 自然布局 (contiguous) 且 fp16, 直接透传
-        else:
-            # V 全局转置 (V_T [B,H,D,N]) + 无 LDS PV: 需配套 -DSAGEATTN_VT_GLOBAL=1 编译 (setup.py 默认)
-            # n 维 padding 到 64 倍数, 防 v_frag_t 32B 直读越界 (见 direct 路径注释)
-            # v8 默认走 native V 布局 (v_native=1, 免转置, 全 sector 直读): V_T 方案实测
-            # 2.4x 慢 (31.7ms vs 18.4ms @ H=8), 故 v8 不用 V_T; 可用 SAGEATTN_GFX10_V8_VT=1 回退。
-            kv_heads_n = k.size(1) if tensor_layout == "HND" else k.size(2)
-            padded_n = ((kv_len_actual + 63) // 64) * 64
-            v_t = torch.empty(
-                q.size(0), kv_heads_n, headdim, padded_n,
-                device=q.device, dtype=torch.float16
-            )
-            ops.v_transpose(v_for_attn, v_t, layout_code)
-            v_for_attn = v_t
+        if tensor_layout == "NHD":
+            v16 = v if v.dtype == torch.float16 else v.to(torch.float16)
+            if v16.is_contiguous():
+                b_, n_, h_, d_ = v16.shape
+                v_for_attn = v16.as_strided((b_, h_, n_, d_), (n_ * h_ * d_, d_, h_ * d_, 1))
+            else:
+                v_for_attn = v16.permute(0, 2, 1, 3).contiguous()
+        elif v.dtype != torch.float16:
+            v_for_attn = v.to(torch.float16)
         o_int8 = o
 
-        # 默认 smooth_k=False (跳过 mean kernel): 实测 randn 下精度不降反升 (减 mean
-        # 反而引入 mean 值自身的 fp16/bf16 舍入误差), 端到端省 0.5-3.5% (见 try.md §9.3);
-        # 仅在 K 有明显非零 DC 偏置时减 mean 才有价值, 此时可显式传 smooth_k=True。
+        # smooth_k: K 减 mean 后再量化, 仅当 K 有显著非零 DC 偏置时有价值, 默认 False
         smooth_k = kwargs.get("smooth_k", False)
         if smooth_k:
             k_mean = ops.mean_seq(k, layout_code)
@@ -290,22 +235,16 @@ def sageattn(
         # v10 INQ (in-kernel Q int8 quant): for small kv the q8 prepass round-trip
         # dominates end-to-end time, so the main kernel quantizes Q itself from the
         # fp16/bf16 source and the prepass skips Q entirely. Gate must match the
-        # .cu dispatch (v10 on & !causal & kv<=1024 & !IPV) or the main kernel
-        # would read an empty q8 tensor -> garbage.
-        inq_env = os.getenv("SAGEATTN_V10_INQ")
-        v10_env = os.getenv("SAGEATTN_GFX10_V10")
-        ipv_env = os.getenv("SAGEATTN_V10_IPV")
-        v10_on = (v10_env == "1") or (v10_env in (None, "") and not is_causal)
-        ipv_on = (ipv_env == "1") or (ipv_env == "2" and q_len == kv_len_actual and q_len >= 512)
-        inq_wanted = (inq_env == "1") or (inq_env in (None, "", "2") and kv_len_actual <= 1024)
+        # .cu dispatch (v10 on & !causal & kv<=1024 & !IPV).
+        v10_on = True
+        ipv_on = False
+        inq_wanted = (kv_len_actual <= 1024)
         q_skip_inq = bool(
             headdim in (64, 128) and not is_causal and v10_on and not ipv_on and inq_wanted
             and q.is_contiguous()
         )
         q_for_inq = q
         if q_skip_inq:
-            # zero-copy HND view of the fp16/bf16 Q for the in-kernel quantizer
-            # ([B,H,S,D] semantics, d-stride 1 -> contiguous row reads).
             if tensor_layout == "NHD":
                 b_, s_, h_, d_ = q.shape
                 q_for_inq = q.as_strided((b_, h_, s_, d_), (s_ * h_ * d_, d_, h_ * d_, 1))

@@ -1,7 +1,6 @@
 """SageAttention native HIP 内核测试 (gfx1035 / RDNA2 iGPU)。
 
 覆盖当前默认 dispatch 下的全部数值路径:
-  direct (V_T)        fp16/bf16 cross-attn      -> TestCrossAttn::test_direct
   int8 v10 INQ        HND/NHD/short self/cross  -> TestBasic::test_short (kv<=1024)
   int8 v10 non-INQ    HND/NHD/bf16 self long    -> TestBasic::test_int8_long, TestMaxErr
   int8 v10 causal     短序列 / 长序列 / q>kv     -> TestCausal
@@ -9,6 +8,7 @@
   GQA (kvh 映射)      非因果 / 因果               -> TestGQA
   smooth_k (mean)      int8 长序列               -> TestSmoothK
   边界/健壮            短序列/非对齐尾部/单头/确定性 -> TestEdgeCases
+
 """
 import os
 
@@ -141,14 +141,14 @@ class TestBasic:
 
 
 class TestCrossAttn:
-    """q_len != kv_len: direct (V_T) 短 kv, int8 v10 长 kv。"""
+    """q_len != kv_len: int8 v10 跨长度数值正确性 (gfx1035 扫描后 cross 全部走 int8)。"""
 
     @pytest.mark.parametrize("head_dim", [64, 128])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_direct(self, sageattn, head_dim, dtype):
-        """cross、kv 短 -> fp16/bf16 direct (V_T) 内核。
+    def test_int8_cross(self, sageattn, head_dim, dtype):
+        """cross (q<kv): int8 v10 non-INQ (kv>1024)。
 
-        D64: kv<=6144; D128: q*2<kv 且 kv<=4096。选 kv 使其走 direct。
+        旧版测 direct (V_T) 路径; gfx1035 扫描后 direct 4-65x 慢, 已切到 int8。
         """
         b, h = 1, 4
         q_len, kv_len = (512, 2048) if head_dim == 64 else (512, 1536)
