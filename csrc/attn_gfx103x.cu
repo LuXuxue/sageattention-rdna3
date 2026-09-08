@@ -19,7 +19,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
-#include <optional>
 #include <type_traits>
 #include <vector>
 
@@ -32,19 +31,8 @@ constexpr int kNHD = 0;
 constexpr int kHND = 1;
 constexpr float kLog2e = 1.4426950408889634f;
 
-// 实验: V 全局转置存储 (V_T [B,H,D,N]) + PV 改 out = P @ V (B operand 行读)
-// SAGEATTN_VT_GLOBAL 宏开关保留: 0=不使用 v_transpose (本实现已不用); 1=启用 v_transpose 路径
-#ifndef SAGEATTN_VT_GLOBAL
-#define SAGEATTN_VT_GLOBAL 0
-#endif
-
-constexpr int RM = 16;
-constexpr int BK = 16;
-
 constexpr int MIN_BLK_Q = 32;
 constexpr int MIN_BLK_K = 16;
-
-constexpr int LDS_PAD = 16;
 
 #include "mma_gfx10.h"
 
@@ -65,22 +53,6 @@ __device__ __forceinline__ float to_float(float v) { return v; }
 __device__ __forceinline__ __half from_float_f16(float v) { return __float2half_rn(v); }
 __device__ __forceinline__ __hip_bfloat16 from_float_bf16(float v) { return __float2bfloat16(v); }
 
-__device__ __forceinline__ _Float16 to_qk_elem(const __half v) {
-    return static_cast<_Float16>(__half2float(v));
-}
-__device__ __forceinline__ __bf16 to_qk_elem(const __hip_bfloat16 v) {
-    return static_cast<__bf16>(__bfloat162float(v));
-}
-
-template <typename QK_DTYPE>
-__device__ __forceinline__ auto qk_zero() {
-    if constexpr (std::is_same<QK_DTYPE, __half>::value) {
-        return static_cast<_Float16>(0.0f);
-    } else {
-        return static_cast<__bf16>(0.0f);
-    }
-}
-
 __device__ __forceinline__ int8_t float_to_int8(float x) {
     x += (x >= 0.0f) ? 0.5f : -0.5f;
     int32_t rounded;
@@ -89,11 +61,6 @@ __device__ __forceinline__ int8_t float_to_int8(float x) {
     rounded = rounded < -128 ? -128 : rounded;
     return static_cast<int8_t>(rounded);
 }
-
-// 2026-09 清理: IPv4 路径已删除 (SAGEATTN_V10_IPV / V8 IPV 默认 off, V8 内核 IPV=true
-// 分支仍引用此 buffer 用于临时调试; 保留声明让 dead code 可被解析编译。
-__device__ unsigned g_ipv_dbg[4096];
-__device__ unsigned g_ipv_once;
 
 template <typename T>
 __global__ void mean_hnd_kernel(
@@ -159,7 +126,7 @@ __global__ void quant_qk_int8_hnd_kernel(
     const int64_t in_stride_b,
     const int64_t in_stride_n,
     const int64_t in_stride_h,
-    const int groups_per_block) {
+    const int64_t groups_per_block) {
     constexpr int Threads = 256;
     constexpr int RATIO = BLK / MIN_BLK;
     constexpr int PackElems = 8;
@@ -311,7 +278,7 @@ __global__ void quant_qk_int8_hnd_kernel(
     }
 }
 
-}// namespace
+}
 
 Tensor mean_seq_gfx103x(Tensor input, int64_t tensor_layout) {
     const int64_t batch = input.size(0);
@@ -370,8 +337,7 @@ std::vector<Tensor> quant_qk_int8_gfx103x(
     Tensor q_scale = new_empty_like(query, {batch, q_heads, q_groups}, ScalarType::Float);
     Tensor k_scale = new_empty_like(key, {batch, kv_heads, k_groups}, ScalarType::Float);
     if (skip_q) {
-        // in-kernel Q quant (v10 INQ): drop the q int8/scale tensors entirely;
-        // K still goes through the normal prepass below.
+
         q_int8 = new_empty_like(query, {0}, ScalarType::Char);
         q_scale = new_empty_like(query, {0}, ScalarType::Float);
     }
@@ -388,12 +354,7 @@ std::vector<Tensor> quant_qk_int8_gfx103x(
     const int64_t k_sh = (tensor_layout == kHND) ? key.stride(1) : key.stride(2);
 
     dim3 block(256);
-    // 大 block quant (对齐 triton BLK): 每 block 处理 BLK 行, 每 MIN_BLK 行一组
-    // 独立 scale (RATIO 组) + 多累加器 ILP —— MIN_BLK 粒度 (scale 语义) 不变
-    // 实测 (同进程 A/B): D=64 用 BLK_Q=128/BLK_K=64 最优 (SDXL07 -19%, SDXL13 -18%);
-    // D=128 旧逻辑已达 ~100GB/s (接近带宽上限), 大 block (128/64 或 64/32) 均 +1~3%
-    // (32KB LDS / 额外 blockReduce barrier), 故 D=128 保持旧逻辑 (BLK=MIN_BLK)
-    // SAGEATTN_QUANT_BLK: 1=auto (按 head_dim), 128=强制 128/64, 64=强制 64/32, 0=旧逻辑
+
     const int blk_sel = getenv("SAGEATTN_QUANT_BLK") ? atoi(getenv("SAGEATTN_QUANT_BLK")) : 1;
     constexpr int BLK_Q64 = 128;
     constexpr int BLK_K64 = 64;
@@ -407,13 +368,12 @@ std::vector<Tensor> quant_qk_int8_gfx103x(
     else { blk_q = MIN_BLK_Q; blk_k = MIN_BLK_K; }
     const int q_blocks = (q_len + blk_q - 1) / blk_q;
     const int k_blocks = (kv_len + blk_k - 1) / blk_k;
-    // 多 group 合并: 每 block 顺序处理 groups_per_block 个连续大 block (实验选项, 默认 1)
+
     int q_gpb = getenv("SAGEATTN_QUANT_GPB") ? atoi(getenv("SAGEATTN_QUANT_GPB")) : 1;
     if (q_gpb < 1) q_gpb = 1;
     dim3 grid_q((q_blocks + q_gpb - 1) / q_gpb, q_heads, batch);
     dim3 grid_k((k_blocks + q_gpb - 1) / q_gpb, kv_heads, batch);
 
-    // 模板参数须为编译期常量: 按 blk_q/blk_k 分派
     #define LAUNCH_QUANT(HD, T, BQ, BK) \
         do { \
             if (!skip_q) { \
@@ -457,11 +417,7 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
     Tensor query, Tensor key, Tensor value, Tensor output,
     Tensor q_scale, Tensor k_scale,
     int64_t tensor_layout, int64_t is_causal, double sm_scale, Tensor q_fp) {
-    // q_int8/k_int8 are ALWAYS laid out as [B, H, S, D] (quant writes HND-style
-    // regardless of the input tensor_layout), so the int8 tensors always use
-    // HND-style sizes/strides. V is native [B,H,N,D] (NHD via as_strided view).
-    // When INQ skips the q8 prepass, query/q_scale are {0}-shaped: derive the
-    // geometry/strides from the always-present fp16/bf16 q_fp view.
+
     const Tensor& qgeo = (query.dim() < 4) ? q_fp : query;
     const int64_t batch = qgeo.size(0);
     const int64_t q_heads = qgeo.size(1);
@@ -470,16 +426,12 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
     const int64_t kv_len = key.size(2);
     const int64_t head_dim = qgeo.size(3);
     const int64_t q_stride_b = (query.dim() >= 4) ? query.stride(0) : 0;
-    const int64_t q_stride_n = (query.dim() >= 4) ? query.stride(2) : 0;   // seq stride (HND int8 tensor)
-    const int64_t q_stride_h = (query.dim() >= 4) ? query.stride(1) : 0;   // head stride
+    const int64_t q_stride_n = (query.dim() >= 4) ? query.stride(2) : 0;
+    const int64_t q_stride_h = (query.dim() >= 4) ? query.stride(1) : 0;
     const int64_t k_stride_b = key.stride(0);
     const int64_t k_stride_n = key.stride(2);
     const int64_t k_stride_h = key.stride(1);
-    // value is the natural [B,H,N,D] V (NHD input as as_strided HND view, or HND passthrough).
-    // The kernel reads v_stride_b/n/h with the HND-as-strided semantics:
-    //   v_stride_n = v.stride(1) = d-contiguous half stride (== d-1 -> 1)
-    //   v_stride_h = v.stride(2) = the n-step within head (== H*D/n)
-    // The .cu kernel already uses these names as documented.
+
     const int64_t v_stride_b = value.stride(0);
     const int64_t v_stride_n = value.stride(1);
     const int64_t v_stride_h = value.stride(2);
@@ -491,7 +443,6 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
     const int64_t ks_stride_b = k_scale.stride(0), ks_stride_h = k_scale.stride(1);
     const hipStream_t stream = current_hip_stream(query);
 
-    // INQ config: 0=off, 1=force, 2=auto (kv<=1024)
     const int v10_inq_mode = getenv("SAGEATTN_V10_INQ") ? atoi(getenv("SAGEATTN_V10_INQ")) : 2;
     const bool v10_inq_wanted = (v10_inq_mode == 1) || (v10_inq_mode == 2 && kv_len <= 1024);
     int64_t qi_stride_b = q_stride_b, qi_stride_n = q_stride_n, qi_stride_h = q_stride_h;
@@ -505,113 +456,22 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
 
     const bool out_bf = (output.scalar_type() == ScalarType::BFloat16);
 
-    // v8: row-per-thread int8-QK, multi-head shared-K, native V (default fallback)
-    // 2026-09: kept as diagnostic opt-in via SAGEATTN_GFX10_V8=1; default is v10.
-    const bool v8_mode = getenv("SAGEATTN_GFX10_V8") ? (atoi(getenv("SAGEATTN_GFX10_V8")) == 1) : false;
-
-    // v10 (default): register-tiled PV (Triton-style)
-    //   BN: D64 default 32, D128 default 16 (override with SAGEATTN_V10_D128_BN)
-    //   TM: 2/4/8 (rows/lane for PV tiling, default 8)
-    //   BM: D64 128, D128 128
-    int v10_bm, v10_bn, v10_tm;
+    int v10_bn, v10_tm;
     if (head_dim == 64) {
-        v10_bm = 128;
-        v10_bn = getenv("SAGEATTN_V10_BN") ? atoi(getenv("SAGEATTN_V10_BN")) : 32;
-        v10_tm = getenv("SAGEATTN_V10_TM") ? atoi(getenv("SAGEATTN_V10_TM")) : 8;
+        v10_bn = getenv("SAGEATTN_BN_D64") ? atoi(getenv("SAGEATTN_BN_D64")) : 32;
+        v10_tm = getenv("SAGEATTN_TM_D64") ? atoi(getenv("SAGEATTN_TM_D64"))
+              : (getenv("SAGEATTN_TM") ? atoi(getenv("SAGEATTN_TM")) : 8);
     } else {
-        v10_bm = getenv("SAGEATTN_V10_D128_BM") ? atoi(getenv("SAGEATTN_V10_D128_BM"))
-              : (getenv("SAGEATTN_V10_BM") ? atoi(getenv("SAGEATTN_V10_BM")) : 128);
-        v10_bn = getenv("SAGEATTN_V10_D128_BN") ? atoi(getenv("SAGEATTN_V10_D128_BN"))
-              : (getenv("SAGEATTN_V10_BN") ? atoi(getenv("SAGEATTN_V10_BN")) : 16);
-        v10_tm = getenv("SAGEATTN_V10_D128_TM") ? atoi(getenv("SAGEATTN_V10_D128_TM"))
-              : (getenv("SAGEATTN_V10_TM") ? atoi(getenv("SAGEATTN_V10_TM")) : 8);
+        v10_bn = getenv("SAGEATTN_BN_D128") ? atoi(getenv("SAGEATTN_BN_D128"))
+              : (getenv("SAGEATTN_BN") ? atoi(getenv("SAGEATTN_BN")) : 16);
+        v10_tm = getenv("SAGEATTN_TM_D128") ? atoi(getenv("SAGEATTN_TM_D128"))
+              : (getenv("SAGEATTN_TM") ? atoi(getenv("SAGEATTN_TM")) : 8);
     }
 
-    // Diagnostic bit: SAGEATTN_V7P_DIAG (named historically; reused by v10)
-    const int diag = getenv("SAGEATTN_V7P_DIAG") ? atoi(getenv("SAGEATTN_V7P_DIAG")) : 0;
-
-    // ----------------------------------------------------------------
-    // L10_V8P64: v8 D64 only, BM=128 hardcoded (HIPCC clang can't fold
-    //   `(HD == 64 ? 128 : 64)` as a constexpr template arg).
-    // ----------------------------------------------------------------
-    #define L10_V8P64(C, BNV, ODT, HG, VN) \
-        do { \
-            dim3 b10(128); \
-            dim3 g10((qo_len + 127) / 128, (q_heads + HG - 1) / HG, batch); \
-            sageattn_gfx10::attn_kernel_gfx10_i8_v8_t<64, C, BNV, 128, HG, ODT> \
-                <<<g10, b10, 0, stream>>>( \
-                    reinterpret_cast<const int8_t*>(query.data_ptr()), \
-                    reinterpret_cast<const int8_t*>(key.data_ptr()), \
-                    reinterpret_cast<const __half*>(value.data_ptr()), \
-                    reinterpret_cast<ODT*>(output.data_ptr()), \
-                    reinterpret_cast<const float*>(q_scale.data_ptr()), \
-                    reinterpret_cast<const float*>(k_scale.data_ptr()), \
-                    batch, qo_len, kv_len, q_heads, kv_heads, \
-                    q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
-                    k_stride_b, k_stride_n, k_stride_h, \
-                    v_stride_b, v_stride_n, v_stride_h, \
-                    o_stride_b, o_stride_n, o_stride_h, \
-                    qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
-                    static_cast<int>(tensor_layout), diag, (VN), nullptr, 0, 0); \
-        } while (0)
-
-    // ----------------------------------------------------------------
-    // L10_V8PBM_128: v8 D128 with BM=128 (gfx1035 default). Use L10_V8PBM_64
-    //   for BM=64. BM=256 is rare and intentionally unsupported.
-    // ----------------------------------------------------------------
-    #define L10_V8PBM_128(C, BNV, ODT, HG, VN) \
-        do { \
-            dim3 b10(128); \
-            dim3 g10((qo_len + 127) / 128, (q_heads + HG - 1) / HG, batch); \
-            sageattn_gfx10::attn_kernel_gfx10_i8_v8_t<128, C, BNV, 128, HG, ODT> \
-                <<<g10, b10, 0, stream>>>( \
-                    reinterpret_cast<const int8_t*>(query.data_ptr()), \
-                    reinterpret_cast<const int8_t*>(key.data_ptr()), \
-                    reinterpret_cast<const __half*>(value.data_ptr()), \
-                    reinterpret_cast<ODT*>(output.data_ptr()), \
-                    reinterpret_cast<const float*>(q_scale.data_ptr()), \
-                    reinterpret_cast<const float*>(k_scale.data_ptr()), \
-                    batch, qo_len, kv_len, q_heads, kv_heads, \
-                    q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
-                    k_stride_b, k_stride_n, k_stride_h, \
-                    v_stride_b, v_stride_n, v_stride_h, \
-                    o_stride_b, o_stride_n, o_stride_h, \
-                    qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
-                    static_cast<int>(tensor_layout), diag, (VN), nullptr, 0, 0); \
-        } while (0)
-
-    #define L10_V8PBM_64(C, BNV, ODT, HG, VN) \
-        do { \
-            dim3 b10(64); \
-            dim3 g10((qo_len + 63) / 64, (q_heads + HG - 1) / HG, batch); \
-            sageattn_gfx10::attn_kernel_gfx10_i8_v8_t<128, C, BNV, 64, HG, ODT> \
-                <<<g10, b10, 0, stream>>>( \
-                    reinterpret_cast<const int8_t*>(query.data_ptr()), \
-                    reinterpret_cast<const int8_t*>(key.data_ptr()), \
-                    reinterpret_cast<const __half*>(value.data_ptr()), \
-                    reinterpret_cast<ODT*>(output.data_ptr()), \
-                    reinterpret_cast<const float*>(q_scale.data_ptr()), \
-                    reinterpret_cast<const float*>(k_scale.data_ptr()), \
-                    batch, qo_len, kv_len, q_heads, kv_heads, \
-                    q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
-                    k_stride_b, k_stride_n, k_stride_h, \
-                    v_stride_b, v_stride_n, v_stride_h, \
-                    o_stride_b, o_stride_n, o_stride_h, \
-                    qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
-                    static_cast<int>(tensor_layout), diag, (VN), nullptr, 0, 0); \
-        } while (0)
-
-    // ----------------------------------------------------------------
-    // L10_V10F_64 / L10_V10F_128: v10 with HD and BN hardcoded to a single
-    //   value per macro. D64 supports BN=32 (default); D128 supports BN=16
-    //   (default) and BN=32. Use separate macros for each BN.
-    //   BM=128, TM are still runtime (TM is the 6th template arg, must be constexpr).
-    //   v10_tm comes from env so we split on the known values 2, 4, 8.
-    // ----------------------------------------------------------------
-    #define L10_V10F_64_BN32_TM2(C, ODT) \
+    #define LAUNCH_TILED_PV_64_BN32_TM2(C, ODT) \
         do { \
             dim3 b10(128); dim3 g10((qo_len + 127) / 128, q_heads, batch); \
-            sageattn_gfx10::attn_kernel_gfx10_i10_t<64, C, 32, 128, ODT, 2> \
+            sageattn_gfx10::attn_kernel_i8q_f16pv_tiled_pv<64, C, 32, 128, ODT, 2> \
                 <<<g10, b10, 0, stream>>>( \
                     reinterpret_cast<const int8_t*>(query.data_ptr()), \
                     reinterpret_cast<const int8_t*>(key.data_ptr()), \
@@ -620,18 +480,17 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                     reinterpret_cast<const float*>(q_scale.data_ptr()), \
                     reinterpret_cast<const float*>(k_scale.data_ptr()), \
                     batch, qo_len, kv_len, q_heads, kv_heads, \
-                    q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                    q_stride_b, q_stride_n, q_stride_h, \
                     k_stride_b, k_stride_n, k_stride_h, \
                     v_stride_b, v_stride_n, v_stride_h, \
                     o_stride_b, o_stride_n, o_stride_h, \
                     qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
-                    static_cast<int>(tensor_layout), diag, 1, \
-                    nullptr, 0, 0, nullptr, 0, 0.0f); \
+                    0, nullptr, 0, 0.0f); \
         } while (0)
-    #define L10_V10F_64_BN32_TM4(C, ODT) \
+    #define LAUNCH_TILED_PV_64_BN32_TM4(C, ODT) \
         do { \
             dim3 b10(128); dim3 g10((qo_len + 127) / 128, q_heads, batch); \
-            sageattn_gfx10::attn_kernel_gfx10_i10_t<64, C, 32, 128, ODT, 4> \
+            sageattn_gfx10::attn_kernel_i8q_f16pv_tiled_pv<64, C, 32, 128, ODT, 4> \
                 <<<g10, b10, 0, stream>>>( \
                     reinterpret_cast<const int8_t*>(query.data_ptr()), \
                     reinterpret_cast<const int8_t*>(key.data_ptr()), \
@@ -640,18 +499,17 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                     reinterpret_cast<const float*>(q_scale.data_ptr()), \
                     reinterpret_cast<const float*>(k_scale.data_ptr()), \
                     batch, qo_len, kv_len, q_heads, kv_heads, \
-                    q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                    q_stride_b, q_stride_n, q_stride_h, \
                     k_stride_b, k_stride_n, k_stride_h, \
                     v_stride_b, v_stride_n, v_stride_h, \
                     o_stride_b, o_stride_n, o_stride_h, \
                     qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
-                    static_cast<int>(tensor_layout), diag, 1, \
-                    nullptr, 0, 0, nullptr, 0, 0.0f); \
+                    0, nullptr, 0, 0.0f); \
         } while (0)
-    #define L10_V10F_64_BN32_TM8(C, ODT) \
+    #define LAUNCH_TILED_PV_64_BN32_TM8(C, ODT) \
         do { \
             dim3 b10(128); dim3 g10((qo_len + 127) / 128, q_heads, batch); \
-            sageattn_gfx10::attn_kernel_gfx10_i10_t<64, C, 32, 128, ODT, 8> \
+            sageattn_gfx10::attn_kernel_i8q_f16pv_tiled_pv<64, C, 32, 128, ODT, 8> \
                 <<<g10, b10, 0, stream>>>( \
                     reinterpret_cast<const int8_t*>(query.data_ptr()), \
                     reinterpret_cast<const int8_t*>(key.data_ptr()), \
@@ -660,18 +518,17 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                     reinterpret_cast<const float*>(q_scale.data_ptr()), \
                     reinterpret_cast<const float*>(k_scale.data_ptr()), \
                     batch, qo_len, kv_len, q_heads, kv_heads, \
-                    q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                    q_stride_b, q_stride_n, q_stride_h, \
                     k_stride_b, k_stride_n, k_stride_h, \
                     v_stride_b, v_stride_n, v_stride_h, \
                     o_stride_b, o_stride_n, o_stride_h, \
                     qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
-                    static_cast<int>(tensor_layout), diag, 1, \
-                    nullptr, 0, 0, nullptr, 0, 0.0f); \
+                    0, nullptr, 0, 0.0f); \
         } while (0)
-    #define L10_V10F_128_BN16_TM2(C, ODT) \
+    #define LAUNCH_TILED_PV_128_BN16_TM2(C, ODT) \
         do { \
             dim3 b10(128); dim3 g10((qo_len + 127) / 128, q_heads, batch); \
-            sageattn_gfx10::attn_kernel_gfx10_i10_t<128, C, 16, 128, ODT, 2> \
+            sageattn_gfx10::attn_kernel_i8q_f16pv_tiled_pv<128, C, 16, 128, ODT, 2> \
                 <<<g10, b10, 0, stream>>>( \
                     reinterpret_cast<const int8_t*>(query.data_ptr()), \
                     reinterpret_cast<const int8_t*>(key.data_ptr()), \
@@ -680,18 +537,17 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                     reinterpret_cast<const float*>(q_scale.data_ptr()), \
                     reinterpret_cast<const float*>(k_scale.data_ptr()), \
                     batch, qo_len, kv_len, q_heads, kv_heads, \
-                    q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                    q_stride_b, q_stride_n, q_stride_h, \
                     k_stride_b, k_stride_n, k_stride_h, \
                     v_stride_b, v_stride_n, v_stride_h, \
                     o_stride_b, o_stride_n, o_stride_h, \
                     qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
-                    static_cast<int>(tensor_layout), diag, 1, \
-                    nullptr, 0, 0, nullptr, 0, 0.0f); \
+                    0, nullptr, 0, 0.0f); \
         } while (0)
-    #define L10_V10F_128_BN16_TM4(C, ODT) \
+    #define LAUNCH_TILED_PV_128_BN16_TM4(C, ODT) \
         do { \
             dim3 b10(128); dim3 g10((qo_len + 127) / 128, q_heads, batch); \
-            sageattn_gfx10::attn_kernel_gfx10_i10_t<128, C, 16, 128, ODT, 4> \
+            sageattn_gfx10::attn_kernel_i8q_f16pv_tiled_pv<128, C, 16, 128, ODT, 4> \
                 <<<g10, b10, 0, stream>>>( \
                     reinterpret_cast<const int8_t*>(query.data_ptr()), \
                     reinterpret_cast<const int8_t*>(key.data_ptr()), \
@@ -700,18 +556,17 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                     reinterpret_cast<const float*>(q_scale.data_ptr()), \
                     reinterpret_cast<const float*>(k_scale.data_ptr()), \
                     batch, qo_len, kv_len, q_heads, kv_heads, \
-                    q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                    q_stride_b, q_stride_n, q_stride_h, \
                     k_stride_b, k_stride_n, k_stride_h, \
                     v_stride_b, v_stride_n, v_stride_h, \
                     o_stride_b, o_stride_n, o_stride_h, \
                     qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
-                    static_cast<int>(tensor_layout), diag, 1, \
-                    nullptr, 0, 0, nullptr, 0, 0.0f); \
+                    0, nullptr, 0, 0.0f); \
         } while (0)
-    #define L10_V10F_128_BN16_TM8(C, ODT) \
+    #define LAUNCH_TILED_PV_128_BN16_TM8(C, ODT) \
         do { \
             dim3 b10(128); dim3 g10((qo_len + 127) / 128, q_heads, batch); \
-            sageattn_gfx10::attn_kernel_gfx10_i10_t<128, C, 16, 128, ODT, 8> \
+            sageattn_gfx10::attn_kernel_i8q_f16pv_tiled_pv<128, C, 16, 128, ODT, 8> \
                 <<<g10, b10, 0, stream>>>( \
                     reinterpret_cast<const int8_t*>(query.data_ptr()), \
                     reinterpret_cast<const int8_t*>(key.data_ptr()), \
@@ -720,18 +575,17 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                     reinterpret_cast<const float*>(q_scale.data_ptr()), \
                     reinterpret_cast<const float*>(k_scale.data_ptr()), \
                     batch, qo_len, kv_len, q_heads, kv_heads, \
-                    q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                    q_stride_b, q_stride_n, q_stride_h, \
                     k_stride_b, k_stride_n, k_stride_h, \
                     v_stride_b, v_stride_n, v_stride_h, \
                     o_stride_b, o_stride_n, o_stride_h, \
                     qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
-                    static_cast<int>(tensor_layout), diag, 1, \
-                    nullptr, 0, 0, nullptr, 0, 0.0f); \
+                    0, nullptr, 0, 0.0f); \
         } while (0)
-    #define L10_V10F_128_BN32_TM2(C, ODT) \
+    #define LAUNCH_TILED_PV_128_BN32_TM2(C, ODT) \
         do { \
             dim3 b10(128); dim3 g10((qo_len + 127) / 128, q_heads, batch); \
-            sageattn_gfx10::attn_kernel_gfx10_i10_t<128, C, 32, 128, ODT, 2> \
+            sageattn_gfx10::attn_kernel_i8q_f16pv_tiled_pv<128, C, 32, 128, ODT, 2> \
                 <<<g10, b10, 0, stream>>>( \
                     reinterpret_cast<const int8_t*>(query.data_ptr()), \
                     reinterpret_cast<const int8_t*>(key.data_ptr()), \
@@ -740,18 +594,17 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                     reinterpret_cast<const float*>(q_scale.data_ptr()), \
                     reinterpret_cast<const float*>(k_scale.data_ptr()), \
                     batch, qo_len, kv_len, q_heads, kv_heads, \
-                    q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                    q_stride_b, q_stride_n, q_stride_h, \
                     k_stride_b, k_stride_n, k_stride_h, \
                     v_stride_b, v_stride_n, v_stride_h, \
                     o_stride_b, o_stride_n, o_stride_h, \
                     qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
-                    static_cast<int>(tensor_layout), diag, 1, \
-                    nullptr, 0, 0, nullptr, 0, 0.0f); \
+                    0, nullptr, 0, 0.0f); \
         } while (0)
-    #define L10_V10F_128_BN32_TM4(C, ODT) \
+    #define LAUNCH_TILED_PV_128_BN32_TM4(C, ODT) \
         do { \
             dim3 b10(128); dim3 g10((qo_len + 127) / 128, q_heads, batch); \
-            sageattn_gfx10::attn_kernel_gfx10_i10_t<128, C, 32, 128, ODT, 4> \
+            sageattn_gfx10::attn_kernel_i8q_f16pv_tiled_pv<128, C, 32, 128, ODT, 4> \
                 <<<g10, b10, 0, stream>>>( \
                     reinterpret_cast<const int8_t*>(query.data_ptr()), \
                     reinterpret_cast<const int8_t*>(key.data_ptr()), \
@@ -760,18 +613,17 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                     reinterpret_cast<const float*>(q_scale.data_ptr()), \
                     reinterpret_cast<const float*>(k_scale.data_ptr()), \
                     batch, qo_len, kv_len, q_heads, kv_heads, \
-                    q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                    q_stride_b, q_stride_n, q_stride_h, \
                     k_stride_b, k_stride_n, k_stride_h, \
                     v_stride_b, v_stride_n, v_stride_h, \
                     o_stride_b, o_stride_n, o_stride_h, \
                     qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
-                    static_cast<int>(tensor_layout), diag, 1, \
-                    nullptr, 0, 0, nullptr, 0, 0.0f); \
+                    0, nullptr, 0, 0.0f); \
         } while (0)
-    #define L10_V10F_128_BN32_TM8(C, ODT) \
+    #define LAUNCH_TILED_PV_128_BN32_TM8(C, ODT) \
         do { \
             dim3 b10(128); dim3 g10((qo_len + 127) / 128, q_heads, batch); \
-            sageattn_gfx10::attn_kernel_gfx10_i10_t<128, C, 32, 128, ODT, 8> \
+            sageattn_gfx10::attn_kernel_i8q_f16pv_tiled_pv<128, C, 32, 128, ODT, 8> \
                 <<<g10, b10, 0, stream>>>( \
                     reinterpret_cast<const int8_t*>(query.data_ptr()), \
                     reinterpret_cast<const int8_t*>(key.data_ptr()), \
@@ -780,20 +632,18 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                     reinterpret_cast<const float*>(q_scale.data_ptr()), \
                     reinterpret_cast<const float*>(k_scale.data_ptr()), \
                     batch, qo_len, kv_len, q_heads, kv_heads, \
-                    q_stride_b, q_stride_n, q_stride_h, q_stride_n, \
+                    q_stride_b, q_stride_n, q_stride_h, \
                     k_stride_b, k_stride_n, k_stride_h, \
                     v_stride_b, v_stride_n, v_stride_h, \
                     o_stride_b, o_stride_n, o_stride_h, \
                     qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
-                    static_cast<int>(tensor_layout), diag, 1, \
-                    nullptr, 0, 0, nullptr, 0, 0.0f); \
+                    0, nullptr, 0, 0.0f); \
         } while (0)
 
-    // INQ variants (uses q_fp, q_src_bf16, sm_scale_log2e)
-    #define L10_V10INQF_64_BN32_TM2(ODT) \
+    #define LAUNCH_TILED_PV_INQ_64_BN32_TM2(ODT) \
         do { \
             dim3 b10(128); dim3 g10((qo_len + 127) / 128, q_heads, batch); \
-            sageattn_gfx10::attn_kernel_gfx10_i10_t<64, false, 32, 128, ODT, 2, false, true> \
+            sageattn_gfx10::attn_kernel_i8q_f16pv_tiled_pv<64, false, 32, 128, ODT, 2, true> \
                 <<<g10, b10, 0, stream>>>( \
                     reinterpret_cast<const int8_t*>(query.data_ptr()), \
                     reinterpret_cast<const int8_t*>(key.data_ptr()), \
@@ -802,19 +652,17 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                     reinterpret_cast<const float*>(q_scale.data_ptr()), \
                     reinterpret_cast<const float*>(k_scale.data_ptr()), \
                     batch, qo_len, kv_len, q_heads, kv_heads, \
-                    qi_stride_b, qi_stride_n, qi_stride_h, q_stride_n, \
+                    qi_stride_b, qi_stride_n, qi_stride_h, \
                     k_stride_b, k_stride_n, k_stride_h, \
                     v_stride_b, v_stride_n, v_stride_h, \
                     o_stride_b, o_stride_n, o_stride_h, \
                     qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
-                    static_cast<int>(tensor_layout), diag, 1, \
-                    nullptr, 0, 0, \
-                    reinterpret_cast<const void*>(q_fp.data_ptr()), q_fp_bf16, v10_sms); \
+                    0, reinterpret_cast<const void*>(q_fp.data_ptr()), q_fp_bf16, v10_sms); \
         } while (0)
-    #define L10_V10INQF_64_BN32_TM4(ODT) \
+    #define LAUNCH_TILED_PV_INQ_64_BN32_TM4(ODT) \
         do { \
             dim3 b10(128); dim3 g10((qo_len + 127) / 128, q_heads, batch); \
-            sageattn_gfx10::attn_kernel_gfx10_i10_t<64, false, 32, 128, ODT, 4, false, true> \
+            sageattn_gfx10::attn_kernel_i8q_f16pv_tiled_pv<64, false, 32, 128, ODT, 4, true> \
                 <<<g10, b10, 0, stream>>>( \
                     reinterpret_cast<const int8_t*>(query.data_ptr()), \
                     reinterpret_cast<const int8_t*>(key.data_ptr()), \
@@ -823,19 +671,17 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                     reinterpret_cast<const float*>(q_scale.data_ptr()), \
                     reinterpret_cast<const float*>(k_scale.data_ptr()), \
                     batch, qo_len, kv_len, q_heads, kv_heads, \
-                    qi_stride_b, qi_stride_n, qi_stride_h, q_stride_n, \
+                    qi_stride_b, qi_stride_n, qi_stride_h, \
                     k_stride_b, k_stride_n, k_stride_h, \
                     v_stride_b, v_stride_n, v_stride_h, \
                     o_stride_b, o_stride_n, o_stride_h, \
                     qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
-                    static_cast<int>(tensor_layout), diag, 1, \
-                    nullptr, 0, 0, \
-                    reinterpret_cast<const void*>(q_fp.data_ptr()), q_fp_bf16, v10_sms); \
+                    0, reinterpret_cast<const void*>(q_fp.data_ptr()), q_fp_bf16, v10_sms); \
         } while (0)
-    #define L10_V10INQF_64_BN32_TM8(ODT) \
+    #define LAUNCH_TILED_PV_INQ_64_BN32_TM8(ODT) \
         do { \
             dim3 b10(128); dim3 g10((qo_len + 127) / 128, q_heads, batch); \
-            sageattn_gfx10::attn_kernel_gfx10_i10_t<64, false, 32, 128, ODT, 8, false, true> \
+            sageattn_gfx10::attn_kernel_i8q_f16pv_tiled_pv<64, false, 32, 128, ODT, 8, true> \
                 <<<g10, b10, 0, stream>>>( \
                     reinterpret_cast<const int8_t*>(query.data_ptr()), \
                     reinterpret_cast<const int8_t*>(key.data_ptr()), \
@@ -844,19 +690,17 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                     reinterpret_cast<const float*>(q_scale.data_ptr()), \
                     reinterpret_cast<const float*>(k_scale.data_ptr()), \
                     batch, qo_len, kv_len, q_heads, kv_heads, \
-                    qi_stride_b, qi_stride_n, qi_stride_h, q_stride_n, \
+                    qi_stride_b, qi_stride_n, qi_stride_h, \
                     k_stride_b, k_stride_n, k_stride_h, \
                     v_stride_b, v_stride_n, v_stride_h, \
                     o_stride_b, o_stride_n, o_stride_h, \
                     qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
-                    static_cast<int>(tensor_layout), diag, 1, \
-                    nullptr, 0, 0, \
-                    reinterpret_cast<const void*>(q_fp.data_ptr()), q_fp_bf16, v10_sms); \
+                    0, reinterpret_cast<const void*>(q_fp.data_ptr()), q_fp_bf16, v10_sms); \
         } while (0)
-    #define L10_V10INQF_128_BN16_TM2(ODT) \
+    #define LAUNCH_TILED_PV_INQ_128_BN16_TM2(ODT) \
         do { \
             dim3 b10(128); dim3 g10((qo_len + 127) / 128, q_heads, batch); \
-            sageattn_gfx10::attn_kernel_gfx10_i10_t<128, false, 16, 128, ODT, 2, false, true> \
+            sageattn_gfx10::attn_kernel_i8q_f16pv_tiled_pv<128, false, 16, 128, ODT, 2, true> \
                 <<<g10, b10, 0, stream>>>( \
                     reinterpret_cast<const int8_t*>(query.data_ptr()), \
                     reinterpret_cast<const int8_t*>(key.data_ptr()), \
@@ -865,19 +709,17 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                     reinterpret_cast<const float*>(q_scale.data_ptr()), \
                     reinterpret_cast<const float*>(k_scale.data_ptr()), \
                     batch, qo_len, kv_len, q_heads, kv_heads, \
-                    qi_stride_b, qi_stride_n, qi_stride_h, q_stride_n, \
+                    qi_stride_b, qi_stride_n, qi_stride_h, \
                     k_stride_b, k_stride_n, k_stride_h, \
                     v_stride_b, v_stride_n, v_stride_h, \
                     o_stride_b, o_stride_n, o_stride_h, \
                     qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
-                    static_cast<int>(tensor_layout), diag, 1, \
-                    nullptr, 0, 0, \
-                    reinterpret_cast<const void*>(q_fp.data_ptr()), q_fp_bf16, v10_sms); \
+                    0, reinterpret_cast<const void*>(q_fp.data_ptr()), q_fp_bf16, v10_sms); \
         } while (0)
-    #define L10_V10INQF_128_BN16_TM4(ODT) \
+    #define LAUNCH_TILED_PV_INQ_128_BN16_TM4(ODT) \
         do { \
             dim3 b10(128); dim3 g10((qo_len + 127) / 128, q_heads, batch); \
-            sageattn_gfx10::attn_kernel_gfx10_i10_t<128, false, 16, 128, ODT, 4, false, true> \
+            sageattn_gfx10::attn_kernel_i8q_f16pv_tiled_pv<128, false, 16, 128, ODT, 4, true> \
                 <<<g10, b10, 0, stream>>>( \
                     reinterpret_cast<const int8_t*>(query.data_ptr()), \
                     reinterpret_cast<const int8_t*>(key.data_ptr()), \
@@ -886,19 +728,17 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                     reinterpret_cast<const float*>(q_scale.data_ptr()), \
                     reinterpret_cast<const float*>(k_scale.data_ptr()), \
                     batch, qo_len, kv_len, q_heads, kv_heads, \
-                    qi_stride_b, qi_stride_n, qi_stride_h, q_stride_n, \
+                    qi_stride_b, qi_stride_n, qi_stride_h, \
                     k_stride_b, k_stride_n, k_stride_h, \
                     v_stride_b, v_stride_n, v_stride_h, \
                     o_stride_b, o_stride_n, o_stride_h, \
                     qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
-                    static_cast<int>(tensor_layout), diag, 1, \
-                    nullptr, 0, 0, \
-                    reinterpret_cast<const void*>(q_fp.data_ptr()), q_fp_bf16, v10_sms); \
+                    0, reinterpret_cast<const void*>(q_fp.data_ptr()), q_fp_bf16, v10_sms); \
         } while (0)
-    #define L10_V10INQF_128_BN16_TM8(ODT) \
+    #define LAUNCH_TILED_PV_INQ_128_BN16_TM8(ODT) \
         do { \
             dim3 b10(128); dim3 g10((qo_len + 127) / 128, q_heads, batch); \
-            sageattn_gfx10::attn_kernel_gfx10_i10_t<128, false, 16, 128, ODT, 8, false, true> \
+            sageattn_gfx10::attn_kernel_i8q_f16pv_tiled_pv<128, false, 16, 128, ODT, 8, true> \
                 <<<g10, b10, 0, stream>>>( \
                     reinterpret_cast<const int8_t*>(query.data_ptr()), \
                     reinterpret_cast<const int8_t*>(key.data_ptr()), \
@@ -907,19 +747,17 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                     reinterpret_cast<const float*>(q_scale.data_ptr()), \
                     reinterpret_cast<const float*>(k_scale.data_ptr()), \
                     batch, qo_len, kv_len, q_heads, kv_heads, \
-                    qi_stride_b, qi_stride_n, qi_stride_h, q_stride_n, \
+                    qi_stride_b, qi_stride_n, qi_stride_h, \
                     k_stride_b, k_stride_n, k_stride_h, \
                     v_stride_b, v_stride_n, v_stride_h, \
                     o_stride_b, o_stride_n, o_stride_h, \
                     qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
-                    static_cast<int>(tensor_layout), diag, 1, \
-                    nullptr, 0, 0, \
-                    reinterpret_cast<const void*>(q_fp.data_ptr()), q_fp_bf16, v10_sms); \
+                    0, reinterpret_cast<const void*>(q_fp.data_ptr()), q_fp_bf16, v10_sms); \
         } while (0)
-    #define L10_V10INQF_128_BN32_TM2(ODT) \
+    #define LAUNCH_TILED_PV_INQ_128_BN32_TM2(ODT) \
         do { \
             dim3 b10(128); dim3 g10((qo_len + 127) / 128, q_heads, batch); \
-            sageattn_gfx10::attn_kernel_gfx10_i10_t<128, false, 32, 128, ODT, 2, false, true> \
+            sageattn_gfx10::attn_kernel_i8q_f16pv_tiled_pv<128, false, 32, 128, ODT, 2, true> \
                 <<<g10, b10, 0, stream>>>( \
                     reinterpret_cast<const int8_t*>(query.data_ptr()), \
                     reinterpret_cast<const int8_t*>(key.data_ptr()), \
@@ -928,19 +766,17 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                     reinterpret_cast<const float*>(q_scale.data_ptr()), \
                     reinterpret_cast<const float*>(k_scale.data_ptr()), \
                     batch, qo_len, kv_len, q_heads, kv_heads, \
-                    qi_stride_b, qi_stride_n, qi_stride_h, q_stride_n, \
+                    qi_stride_b, qi_stride_n, qi_stride_h, \
                     k_stride_b, k_stride_n, k_stride_h, \
                     v_stride_b, v_stride_n, v_stride_h, \
                     o_stride_b, o_stride_n, o_stride_h, \
                     qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
-                    static_cast<int>(tensor_layout), diag, 1, \
-                    nullptr, 0, 0, \
-                    reinterpret_cast<const void*>(q_fp.data_ptr()), q_fp_bf16, v10_sms); \
+                    0, reinterpret_cast<const void*>(q_fp.data_ptr()), q_fp_bf16, v10_sms); \
         } while (0)
-    #define L10_V10INQF_128_BN32_TM4(ODT) \
+    #define LAUNCH_TILED_PV_INQ_128_BN32_TM4(ODT) \
         do { \
             dim3 b10(128); dim3 g10((qo_len + 127) / 128, q_heads, batch); \
-            sageattn_gfx10::attn_kernel_gfx10_i10_t<128, false, 32, 128, ODT, 4, false, true> \
+            sageattn_gfx10::attn_kernel_i8q_f16pv_tiled_pv<128, false, 32, 128, ODT, 4, true> \
                 <<<g10, b10, 0, stream>>>( \
                     reinterpret_cast<const int8_t*>(query.data_ptr()), \
                     reinterpret_cast<const int8_t*>(key.data_ptr()), \
@@ -949,19 +785,17 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                     reinterpret_cast<const float*>(q_scale.data_ptr()), \
                     reinterpret_cast<const float*>(k_scale.data_ptr()), \
                     batch, qo_len, kv_len, q_heads, kv_heads, \
-                    qi_stride_b, qi_stride_n, qi_stride_h, q_stride_n, \
+                    qi_stride_b, qi_stride_n, qi_stride_h, \
                     k_stride_b, k_stride_n, k_stride_h, \
                     v_stride_b, v_stride_n, v_stride_h, \
                     o_stride_b, o_stride_n, o_stride_h, \
                     qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
-                    static_cast<int>(tensor_layout), diag, 1, \
-                    nullptr, 0, 0, \
-                    reinterpret_cast<const void*>(q_fp.data_ptr()), q_fp_bf16, v10_sms); \
+                    0, reinterpret_cast<const void*>(q_fp.data_ptr()), q_fp_bf16, v10_sms); \
         } while (0)
-    #define L10_V10INQF_128_BN32_TM8(ODT) \
+    #define LAUNCH_TILED_PV_INQ_128_BN32_TM8(ODT) \
         do { \
             dim3 b10(128); dim3 g10((qo_len + 127) / 128, q_heads, batch); \
-            sageattn_gfx10::attn_kernel_gfx10_i10_t<128, false, 32, 128, ODT, 8, false, true> \
+            sageattn_gfx10::attn_kernel_i8q_f16pv_tiled_pv<128, false, 32, 128, ODT, 8, true> \
                 <<<g10, b10, 0, stream>>>( \
                     reinterpret_cast<const int8_t*>(query.data_ptr()), \
                     reinterpret_cast<const int8_t*>(key.data_ptr()), \
@@ -970,166 +804,123 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
                     reinterpret_cast<const float*>(q_scale.data_ptr()), \
                     reinterpret_cast<const float*>(k_scale.data_ptr()), \
                     batch, qo_len, kv_len, q_heads, kv_heads, \
-                    qi_stride_b, qi_stride_n, qi_stride_h, q_stride_n, \
+                    qi_stride_b, qi_stride_n, qi_stride_h, \
                     k_stride_b, k_stride_n, k_stride_h, \
                     v_stride_b, v_stride_n, v_stride_h, \
                     o_stride_b, o_stride_n, o_stride_h, \
                     qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
-                    static_cast<int>(tensor_layout), diag, 1, \
-                    nullptr, 0, 0, \
-                    reinterpret_cast<const void*>(q_fp.data_ptr()), q_fp_bf16, v10_sms); \
+                    0, reinterpret_cast<const void*>(q_fp.data_ptr()), q_fp_bf16, v10_sms); \
         } while (0)
 
-    if (v8_mode) {
-        // v8 fallback (SAGEATTN_GFX10_V8=1): row-per-thread int8-QK.
-        if (head_dim == 64) {
-            if (is_causal) {
-                if (out_bf) L10_V8P64(true,  32, __hip_bfloat16, 1, 1);
-                else        L10_V8P64(true,  32, __half,         1, 1);
+    if (head_dim == 64) {
+
+        const int tm = (v10_tm == 2) ? 2 : ((v10_tm == 4) ? 4 : 8);
+        if (is_causal) {
+            if (out_bf) {
+                if      (tm == 2) LAUNCH_TILED_PV_64_BN32_TM2(true, __hip_bfloat16);
+                else if (tm == 4) LAUNCH_TILED_PV_64_BN32_TM4(true, __hip_bfloat16);
+                else              LAUNCH_TILED_PV_64_BN32_TM8(true, __hip_bfloat16);
             } else {
-                if (out_bf) L10_V8P64(false, 32, __hip_bfloat16, 1, 1);
-                else        L10_V8P64(false, 32, __half,         1, 1);
+                if      (tm == 2) LAUNCH_TILED_PV_64_BN32_TM2(true, __half);
+                else if (tm == 4) LAUNCH_TILED_PV_64_BN32_TM4(true, __half);
+                else              LAUNCH_TILED_PV_64_BN32_TM8(true, __half);
             }
         } else {
-            // D128: BM=64 vs BM=128 dispatch (BM=256 not supported)
-            if (v10_bm == 64) {
-                if (is_causal) {
-                    if (out_bf) L10_V8PBM_64(true,  32, __hip_bfloat16, 1, 1);
-                    else        L10_V8PBM_64(true,  32, __half,         1, 1);
+            if (v10_inq_wanted) {
+                if (out_bf) {
+                    if      (tm == 2) LAUNCH_TILED_PV_INQ_64_BN32_TM2(__hip_bfloat16);
+                    else if (tm == 4) LAUNCH_TILED_PV_INQ_64_BN32_TM4(__hip_bfloat16);
+                    else              LAUNCH_TILED_PV_INQ_64_BN32_TM8(__hip_bfloat16);
                 } else {
-                    if (out_bf) L10_V8PBM_64(false, 32, __hip_bfloat16, 1, 1);
-                    else        L10_V8PBM_64(false, 32, __half,         1, 1);
+                    if      (tm == 2) LAUNCH_TILED_PV_INQ_64_BN32_TM2(__half);
+                    else if (tm == 4) LAUNCH_TILED_PV_INQ_64_BN32_TM4(__half);
+                    else              LAUNCH_TILED_PV_INQ_64_BN32_TM8(__half);
                 }
             } else {
-                if (is_causal) {
-                    if (out_bf) L10_V8PBM_128(true,  32, __hip_bfloat16, 1, 1);
-                    else        L10_V8PBM_128(true,  32, __half,         1, 1);
+                if (out_bf) {
+                    if      (tm == 2) LAUNCH_TILED_PV_64_BN32_TM2(false, __hip_bfloat16);
+                    else if (tm == 4) LAUNCH_TILED_PV_64_BN32_TM4(false, __hip_bfloat16);
+                    else              LAUNCH_TILED_PV_64_BN32_TM8(false, __hip_bfloat16);
                 } else {
-                    if (out_bf) L10_V8PBM_128(false, 32, __hip_bfloat16, 1, 1);
-                    else        L10_V8PBM_128(false, 32, __half,         1, 1);
+                    if      (tm == 2) LAUNCH_TILED_PV_64_BN32_TM2(false, __half);
+                    else if (tm == 4) LAUNCH_TILED_PV_64_BN32_TM4(false, __half);
+                    else              LAUNCH_TILED_PV_64_BN32_TM8(false, __half);
                 }
             }
         }
     } else {
-        // v10 (default). BN/TM dispatched via env-driven if/else. v10_tm
-        // constrained to {2,4,8} (other values fall through to closest).
-        // v10_bn: D64 default 32; D128 default 16 (32 also supported).
-        // v10_bm: hardcoded 128 here (env override of 256 not supported in
-        // the cleaned-up dispatch).
-        if (head_dim == 64) {
-            // D64: BN=32 only
-            const int bn = 32;
-            const int tm = (v10_tm == 2) ? 2 : ((v10_tm == 4) ? 4 : 8);
-            if (is_causal) {
-                if (out_bf) {
-                    if      (tm == 2) L10_V10F_64_BN32_TM2(true, __hip_bfloat16);
-                    else if (tm == 4) L10_V10F_64_BN32_TM4(true, __hip_bfloat16);
-                    else              L10_V10F_64_BN32_TM8(true, __hip_bfloat16);
-                } else {
-                    if      (tm == 2) L10_V10F_64_BN32_TM2(true, __half);
-                    else if (tm == 4) L10_V10F_64_BN32_TM4(true, __half);
-                    else              L10_V10F_64_BN32_TM8(true, __half);
-                }
+
+        const int bn = (v10_bn == 32) ? 32 : 16;
+        const int tm = (v10_tm == 2) ? 2 : ((v10_tm == 4) ? 4 : 8);
+        if (is_causal) {
+            if (out_bf) {
+                if      (bn == 32 && tm == 2) LAUNCH_TILED_PV_128_BN32_TM2(true, __hip_bfloat16);
+                else if (bn == 32 && tm == 4) LAUNCH_TILED_PV_128_BN32_TM4(true, __hip_bfloat16);
+                else if (bn == 32 && tm == 8) LAUNCH_TILED_PV_128_BN32_TM8(true, __hip_bfloat16);
+                else if (bn == 16 && tm == 2) LAUNCH_TILED_PV_128_BN16_TM2(true, __hip_bfloat16);
+                else if (bn == 16 && tm == 4) LAUNCH_TILED_PV_128_BN16_TM4(true, __hip_bfloat16);
+                else                          LAUNCH_TILED_PV_128_BN16_TM8(true, __hip_bfloat16);
             } else {
-                if (v10_inq_wanted) {
-                    if (out_bf) {
-                        if      (tm == 2) L10_V10INQF_64_BN32_TM2(__hip_bfloat16);
-                        else if (tm == 4) L10_V10INQF_64_BN32_TM4(__hip_bfloat16);
-                        else              L10_V10INQF_64_BN32_TM8(__hip_bfloat16);
-                    } else {
-                        if      (tm == 2) L10_V10INQF_64_BN32_TM2(__half);
-                        else if (tm == 4) L10_V10INQF_64_BN32_TM4(__half);
-                        else              L10_V10INQF_64_BN32_TM8(__half);
-                    }
-                } else {
-                    if (out_bf) {
-                        if      (tm == 2) L10_V10F_64_BN32_TM2(false, __hip_bfloat16);
-                        else if (tm == 4) L10_V10F_64_BN32_TM4(false, __hip_bfloat16);
-                        else              L10_V10F_64_BN32_TM8(false, __hip_bfloat16);
-                    } else {
-                        if      (tm == 2) L10_V10F_64_BN32_TM2(false, __half);
-                        else if (tm == 4) L10_V10F_64_BN32_TM4(false, __half);
-                        else              L10_V10F_64_BN32_TM8(false, __half);
-                    }
-                }
+                if      (bn == 32 && tm == 2) LAUNCH_TILED_PV_128_BN32_TM2(true, __half);
+                else if (bn == 32 && tm == 4) LAUNCH_TILED_PV_128_BN32_TM4(true, __half);
+                else if (bn == 32 && tm == 8) LAUNCH_TILED_PV_128_BN32_TM8(true, __half);
+                else if (bn == 16 && tm == 2) LAUNCH_TILED_PV_128_BN16_TM2(true, __half);
+                else if (bn == 16 && tm == 4) LAUNCH_TILED_PV_128_BN16_TM4(true, __half);
+                else                          LAUNCH_TILED_PV_128_BN16_TM8(true, __half);
             }
         } else {
-            // D128: BN={16,32} (env-driven), TM={2,4,8}
-            const int bn = (v10_bn == 32) ? 32 : 16;
-            const int tm = (v10_tm == 2) ? 2 : ((v10_tm == 4) ? 4 : 8);
-            if (is_causal) {
+            if (v10_inq_wanted) {
                 if (out_bf) {
-                    if      (bn == 32 && tm == 2) L10_V10F_128_BN32_TM2(true, __hip_bfloat16);
-                    else if (bn == 32 && tm == 4) L10_V10F_128_BN32_TM4(true, __hip_bfloat16);
-                    else if (bn == 32 && tm == 8) L10_V10F_128_BN32_TM8(true, __hip_bfloat16);
-                    else if (bn == 16 && tm == 2) L10_V10F_128_BN16_TM2(true, __hip_bfloat16);
-                    else if (bn == 16 && tm == 4) L10_V10F_128_BN16_TM4(true, __hip_bfloat16);
-                    else                          L10_V10F_128_BN16_TM8(true, __hip_bfloat16);
+                    if      (bn == 32 && tm == 2) LAUNCH_TILED_PV_INQ_128_BN32_TM2(__hip_bfloat16);
+                    else if (bn == 32 && tm == 4) LAUNCH_TILED_PV_INQ_128_BN32_TM4(__hip_bfloat16);
+                    else if (bn == 32 && tm == 8) LAUNCH_TILED_PV_INQ_128_BN32_TM8(__hip_bfloat16);
+                    else if (bn == 16 && tm == 2) LAUNCH_TILED_PV_INQ_128_BN16_TM2(__hip_bfloat16);
+                    else if (bn == 16 && tm == 4) LAUNCH_TILED_PV_INQ_128_BN16_TM4(__hip_bfloat16);
+                    else                          LAUNCH_TILED_PV_INQ_128_BN16_TM8(__hip_bfloat16);
                 } else {
-                    if      (bn == 32 && tm == 2) L10_V10F_128_BN32_TM2(true, __half);
-                    else if (bn == 32 && tm == 4) L10_V10F_128_BN32_TM4(true, __half);
-                    else if (bn == 32 && tm == 8) L10_V10F_128_BN32_TM8(true, __half);
-                    else if (bn == 16 && tm == 2) L10_V10F_128_BN16_TM2(true, __half);
-                    else if (bn == 16 && tm == 4) L10_V10F_128_BN16_TM4(true, __half);
-                    else                          L10_V10F_128_BN16_TM8(true, __half);
+                    if      (bn == 32 && tm == 2) LAUNCH_TILED_PV_INQ_128_BN32_TM2(__half);
+                    else if (bn == 32 && tm == 4) LAUNCH_TILED_PV_INQ_128_BN32_TM4(__half);
+                    else if (bn == 32 && tm == 8) LAUNCH_TILED_PV_INQ_128_BN32_TM8(__half);
+                    else if (bn == 16 && tm == 2) LAUNCH_TILED_PV_INQ_128_BN16_TM2(__half);
+                    else if (bn == 16 && tm == 4) LAUNCH_TILED_PV_INQ_128_BN16_TM4(__half);
+                    else                          LAUNCH_TILED_PV_INQ_128_BN16_TM8(__half);
                 }
             } else {
-                if (v10_inq_wanted) {
-                    if (out_bf) {
-                        if      (bn == 32 && tm == 2) L10_V10INQF_128_BN32_TM2(__hip_bfloat16);
-                        else if (bn == 32 && tm == 4) L10_V10INQF_128_BN32_TM4(__hip_bfloat16);
-                        else if (bn == 32 && tm == 8) L10_V10INQF_128_BN32_TM8(__hip_bfloat16);
-                        else if (bn == 16 && tm == 2) L10_V10INQF_128_BN16_TM2(__hip_bfloat16);
-                        else if (bn == 16 && tm == 4) L10_V10INQF_128_BN16_TM4(__hip_bfloat16);
-                        else                          L10_V10INQF_128_BN16_TM8(__hip_bfloat16);
-                    } else {
-                        if      (bn == 32 && tm == 2) L10_V10INQF_128_BN32_TM2(__half);
-                        else if (bn == 32 && tm == 4) L10_V10INQF_128_BN32_TM4(__half);
-                        else if (bn == 32 && tm == 8) L10_V10INQF_128_BN32_TM8(__half);
-                        else if (bn == 16 && tm == 2) L10_V10INQF_128_BN16_TM2(__half);
-                        else if (bn == 16 && tm == 4) L10_V10INQF_128_BN16_TM4(__half);
-                        else                          L10_V10INQF_128_BN16_TM8(__half);
-                    }
+                if (out_bf) {
+                    if      (bn == 32 && tm == 2) LAUNCH_TILED_PV_128_BN32_TM2(false, __hip_bfloat16);
+                    else if (bn == 32 && tm == 4) LAUNCH_TILED_PV_128_BN32_TM4(false, __hip_bfloat16);
+                    else if (bn == 32 && tm == 8) LAUNCH_TILED_PV_128_BN32_TM8(false, __hip_bfloat16);
+                    else if (bn == 16 && tm == 2) LAUNCH_TILED_PV_128_BN16_TM2(false, __hip_bfloat16);
+                    else if (bn == 16 && tm == 4) LAUNCH_TILED_PV_128_BN16_TM4(false, __hip_bfloat16);
+                    else                          LAUNCH_TILED_PV_128_BN16_TM8(false, __hip_bfloat16);
                 } else {
-                    if (out_bf) {
-                        if      (bn == 32 && tm == 2) L10_V10F_128_BN32_TM2(false, __hip_bfloat16);
-                        else if (bn == 32 && tm == 4) L10_V10F_128_BN32_TM4(false, __hip_bfloat16);
-                        else if (bn == 32 && tm == 8) L10_V10F_128_BN32_TM8(false, __hip_bfloat16);
-                        else if (bn == 16 && tm == 2) L10_V10F_128_BN16_TM2(false, __hip_bfloat16);
-                        else if (bn == 16 && tm == 4) L10_V10F_128_BN16_TM4(false, __hip_bfloat16);
-                        else                          L10_V10F_128_BN16_TM8(false, __hip_bfloat16);
-                    } else {
-                        if      (bn == 32 && tm == 2) L10_V10F_128_BN32_TM2(false, __half);
-                        else if (bn == 32 && tm == 4) L10_V10F_128_BN32_TM4(false, __half);
-                        else if (bn == 32 && tm == 8) L10_V10F_128_BN32_TM8(false, __half);
-                        else if (bn == 16 && tm == 2) L10_V10F_128_BN16_TM2(false, __half);
-                        else if (bn == 16 && tm == 4) L10_V10F_128_BN16_TM4(false, __half);
-                        else                          L10_V10F_128_BN16_TM8(false, __half);
-                    }
+                    if      (bn == 32 && tm == 2) LAUNCH_TILED_PV_128_BN32_TM2(false, __half);
+                    else if (bn == 32 && tm == 4) LAUNCH_TILED_PV_128_BN32_TM4(false, __half);
+                    else if (bn == 32 && tm == 8) LAUNCH_TILED_PV_128_BN32_TM8(false, __half);
+                    else if (bn == 16 && tm == 2) LAUNCH_TILED_PV_128_BN16_TM2(false, __half);
+                    else if (bn == 16 && tm == 4) LAUNCH_TILED_PV_128_BN16_TM4(false, __half);
+                    else                          LAUNCH_TILED_PV_128_BN16_TM8(false, __half);
                 }
             }
         }
     }
-    #undef L10_V8P64
-    #undef L10_V8PBM_64
-    #undef L10_V8PBM_128
-    #undef L10_V10F_64_BN32_TM2
-    #undef L10_V10F_64_BN32_TM4
-    #undef L10_V10F_64_BN32_TM8
-    #undef L10_V10F_128_BN16_TM2
-    #undef L10_V10F_128_BN16_TM4
-    #undef L10_V10F_128_BN16_TM8
-    #undef L10_V10F_128_BN32_TM2
-    #undef L10_V10F_128_BN32_TM4
-    #undef L10_V10F_128_BN32_TM8
-    #undef L10_V10INQF_64_BN32_TM2
-    #undef L10_V10INQF_64_BN32_TM4
-    #undef L10_V10INQF_64_BN32_TM8
-    #undef L10_V10INQF_128_BN16_TM2
-    #undef L10_V10INQF_128_BN16_TM4
-    #undef L10_V10INQF_128_BN16_TM8
-    #undef L10_V10INQF_128_BN32_TM2
-    #undef L10_V10INQF_128_BN32_TM4
-    #undef L10_V10INQF_128_BN32_TM8
+    #undef LAUNCH_TILED_PV_64_BN32_TM2
+    #undef LAUNCH_TILED_PV_64_BN32_TM4
+    #undef LAUNCH_TILED_PV_64_BN32_TM8
+    #undef LAUNCH_TILED_PV_128_BN16_TM2
+    #undef LAUNCH_TILED_PV_128_BN16_TM4
+    #undef LAUNCH_TILED_PV_128_BN16_TM8
+    #undef LAUNCH_TILED_PV_128_BN32_TM2
+    #undef LAUNCH_TILED_PV_128_BN32_TM4
+    #undef LAUNCH_TILED_PV_128_BN32_TM8
+    #undef LAUNCH_TILED_PV_INQ_64_BN32_TM2
+    #undef LAUNCH_TILED_PV_INQ_64_BN32_TM4
+    #undef LAUNCH_TILED_PV_INQ_64_BN32_TM8
+    #undef LAUNCH_TILED_PV_INQ_128_BN16_TM2
+    #undef LAUNCH_TILED_PV_INQ_128_BN16_TM4
+    #undef LAUNCH_TILED_PV_INQ_128_BN16_TM8
+    #undef LAUNCH_TILED_PV_INQ_128_BN32_TM2
+    #undef LAUNCH_TILED_PV_INQ_128_BN32_TM4
+    #undef LAUNCH_TILED_PV_INQ_128_BN32_TM8
     return output;
 }
