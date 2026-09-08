@@ -1,8 +1,13 @@
-"""SageAttention native HIP 内核测试 (gfx1035 / RDNA2 iGPU)。
+"""SageAttention native HIP 内核测试 (gfx1035 RDNA2 / gfx1103 RDNA3)。
 
-覆盖当前默认 dispatch 下的全部数值路径:
-  int8 v10 INQ        HND/NHD/short self/cross  -> TestBasic::test_short (kv<=1024)
+覆盖当前默认 dispatch 下的全部数值路径 (双架构):
+  gfx1035: 所有路径走 int8 (is_gfx103 → use_direct=False)
+  gfx1103: short kv 走 direct (fp16/bf16 WMMA), long kv 走 int8
+
+路径覆盖:
+  int8 v10 INQ        HND/NHD/short self/cross  -> TestBasic::test_hnd_short (kv<=1024)
   int8 v10 non-INQ    HND/NHD/bf16 self long    -> TestBasic::test_int8_long, TestMaxErr
+  direct fp16/bf16    HND/NHD/short self        -> TestBasic::test_hnd_short (gfx1103)
   int8 v10 causal     短序列 / 长序列 / q>kv     -> TestCausal
   (diagonal 早停)      NHD 布局                  -> TestCausal::test_nhd_causal
   GQA (kvh 映射)      非因果 / 因果               -> TestGQA
@@ -11,6 +16,32 @@
 
 """
 import os
+
+import torch as _torch
+
+def _detect_arch():
+    """Return 'gfx110x' (RDNA3) or 'gfx103x' (RDNA2) or None."""
+    try:
+        if not _torch.cuda.is_available():
+            return None
+        prop = _torch.cuda.get_device_properties(_torch.cuda.current_device())
+        name = getattr(prop, 'gcnArchName', None) or getattr(prop, 'name', '')
+        if isinstance(name, str) and name.startswith('gfx'):
+            if name.startswith('gfx11'):
+                return 'gfx110x'
+            if name.startswith('gfx103'):
+                return 'gfx103x'
+        mj = getattr(prop, 'major', None)
+        if mj == 11:
+            return 'gfx110x'
+        if mj == 10:
+            return 'gfx103x'
+    except Exception:
+        pass
+    return None
+
+GFX_ARCH = _detect_arch()
+IS_RDNA3 = GFX_ARCH == 'gfx110x'
 
 os.environ["SAGEATTN_BACKEND"] = "native"
 
@@ -110,8 +141,13 @@ class TestBasic:
     @pytest.mark.parametrize("head_dim", [64, 128])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_int8_long(self, sageattn, head_dim, dtype):
-        """kv>1024 self -> int8 v10 (非 INQ) 长序列路径。"""
-        b, h, seq_len = 1, 8, 2048
+        """kv>1024 self -> int8 v10 (非 INQ) 长序列路径。
+
+        gfx1103 direct threshold: D64 HND=2048, D128=2048;
+        使用 4096 确保 gfx1103 也走 int8 路径。
+        """
+        b, h = 1, 8
+        seq_len = 4096 if IS_RDNA3 else 2048
         q = torch.randn(b, h, seq_len, head_dim, dtype=dtype, device="cuda")
         k = torch.randn(b, h, seq_len, head_dim, dtype=dtype, device="cuda")
         v = torch.randn(b, h, seq_len, head_dim, dtype=dtype, device="cuda")
@@ -120,8 +156,13 @@ class TestBasic:
 
     @pytest.mark.parametrize("head_dim", [64, 128])
     def test_nhd_int8_long(self, sageattn, head_dim):
-        """NHD 长序列 (kv>1024) -> NHD 布局 + 非 INQ 主内核 + prepass。"""
-        b, h, seq_len = 1, 4, 2048
+        """NHD 长序列 (kv>1024) -> NHD 布局 + 非 INQ 主内核 + prepass。
+
+        gfx1103 direct threshold: D64 NHD=3072, D128=2048;
+        使用 4096 确保 gfx1103 也走 int8 路径。
+        """
+        b, h = 1, 4
+        seq_len = 4096 if IS_RDNA3 else 2048
         q = torch.randn(b, seq_len, h, head_dim, dtype=torch.float16, device="cuda")
         k = torch.randn(b, seq_len, h, head_dim, dtype=torch.float16, device="cuda")
         v = torch.randn(b, seq_len, h, head_dim, dtype=torch.float16, device="cuda")
@@ -289,8 +330,13 @@ class TestEdgeCases:
 
     @pytest.mark.parametrize("head_dim", [64, 128])
     def test_repeated_same_result(self, sageattn, head_dim):
-        """int8 内核重复运行逐位一致 (软max LDS 无竞态, softmax LDS 写读同波前有序)。"""
-        b, h, seq_len = 1, 4, 2048
+        """int8 内核重复运行逐位一致 (软max LDS 无竞态, softmax LDS 写读同波前有序)。
+
+        gfx1103 direct threshold: D64 HND=2048, D128=2048;
+        使用 4096 确保 gfx1103 也走 int8 路径。
+        """
+        b, h = 1, 4
+        seq_len = 4096 if IS_RDNA3 else 2048
         q = torch.randn(b, h, seq_len, head_dim, dtype=torch.float16, device="cuda")
         k = torch.randn(b, h, seq_len, head_dim, dtype=torch.float16, device="cuda")
         v = torch.randn(b, h, seq_len, head_dim, dtype=torch.float16, device="cuda")
@@ -307,14 +353,31 @@ class TestMaxErr:
     """
 
     # (name, b, h_q, h_kv, sq, d, dtype) — NHD 布局, self
-    CASES = [
-        ("D128_BF16_int8_2304", 1, 4, 4, 2304, 128, torch.bfloat16),
-        ("D128_FP16_int8_2304", 1, 4, 4, 2304, 128, torch.float16),
-        ("D64_BF16_int8_3072", 1, 4, 4, 3072, 64, torch.bfloat16),
-        ("D64_FP16_int8_3072", 1, 4, 4, 3072, 64, torch.float16),
-        ("D128_FP16_int8_1024", 1, 4, 4, 1024, 128, torch.float16),
-        ("D64_FP16_int8_2048", 1, 4, 4, 2048, 64, torch.float16),
-    ]
+    # gfx1103 direct threshold: D64 NHD=3072, D128=2048;
+    # D64/D128 kv<=threshold 会走 direct 而非 int8, 故 gfx1103 上用 kv=4096 确保 int8。
+    # D128 kv=2304 已 > 2048, 两个架构均走 int8。
+    def _build_cases():
+        base = [
+            ("D128_BF16_int8_2304", 1, 4, 4, 2304, 128, torch.bfloat16),
+            ("D128_FP16_int8_2304", 1, 4, 4, 2304, 128, torch.float16),
+        ]
+        if IS_RDNA3:
+            base += [
+                ("D64_BF16_int8_4096", 1, 4, 4, 4096, 64, torch.bfloat16),
+                ("D64_FP16_int8_4096", 1, 4, 4, 4096, 64, torch.float16),
+                ("D128_FP16_int8_4096", 1, 4, 4, 4096, 128, torch.float16),
+                ("D64_FP16_int8_4096b", 1, 4, 4, 4096, 64, torch.float16),
+            ]
+        else:
+            base += [
+                ("D64_BF16_int8_3072", 1, 4, 4, 3072, 64, torch.bfloat16),
+                ("D64_FP16_int8_3072", 1, 4, 4, 3072, 64, torch.float16),
+                ("D128_FP16_int8_1024", 1, 4, 4, 1024, 128, torch.float16),
+                ("D64_FP16_int8_2048", 1, 4, 4, 2048, 64, torch.float16),
+            ]
+        return base
+
+    CASES = _build_cases()
 
     @pytest.mark.parametrize("case_idx", range(len(CASES)))
     def test_maxerr(self, sageattn, case_idx):

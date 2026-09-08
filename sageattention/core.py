@@ -210,20 +210,38 @@ def sageattn(
                 layout_code, int(is_causal), sm_scale, bm_sel
             )
     else:
-        # int8 path. V is always native [B,H,N,D] (the v10 main kernel reads native
-        # V directly, no V_T transpose). NHD input V is exposed as a zero-copy
-        # HND view via as_strided (saves 0.12ms permute copy); HND is passed
-        # through unchanged. bf16 V is cast to fp16 once (kernel reads __half).
-        v_for_attn = v
-        if tensor_layout == "NHD":
-            v16 = v if v.dtype == torch.float16 else v.to(torch.float16)
-            if v16.is_contiguous():
-                b_, n_, h_, d_ = v16.shape
-                v_for_attn = v16.as_strided((b_, h_, n_, d_), (n_ * h_ * d_, d_, h_ * d_, 1))
+        # int8 path. RDNA2 (gfx103x v8/v10 main kernels) read native [B,H,N,D] V
+        # directly (no V_T transpose); NHD input V is exposed as a zero-copy HND
+        # view via as_strided. RDNA3 (gfx110x) main kernels are compiled with
+        # -DSAGEATTN_VT_GLOBAL=1 and read V_T [B,H,D,N] (padded n to 64), so for
+        # gfx1103 we must globally transpose V just like the direct path does.
+        v_native = is_gfx103  # gfx110x int8 kernels require V_T; gfx103x use native
+        if v_native:
+            v_for_attn = v
+            if tensor_layout == "NHD":
+                v16 = v if v.dtype == torch.float16 else v.to(torch.float16)
+                if v16.is_contiguous():
+                    b_, n_, h_, d_ = v16.shape
+                    v_for_attn = v16.as_strided((b_, h_, n_, d_), (n_ * h_ * d_, d_, h_ * d_, 1))
+                else:
+                    v_for_attn = v16.permute(0, 2, 1, 3).contiguous()
+            elif v.dtype != torch.float16:
+                v_for_attn = v.to(torch.float16)
+        else:
+            # gfx110x: global V transpose [B,H,D,N], n padded to 64-multiple
+            # (matches kernel's v_t_n stride; prevents 32B row-read OOB -> NaN).
+            if v.dtype != torch.float16:
+                v_for_attn16 = v.to(torch.float16)
             else:
-                v_for_attn = v16.permute(0, 2, 1, 3).contiguous()
-        elif v.dtype != torch.float16:
-            v_for_attn = v.to(torch.float16)
+                v_for_attn16 = v
+            kv_heads_n = k.size(1) if tensor_layout == "HND" else k.size(2)
+            padded_n = ((kv_len_actual + 63) // 64) * 64
+            v_t = torch.empty(
+                q.size(0), kv_heads_n, headdim, padded_n,
+                device=q.device, dtype=torch.float16
+            )
+            ops.v_transpose(v_for_attn16, v_t, layout_code)
+            v_for_attn = v_t
         o_int8 = o
 
         # smooth_k: K 减 mean 后再量化, 仅当 K 有显著非零 DC 偏置时有价值, 默认 False

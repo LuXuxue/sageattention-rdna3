@@ -2020,7 +2020,9 @@ Tensor mean_seq_gfx110x(Tensor input, int64_t tensor_layout) {
 
 std::vector<Tensor> quant_qk_int8_gfx110x(
     Tensor query, Tensor key, Tensor key_mean,
-    int64_t tensor_layout, double sm_scale) {
+    int64_t tensor_layout, double sm_scale, int64_t skip_q) {
+
+    (void)skip_q;
 
     const int64_t batch = query.size(0);
     const int64_t q_heads = (tensor_layout == kHND) ? query.size(1) : query.size(2);
@@ -2116,7 +2118,9 @@ std::vector<Tensor> quant_qk_int8_gfx110x(
 Tensor qk_int8_sv_bf16_attn_gfx110x_t(
     Tensor query, Tensor key, Tensor value, Tensor output,
     Tensor q_scale, Tensor k_scale,
-    int64_t tensor_layout, int64_t is_causal, double sm_scale) {
+    int64_t tensor_layout, int64_t is_causal, double sm_scale, Tensor q_fp) {
+
+    (void)q_fp;
 
     const int64_t batch = query.size(0);
     const int64_t q_heads = query.size(1);
