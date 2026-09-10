@@ -2658,6 +2658,12 @@ Tensor qk_int8_sv_bf16_attn_gfx110x_t(
                                 if (d64_bm == 64) { LAUNCH_ATTN_T32_WPE4(64, false, 64, 32, VT, OT); } \
                                 else { LAUNCH_ATTN_T32_WPE4(64, false, 128, 32, VT, OT); } \
                             } \
+                        } else if (d64_bm == 64) { \
+                            /* BM=64 的 wpe1 实例 (2 warps): 仅支持 BN=32。 \
+                               历史 bug: 此前 wpe1 分支忽略 d64_bm, grid/block 按 64 而 \
+                               kernel 模板恒 BM=128 -> 奇数 64 行块整段不写 (NaN/垃圾)。 */ \
+                            if (is_causal) { LAUNCH_ATTN_T32_WPE1(64, true, 64, 32, VT, OT); } \
+                            else { LAUNCH_ATTN_T32_WPE1(64, false, 64, 32, VT, OT); } \
                         } else if (d64_bn == 16) { \
                             if (is_causal) { LAUNCH_ATTN_T32_WPE1(64, true, 128, 16, VT, OT); } \
                             else { LAUNCH_ATTN_T32_WPE1(64, false, 128, 16, VT, OT); } \
