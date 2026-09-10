@@ -14,6 +14,7 @@ Tensor qk_int8_sv_bf16_attn_gfx103x_t(
     Tensor output,
     Tensor q_scale,
     Tensor k_scale,
+    Tensor v_scale,
     int64_t tensor_layout,
     int64_t is_causal,
     double sm_scale,

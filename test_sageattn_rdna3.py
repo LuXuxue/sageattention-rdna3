@@ -19,6 +19,8 @@ import os
 
 import torch as _torch
 
+os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
+
 def _detect_arch():
     """Return 'gfx110x' (RDNA3) or 'gfx103x' (RDNA2) or None."""
     try:

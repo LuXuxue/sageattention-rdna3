@@ -415,8 +415,9 @@ std::vector<Tensor> quant_qk_int8_gfx103x(
 
 Tensor qk_int8_sv_bf16_attn_gfx103x_t(
     Tensor query, Tensor key, Tensor value, Tensor output,
-    Tensor q_scale, Tensor k_scale,
+    Tensor q_scale, Tensor k_scale, Tensor v_scale,
     int64_t tensor_layout, int64_t is_causal, double sm_scale, Tensor q_fp) {
+    (void)v_scale;
 
     const Tensor& qgeo = (query.dim() < 4) ? q_fp : query;
     const int64_t batch = qgeo.size(0);

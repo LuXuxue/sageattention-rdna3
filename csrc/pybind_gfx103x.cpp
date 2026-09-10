@@ -18,7 +18,7 @@ PyMODINIT_FUNC PyInit__qattn_gfx103x(void)
 STABLE_TORCH_LIBRARY(sageattention, m) {
     m.def("qk_int8_sv_bf16_attn_t("
             "Tensor query, Tensor key, Tensor value, Tensor(a!) output, "
-            "Tensor q_scale, Tensor k_scale, int tensor_layout, "
+            "Tensor q_scale, Tensor k_scale, Tensor v_scale, int tensor_layout, "
             "int is_causal, float sm_scale, Tensor q_fp"
           ") -> Tensor");
     m.def("quant_qk_int8("

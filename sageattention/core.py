@@ -228,6 +228,12 @@ def sageattn(
                     v_for_attn = v16.permute(0, 2, 1, 3).contiguous()
             elif v.dtype != torch.float16:
                 v_for_attn = v.to(torch.float16)
+            # v_scale 占位 (gfx103x kernel 读 native fp16 V, 不读取 v_scale; 仅满足 pybind 签名)
+            kv_heads_n = k.size(1) if tensor_layout == "HND" else k.size(2)
+            v_scale_t = torch.empty(
+                q.size(0), kv_heads_n, (kv_len_actual + 31) // 32,
+                device=q.device, dtype=torch.float32
+            )
         else:
             # gfx110x: V 预处理选路。SAGEATTN_INT8_V=1 -> 量化转置 int8 (4KB/tile, 特征实验性);
             # 默认 0 -> fp16 V_T 快路径 (wmma/L2 带宽友好; 780M 实测 int8-V 全线反而 +11~61% 变慢,
@@ -282,17 +288,48 @@ def sageattn(
             k_mean = ops.mean_seq(k, layout_code)
         else:
             k_mean = torch.empty(0, device=q.device, dtype=q.dtype)
+        # v10 INQ (in-kernel Q int8 quant): 小 kv 时 prepass 的 Q 量化 round-trip
+        # 主导端到端时间, 主 kernel 直接从 fp16/bf16 源在核内量化 Q, prepass 跳过 Q。
+        # 此路径仅 gfx103x 支持 (gfx110x 主 kernel 忽略 q_fp, 必须用 prepass 的 q_int8)。
+        # 注意: 若对 gfx103x 去掉 INQ (skip_q=0 + 空 q_fp), 非因果小 kv 的精度会从 ~1%
+        # 恶化到 >70% 相对误差 (commit 484fdce 的回归, 本修复已恢复)。
+        q_skip_inq = False
+        q_fp = q
+        if is_gfx103:
+            v10_on = True
+            ipv_on = False
+            inq_wanted = (kv_len_actual <= 1024)
+            q_skip_inq = bool(
+                headdim in (64, 128) and not is_causal and v10_on and not ipv_on and inq_wanted
+                and q.is_contiguous()
+            )
+            if q_skip_inq and tensor_layout == "NHD":
+                b_, s_, h_, d_ = q.shape
+                q_fp = q.as_strided((b_, h_, s_, d_), (s_ * h_ * d_, d_, h_ * d_, 1))
         q_int8, q_scale, k_int8, k_scale = ops.quant_qk_int8(
-            q, k, k_mean, layout_code, sm_scale, 0
+            q, k, k_mean, layout_code, sm_scale, int(q_skip_inq)
         )
         # 侧流 vt 完成后主流才能读 v_t: 使主流 (含之后的 attn kernel) 等待侧流事件
         if _prepass_vt_stream is not None:
             torch.cuda.current_stream().wait_stream(_prepass_vt_stream)
-        ops.qk_int8_sv_bf16_attn_t(
-            q_int8, k_int8, v_for_attn, o_int8,
-            q_scale, k_scale, v_scale_t,
-            layout_code, int(is_causal), sm_scale, torch.empty(0, device=q.device, dtype=q.dtype)
-        )
+        # gfx110x 扩展新增 v_scale 参数; 旧版/未重建的 gfx103x pyd 未接收它 ->
+        # 按实际加载的 schema 选签名 (两者兼容, 重建 gfx103x 后自动切到新签名)。
+        schemas = getattr(ops.qk_int8_sv_bf16_attn_t, '_schemas', None) or {}
+        has_vscale = any('v_scale' in str(s) for s in schemas.values())
+        if has_vscale:
+            ops.qk_int8_sv_bf16_attn_t(
+                q_int8, k_int8, v_for_attn, o_int8,
+                q_scale, k_scale, v_scale_t,
+                layout_code, int(is_causal), sm_scale,
+                q_fp if is_gfx103 else torch.empty(0, device=q.device, dtype=q.dtype)
+            )
+        else:
+            ops.qk_int8_sv_bf16_attn_t(
+                q_int8, k_int8, v_for_attn, o_int8,
+                q_scale, k_scale,
+                layout_code, int(is_causal), sm_scale,
+                q_fp if is_gfx103 else torch.empty(0, device=q.device, dtype=q.dtype)
+            )
 
     if input_dtype == torch.float32:
         o = o.to(torch.float32)
