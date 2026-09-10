@@ -108,8 +108,6 @@ export SAGEATTN_BACKEND=triton  # Linux
 | `SAGEATTN_BACKEND` | `native` | `native`, `triton` | 后端选择（triton 用于性能对比） |
 | `SAGEATTN_DEFAULT_PV_ACCUM_DTYPE` | `fp32` | `fp32`, `fp16`, `fp16+fp32` | triton 后端的 PV 累加精度（非法值回落 fp32） |
 | `SAGEATTN_BM_SEL` | `0` | `0`, `1`, `2` | direct kernel 的 BM 选择（0=默认, 1=32, 2=128）；API 参数 `bm_sel` 优先 |
-| `SAGEATTN_INT8_V` | `0` | `0`, `1` | 0=fp16 V_T 快路径（默认）；1=int8 V 量化转置（实验，实测更慢） |
-| `SAGEATTN_VT_OVERLAP` | `1` | `0`, `1` | int8-V 路径的 `v_quant_transpose` 是否用侧流重叠（1=重叠, 0=串行） |
 
 ### Direct / Int8 分派阈值（`core.py`，kv 小于等于阈值走 direct 路径）
 

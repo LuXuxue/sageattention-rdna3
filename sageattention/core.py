@@ -14,7 +14,6 @@ _qattn_ops = None
 GFX_NATIVE_ENABLED = False
 GFX_ARCH_LOADED = None  # 记录实际加载的扩展 (gfx110x / gfx103x)
 _import_error = None
-_prepass_vt_stream = None  # 侧流: v_transpose 与 quant prepass 重叠执行 (gfx110x int8 path)
 
 def _detect_gfx_arch():
     """Return 'gfx110x' (RDNA3) or 'gfx103x' (RDNA2) for current HIP device, or None."""
@@ -217,6 +216,7 @@ def sageattn(
         # -DSAGEATTN_VT_GLOBAL=1 and read V_T [B,H,D,N] (padded n to 64), so for
         # gfx1103 we must globally transpose V just like the direct path does.
         v_native = is_gfx103  # gfx110x int8 kernels require V_T; gfx103x use native
+        kv_heads_n = k.size(1) if tensor_layout == "HND" else k.size(2)
         if v_native:
             v_for_attn = v
             if tensor_layout == "NHD":
@@ -229,57 +229,26 @@ def sageattn(
             elif v.dtype != torch.float16:
                 v_for_attn = v.to(torch.float16)
             # v_scale 占位 (gfx103x kernel 读 native fp16 V, 不读取 v_scale; 仅满足 pybind 签名)
-            kv_heads_n = k.size(1) if tensor_layout == "HND" else k.size(2)
             v_scale_t = torch.empty(
                 q.size(0), kv_heads_n, (kv_len_actual + 31) // 32,
                 device=q.device, dtype=torch.float32
             )
         else:
-            # gfx110x: V 预处理选路。SAGEATTN_INT8_V=1 -> 量化转置 int8 (4KB/tile, 特征实验性);
-            # 默认 0 -> fp16 V_T 快路径 (wmma/L2 带宽友好; 780M 实测 int8-V 全线反而 +11~61% 变慢,
-            # LDS round-trip / 16B in-loop 读是结构代价, 无 DRAM 收益).
-            kv_heads_n = k.size(1) if tensor_layout == "HND" else k.size(2)
+            # gfx110x: fp16 V_T 快路径 (wmma/L2 带宽友好; 实测 int8-V 全线反而 +11~61% 变慢,
+            # LDS round-trip / 16B in-loop 读是结构代价, 无 DRAM 收益, 已弃)。
+            # bf16 输入由 v_transpose 内部转 fp16 (直接传 bf16, 省 .to(fp16) 独立 cast kernel ~0.5ms 临界路径开销)
             padded_n = ((kv_len_actual + 63) // 64) * 64
-            n_tiles32 = (kv_len_actual + 31) // 32
-            if os.getenv("SAGEATTN_INT8_V", "0") != "0":
-                v_for_attn16 = v
-                v_t = torch.empty(
-                    q.size(0), kv_heads_n, headdim, padded_n,
-                    device=q.device, dtype=torch.int8
-                )
-                v_scale_t = torch.empty(
-                    q.size(0), kv_heads_n, n_tiles32,
-                    device=q.device, dtype=torch.float32
-                )
-                global _prepass_vt_stream
-                if _prepass_vt_stream is None:
-                    _prepass_vt_stream = torch.cuda.Stream()
-                if os.getenv("SAGEATTN_VT_OVERLAP", "1") == "0":
-                    ops.v_quant_transpose(v_for_attn16, v_t, v_scale_t, layout_code)
-                else:
-                    # 侧流读取的 v 由主流产生: 必须先让侧流等待主流已入队的 v 生产者,
-                    # 否则侧流与主流的 v 写入竞争 -> 时好时坏的 UB (NaN / 大误差)。
-                    _prepass_vt_stream.wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(_prepass_vt_stream):
-                        ops.v_quant_transpose(v_for_attn16, v_t, v_scale_t, layout_code)
-                v_for_attn = v_t
-            else:
-                # fp16 V 快路径 (与历史 qk_int8_sv fp16-V 一致): bf16 输入由 v_transpose 内部转 fp16
-                # (直接传 bf16, 省 .to(fp16) 独立 cast kernel ~0.5ms 临界路径开销)
-                # 注: 侧流重叠 (SAGEATTN_VT_OVERLAP=1) 实测负收益 (780M stream sync 延迟 > 节省), 故串行
-                # 注: native-V 单遍 (in-kernel 转置, SAGEATTN_VT_NATIVE) 实测净亏损 10-17%, 已弃
-                v_for_attn16 = v
-                v_t = torch.empty(
-                    q.size(0), kv_heads_n, headdim, padded_n,
-                    device=q.device, dtype=torch.float16
-                )
-                ops.v_transpose(v_for_attn16, v_t, layout_code)
-                v_for_attn = v_t
-                # v_scale 占位 (kernel VTYPE!=int8 时不读取), 仅满足 pybind 签名
-                v_scale_t = torch.empty(
-                    q.size(0), kv_heads_n, n_tiles32,
-                    device=q.device, dtype=torch.float32
-                )
+            v_t = torch.empty(
+                q.size(0), kv_heads_n, headdim, padded_n,
+                device=q.device, dtype=torch.float16
+            )
+            ops.v_transpose(v, v_t, layout_code)
+            v_for_attn = v_t
+            # v_scale 占位 (kernel 不读取), 仅满足 pybind 签名
+            v_scale_t = torch.empty(
+                q.size(0), kv_heads_n, (kv_len_actual + 31) // 32,
+                device=q.device, dtype=torch.float32
+            )
         o_int8 = o
 
         # smooth_k: K 减 mean 后再量化, 仅当 K 有显著非零 DC 偏置时有价值, 默认 False
@@ -309,27 +278,13 @@ def sageattn(
         q_int8, q_scale, k_int8, k_scale = ops.quant_qk_int8(
             q, k, k_mean, layout_code, sm_scale, int(q_skip_inq)
         )
-        # 侧流 vt 完成后主流才能读 v_t: 使主流 (含之后的 attn kernel) 等待侧流事件
-        if _prepass_vt_stream is not None:
-            torch.cuda.current_stream().wait_stream(_prepass_vt_stream)
-        # gfx110x 扩展新增 v_scale 参数; 旧版/未重建的 gfx103x pyd 未接收它 ->
-        # 按实际加载的 schema 选签名 (两者兼容, 重建 gfx103x 后自动切到新签名)。
-        schemas = getattr(ops.qk_int8_sv_bf16_attn_t, '_schemas', None) or {}
-        has_vscale = any('v_scale' in str(s) for s in schemas.values())
-        if has_vscale:
-            ops.qk_int8_sv_bf16_attn_t(
-                q_int8, k_int8, v_for_attn, o_int8,
-                q_scale, k_scale, v_scale_t,
-                layout_code, int(is_causal), sm_scale,
-                q_fp if is_gfx103 else torch.empty(0, device=q.device, dtype=q.dtype)
-            )
-        else:
-            ops.qk_int8_sv_bf16_attn_t(
-                q_int8, k_int8, v_for_attn, o_int8,
-                q_scale, k_scale,
-                layout_code, int(is_causal), sm_scale,
-                q_fp if is_gfx103 else torch.empty(0, device=q.device, dtype=q.dtype)
-            )
+        # qk_int8_sv_bf16_attn_t 签名含 v_scale (gfx103x/gfx110x 扩展均已按此签名重建)。
+        ops.qk_int8_sv_bf16_attn_t(
+            q_int8, k_int8, v_for_attn, o_int8,
+            q_scale, k_scale, v_scale_t,
+            layout_code, int(is_causal), sm_scale,
+            q_fp if is_gfx103 else torch.empty(0, device=q.device, dtype=q.dtype)
+        )
 
     if input_dtype == torch.float32:
         o = o.to(torch.float32)

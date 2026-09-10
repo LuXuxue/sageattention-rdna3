@@ -33,46 +33,8 @@ constexpr int kNHD = 0;
 constexpr int kHND = 1;
 constexpr float kLog2e = 1.4426950408889634f;
 
-// 实验: V 全局转置存储 (V_T [B,H,D,N]) + PV 改 out = P @ V (B operand 行读)
-// 注意: 本宏只应在 host 代码 (dispatch) 使用 #if; 模板 __device__ 函数体内
-//       用 #if 会触发 hipcc 解析 bug (wpe1 undeclared), 故 PV 段为无条件代码
-#ifndef SAGEATTN_VT_GLOBAL
-#define SAGEATTN_VT_GLOBAL 0
-#endif
-
-// int8 V_T (量化转置) -> fp16 片段: 16 个 int8 (16B, 单次 dwordx4 向量读) -> 16 halfs
-__device__ __forceinline__ sageattn_gfx11::v16h convert_i8x32_f16(const int8_t* p) {
-    const uint4 u = *reinterpret_cast<const uint4*>(p);
-    const signed char* c = reinterpret_cast<const signed char*>(&u);
-    sageattn_gfx11::v16h out;
-    __half* o = reinterpret_cast<__half*>(&out);
-#pragma unroll
-    for (int j = 0; j < 16; ++j) {
-        o[j] = __float2half_rn(static_cast<float>(c[j]));
-    }
-    return out;
-}
-
-// 变体: 转换时直接乘 per-tile 反量化 scale (省一次 16-half 乘 pass)
-__device__ __forceinline__ sageattn_gfx11::v16h convert_i8x32_f16_scaled(const int8_t* p, float s) {
-    const uint4 u = *reinterpret_cast<const uint4*>(p);
-    const signed char* c = reinterpret_cast<const signed char*>(&u);
-    sageattn_gfx11::v16h out;
-    __half* o = reinterpret_cast<__half*>(&out);
-#pragma unroll
-    for (int j = 0; j < 16; ++j) {
-        o[j] = __float2half_rn(static_cast<float>(c[j]) * s);
-    }
-    return out;
-}
-
-// v16h 逐元素乘常数 (半精度) — int8 V 反量化 (per 16-col 块)
-__device__ __forceinline__ sageattn_gfx11::v16h mul_v16h_scalar(sageattn_gfx11::v16h a, __half s) {
-    __half* pa = reinterpret_cast<__half*>(&a);
-#pragma unroll
-    for (int i = 0; i < 16; ++i) pa[i] = __hmul(pa[i], s);
-    return a;
-}
+// V 全局转置存储 (V_T [B,H,D,N]) + PV out = P @ V (B operand 行读) 是唯一支持的
+// PV 方案 (setup.py 恒 -DSAGEATTN_VT_GLOBAL=1; 旧的 LDS 列读 PV 路径已删除)。
 
 constexpr int RM = 16;
 constexpr int BK = 16;
@@ -485,114 +447,6 @@ __global__ void v_transpose_kernel(
     }
 }
 
-// V 量化转置 (gfx110x int8 path): V [B,H,N,D] bf16/fp16 -> V_T_i8 [B,H,D,N_pad64] int8
-// + 每 32 n-tile 的 fp32 scale [B,H,ceil(seq/32)] (scale = maxabs/127, 无效区 scale 1.0)。
-// block 覆盖 (b, h, nt); head_dim <= 128; 单个 block 先载入整 tile (含 max),
-// 再按 [D][N] 写回 int8, 避免二次全局读 V。
-template <typename V_IN>
-__global__ void v_quant_transpose_kernel(
-    const V_IN* __restrict__ v,
-    int8_t* __restrict__ v_t_i8,
-    float* __restrict__ v_scale,
-    const int64_t batch_size,
-    const int64_t seq_len,
-    const int64_t num_heads,
-    const int64_t head_dim,
-    const int64_t v_stride_b,
-    const int64_t v_stride_n,
-    const int64_t v_stride_h,
-    const int tensor_layout) {
-    constexpr int NT = 32;      // n-tile
-    constexpr int THREADS = 256;
-    __shared__ __half tile[NT][(128 / 16) * 16 + 1];
-    __shared__ float red[THREADS];
-
-    const int64_t v_t_n = ((seq_len + 63) / 64) * 64;
-    const int64_t ntiles = v_t_n / NT;
-    const int64_t total = batch_size * num_heads * ntiles;
-    const int tid = threadIdx.x;
-    const int n_l = tid >> 3;         // 0..31 (载入: 行)
-    const int d_l = (tid & 7) * 16;   // 0..112 (载入: 16 halfs / 线程, 8 线程/行)
-    const int d_w = tid >> 3;         // 0..31  (写回: d 覆盖)
-    const int n_w = (tid & 7) * 4;    // 0..28  (写回: n 4 个连续)
-
-    for (int64_t i = blockIdx.x; i < total; i += gridDim.x) {
-        const int64_t nt = i % ntiles;
-        const int64_t h = (i / ntiles) % num_heads;
-        const int64_t b = i / (ntiles * num_heads);
-        const int64_t n0 = nt * NT;
-
-        // pass1: 载入 LDS (fp16) + 局部 max
-        float lmax = 0.0f;
-        {
-            const int64_t d_abs = d_l;
-            const int64_t n_abs = n0 + n_l;
-            __half* dst = &tile[n_l][d_l];
-            if (d_abs + 16 <= head_dim) {
-                if (n_abs < seq_len) {
-                    const int64_t v_off = (tensor_layout == kHND) ?
-                        (b * v_stride_b + h * v_stride_h + n_abs * v_stride_n + d_abs) :
-                        (b * v_stride_b + n_abs * v_stride_n + h * v_stride_h + d_abs);
-                    if constexpr (std::is_same<V_IN, __half>::value) {
-                        const __half* src = v + v_off;
-#pragma unroll
-                        for (int j = 0; j < 16; ++j) {
-                            const float f = __half2float(src[j]);
-                            dst[j] = src[j];
-                            lmax = fmaxf(lmax, fabsf(f));
-                        }
-                    } else {
-#pragma unroll
-                        for (int j = 0; j < 16; ++j) {
-                            const float f = __bfloat162float(v[v_off + j]);
-                            dst[j] = __float2half_rn(f);
-                            lmax = fmaxf(lmax, fabsf(f));
-                        }
-                    }
-                } else {
-#pragma unroll
-                    for (int j = 0; j < 16; ++j) dst[j] = __half{0};
-                }
-            } else {
-#pragma unroll
-                for (int j = 0; j < 16; ++j) dst[j] = __half{0};
-            }
-        }
-        red[tid] = lmax;
-        __syncthreads();
-        for (int s = THREADS / 2; s > 0; s >>= 1) {
-            if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
-            __syncthreads();
-        }
-        const float scale = (red[0] > 1e-6f) ? (red[0] / 127.0f) : 1.0f;
-        if (tid == 0) v_scale[(b * num_heads + h) * ntiles + nt] = scale;
-        __syncthreads();
-
-        // pass2: quantize + 转置写回 [D][N] (n 连续, 4 x int8)
-        for (int64_t d_off = 0; d_off < head_dim; d_off += 32) {
-            const int64_t d_abs = d_off + d_w;
-            if (d_abs < head_dim) {
-                __half hvals[4];
-#pragma unroll
-                for (int j = 0; j < 4; ++j) hvals[j] = tile[n_w + j][d_abs];
-                const int64_t vt_base = ((b * num_heads + h) * head_dim + d_abs) * v_t_n + n0 + n_w;
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const int64_t n_abs = n0 + n_w + j;
-                    int8_t vq = 0;
-                    if (n_abs < seq_len) {
-                        const float q = roundf(__half2float(hvals[j]) / scale);
-                        const int ic = (q > 127.0f) ? 127 : ((q < -127.0f) ? -127 : static_cast<int>(q));
-                        vq = static_cast<int8_t>(ic);
-                    }
-                    v_t_i8[vt_base + j] = vq;
-                }
-            }
-        }
-        __syncthreads();
-    }
-}
-
 template <int HeadDim, bool IsCausal, int BLOCK_M, int BLOCK_N, typename V_DTYPE = __half,
           typename OUT_DTYPE = V_DTYPE>
 __device__ __forceinline__ void attn_kernel_impl_t(
@@ -602,9 +456,6 @@ __device__ __forceinline__ void attn_kernel_impl_t(
     void* __restrict__ output,
     const float* __restrict__ q_scale,
     const float* __restrict__ k_scale,
-    const float* __restrict__ v_scale,
-    const int64_t vs_stride_b,
-    const int64_t vs_stride_h,
     const int64_t batch_size,
     const int64_t qo_len,
     const int64_t kv_len,
@@ -633,15 +484,13 @@ __device__ __forceinline__ void attn_kernel_impl_t(
     constexpr int DTiles = HeadDim / BK;
     constexpr int ColTiles = BLOCK_N / BK;
     constexpr int KStride = HeadDim + LDS_PAD;
-    constexpr int VStride = HeadDim + LDS_PAD;
 
     __shared__ int8_t k_tile[BLOCK_N * KStride];
     // V_T tile 拷贝到 LDS (布局 [D][N], 行 = D 维, n 连续 16 half 行读):
     // PV 的 v_frag 从 LDS 读而非全局 (消除每 lane 32 次冗余全局行读, 与 triton LDS 缓存对齐)
-    // VT_GLOBAL: 需 HeadDim 行 x VTileStride(80) 列; 非 VT_GLOBAL: 原 [BLOCK_N][VStride] 列读布局
-    constexpr int VTileStride = 80;  // 行间 8 bank 偏移 (同 VStride 冲突模式), 20KB/128 行
-    __shared__ __align__(32) __half v_tile[
-        (SAGEATTN_VT_GLOBAL) ? (HeadDim * VTileStride) : (BLOCK_N * VStride)];
+    // 需 HeadDim 行 x VTileStride(80) 列
+    constexpr int VTileStride = 80;  // 行间 8 bank 偏移, 20KB/128 行
+    __shared__ __align__(32) __half v_tile[HeadDim * VTileStride];
 
     const int tid = threadIdx.x;
     const int lane = tid & 31;
@@ -693,21 +542,11 @@ __device__ __forceinline__ void attn_kernel_impl_t(
     // 否则 kv_len 非 64 倍数时最后 kv-tile 的 v_frag_t 32B 直读越界 (UB/NaN)
     const int64_t v_t_n = ((kv_len + 63) / 64) * 64;
     constexpr int KVecsPerRow = HeadDim / 16;
-    constexpr int VVecsPerRow = HeadDim / 8;
     constexpr int KVecsTotal = BLOCK_N * KVecsPerRow;
-    constexpr int VVecsTotal = BLOCK_N * VVecsPerRow;
     constexpr int KPrefetchPerThread = (KVecsTotal + THREADS - 1) / THREADS;
-    constexpr int VPrefetchPerThread = (VVecsTotal + THREADS - 1) / THREADS;
 
     uint4 k_prefetch[KPrefetchPerThread];
-    // VT_GLOBAL=1: V lives in the V_T tile (LDS), v_prefetch unused
-    // VT_GLOBAL=1: V lives in the V_T tile (LDS), v_prefetch unused
-    uint4 v_prefetch[(SAGEATTN_VT_GLOBAL) ? 1 : VPrefetchPerThread];
     constexpr int VVecsPerTileVT = (HeadDim * BLOCK_N) / 16;
-    // int8 V 专用 prefetch 缓冲区; fp16/bf16 V 由 tile-start 直读, 不需要 (省 32 VGPR)
-    constexpr int VPrefetchVT = (SAGEATTN_VT_GLOBAL && std::is_same<V_DTYPE, int8_t>::value)
-        ? (VVecsPerTileVT / THREADS) : 0;
-    v16h v_prefetch_vt[VPrefetchVT > 0 ? VPrefetchVT : 1];
     for (int i = tid; i < KVecsTotal; i += THREADS) {
         const int n = i / KVecsPerRow;
         const int d = (i - n * KVecsPerRow) * 16;
@@ -722,48 +561,8 @@ __device__ __forceinline__ void attn_kernel_impl_t(
             *reinterpret_cast<uint4*>(&k_tile[n * KStride + d]) = make_uint4(0, 0, 0, 0);
         }
     }
-    if (SAGEATTN_VT_GLOBAL) {
-    if (std::is_same<V_DTYPE, int8_t>::value) {
-    // int8 V: first V_T tile loads directly into LDS (later tiles: v_prefetch_vt -> LDS in write phase)
-    // V_T_i8: int8 数据, 32B (32 int8) -> 16 halfs 转 fp16 后入 LDS (LDS/frag 仍为 fp16)
-    const int8_t* vt8 = reinterpret_cast<const int8_t*>(v);
-#pragma unroll
-    for (int i = tid; i < VVecsPerTileVT; i += THREADS) {
-        const int d = i / (BLOCK_N / BK);
-        const int c16 = i % (BLOCK_N / BK);
-        const int64_t v_off =
-            ((b * num_kv_heads + hkv) * HeadDim + d) * v_t_n + (c16 * BK);
-        *reinterpret_cast<v16h*>(
-            reinterpret_cast<char*>(v_tile) + (d * VTileStride + c16 * BK) * 2) =
-            convert_i8x32_f16(vt8 + v_off);
-    }
-    }
-    // fp16/bf16 V_T: PV 直接从全局 V_T 行读 (vt_off 32B), 无需 LDS 暂存
-    } else {
-    for (int i = tid; i < VVecsTotal; i += THREADS) {
-        const int n = i / VVecsPerRow;
-        const int d = (i - n * VVecsPerRow) * 8;
-        const int64_t v_idx = n;
-        if (v_idx < kv_len) {
-            const int64_t v_off = (tensor_layout == kHND) ?
-                (b * v_stride_b + hkv * v_stride_h + v_idx * v_stride_n + d) :
-                (b * v_stride_b + v_idx * v_stride_n + hkv * v_stride_h + d);
-            if constexpr (std::is_same<V_DTYPE, __half>::value) {
-                *reinterpret_cast<uint4*>(reinterpret_cast<char*>(v_tile) + (n * VStride + d) * 2) =
-                    *reinterpret_cast<const uint4*>(v + v_off);
-            } else {
-                const V_DTYPE* vsrc = v + v_off;
-                __half* vdst = reinterpret_cast<__half*>(reinterpret_cast<char*>(v_tile) + (n * VStride + d) * 2);
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    vdst[j] = __float2half_rn(__bfloat162float(vsrc[j]));
-                }
-            }
-        } else {
-            *reinterpret_cast<uint4*>(reinterpret_cast<char*>(v_tile) + (n * VStride + d) * 2) = make_uint4(0, 0, 0, 0);
-        }
-    }
-    }
+    // fp16 V_T: 首个 tile 由主循环 PV 前的 LDS 拷贝段处理 (BM>=128) 或直读全局 (BM64),
+    // 此处无需预载
     __syncthreads();
 
     const int hw = lane >> 4;
@@ -791,39 +590,6 @@ __device__ __forceinline__ void attn_kernel_impl_t(
                     }
                 }
             }
-    if (SAGEATTN_VT_GLOBAL) {
-    if (std::is_same<V_DTYPE, int8_t>::value) {
-    const int8_t* vt8 = reinterpret_cast<const int8_t*>(v);
-#pragma unroll
-        for (int i = tid; i < VVecsPerTileVT; i += THREADS) {
-            const int d = i / (BLOCK_N / BK);
-            const int c16 = i % (BLOCK_N / BK);
-            const int64_t v_off =
-                ((b * num_kv_heads + hkv) * HeadDim + d) * v_t_n + (next_base + c16 * BK);
-            v_prefetch_vt[i / THREADS] = convert_i8x32_f16(vt8 + v_off);
-        }
-    }
-    }
-
-    if (!SAGEATTN_VT_GLOBAL) {
-#pragma unroll
-            for (int i = 0; i < VPrefetchPerThread; ++i) {
-                const int vec = tid + i * THREADS;
-                if (vec < VVecsTotal) {
-                    const int n = vec / VVecsPerRow;
-                    const int d = (vec - n * VVecsPerRow) * 8;
-                    const int64_t v_idx = next_base + n;
-                    if (v_idx < kv_len) {
-                        const int64_t v_off = (tensor_layout == kHND) ?
-                            (b * v_stride_b + hkv * v_stride_h + v_idx * v_stride_n + d) :
-                            (b * v_stride_b + v_idx * v_stride_n + hkv * v_stride_h + d);
-                        v_prefetch[i] = *reinterpret_cast<const uint4*>(v + v_off);
-                    } else {
-                        v_prefetch[i] = make_uint4(0, 0, 0, 0);
-                    }
-                }
-            }
-    }
         }
 
         float score_cache[ColTiles][8];
@@ -857,14 +623,13 @@ __device__ __forceinline__ void attn_kernel_impl_t(
             }
         }
 
-        // ---- V_T 当前 tile (kb_base) 拷入 LDS (仅 VT_GLOBAL) ----
-        // v_tile 布局 [D][N]: 行 = D 维 (HeadDim), 列 = n (BLOCK_N), 行 stride VStride half。
+        // ---- V_T 当前 tile (kb_base) 拷入 LDS ----
+        // v_tile 布局 [D][N]: 行 = D 维 (HeadDim), 列 = n (BLOCK_N), 行 stride VTileStride half。
         // PV 的 v_frag 从 LDS 行读 (b128), 消除"每 lane 每 dt 一次 32B 全局行读"的
         // L1/L2 带宽冗余 (128 lanes x 32 次/迭代 -> 128KB, 实际 tile 仅 16KB)。
         // 512 个 v16h (128 D 行 x 4 个 16 列组), 128 threads -> 4/thread, 全局行读 32B 对齐。
-        if (SAGEATTN_VT_GLOBAL) {
-        if (!std::is_same<V_DTYPE, int8_t>::value && BLOCK_M >= 128) {
-            // fp16/bf16 V_T (BM128): 每 tile 行读入 LDS (与历史直读结构一致), barrier 后 PV 读 LDS
+        if (BLOCK_M >= 128) {
+            // fp16 V_T (BM128): 每 tile 行读入 LDS, barrier 后 PV 读 LDS
             // BM64: 不走 LDS, PV 直接全局行读 (实测 BM64 下直读更快, 免 barrier/20KB tile)
 #pragma unroll
             for (int i = tid; i < VVecsPerTileVT; i += THREADS) {
@@ -877,7 +642,6 @@ __device__ __forceinline__ void attn_kernel_impl_t(
                     reinterpret_cast<char*>(v_tile) + (d * VTileStride + c16 * BK) * 2) = src;
             }
             __syncthreads();  // v_tile 写完后 PV 才可读
-        }
         }
 
         // ---- per-row max: 局部归约 (同行偶/奇列) -> permlanex16 合并 ----
@@ -916,15 +680,11 @@ __device__ __forceinline__ void attn_kernel_impl_t(
         row_l += partial_sm + permlanex16(partial_sm);
 
         // ---- P fragment 寄存器组装 + PV ----
-        // SAGEATTN_VT_GLOBAL=1: V 已转置为 V_T [B,H,D,N], 用 out = P @ V (B operand 行读 b128)
-        // SAGEATTN_VT_GLOBAL=0: 原转置 PV (out^T = V^T @ P^T, LDS v_frag 列读)
-        // 注意: 用运行时 if (编译器 DCE), 不能用 #if/if constexpr (模板体内会触发 hipcc 解析 bug)
-        if (SAGEATTN_VT_GLOBAL) {
-        // out^T = V^T @ P^T: A = V^T (v_tile 行 (L&15) 的 16 连续 n = LDS 行读 b128),
-        // B = P^T (p_frag). V_T tile 已由主循环拷入 v_tile [D][N] (见主循环 V 拷贝段)
+        // V 已转置为 V_T [B,H,D,N], 用 out = P @ V (B operand 行读 b128):
+        // A = V^T (v_tile/V_T 行 (L&15) 的 16 连续 n), B = P^T (p_frag)
         // C = out^T: lane L 持 out^T[2e+hw][L&15] = out[L&15][2e+hw] (转置解释, 匹配写回)
-        // fp16/bf16 V_T: BM128 走 v_tile LDS 行读 (与历史直读 PV 一致); BM64 直接全局 V_T 行读
-        if (!std::is_same<V_DTYPE, int8_t>::value && BLOCK_M >= 128) {
+        // BM128 走 v_tile LDS 行读; BM64 直接全局 V_T 行读
+        if (BLOCK_M >= 128) {
 #pragma unroll
         for (int ct = 0; ct < ColTiles; ++ct) {
             float p_vals[8];
@@ -940,7 +700,7 @@ __device__ __forceinline__ void attn_kernel_impl_t(
                 out_acc[dt] = sageattn_gfx11::wmma_f32_f16(v_frag_t, p_frag, out_acc[dt]);
             }
         }
-        } else if (!std::is_same<V_DTYPE, int8_t>::value) {
+        } else {
 #pragma unroll
         for (int ct = 0; ct < ColTiles; ++ct) {
             float p_vals[8];
@@ -953,42 +713,6 @@ __device__ __forceinline__ void attn_kernel_impl_t(
                     ((b * num_kv_heads + hkv) * HeadDim + (dt * BK + m_row)) * v_t_n + (kb_base + ct * BK);
                 const v16h v_frag_t = *reinterpret_cast<const v16h*>(v + vt_off);
                 out_acc[dt] = sageattn_gfx11::wmma_f32_f16(v_frag_t, p_frag, out_acc[dt]);
-            }
-        }
-        } else {
-#pragma unroll
-        for (int ct = 0; ct < ColTiles; ++ct) {
-            float p_vals[8];
-#pragma unroll
-            for (int e = 0; e < 8; ++e) p_vals[e] = score_cache[ct][e];
-            const v16h p_frag = assemble_p_frag(p_vals, hw);
-            // int8 V 反量化: 每 16-col 块 (V 量化粒度 32, 两 16-col 半共用同 scale)
-            const float rvs = v_scale[b * vs_stride_b + hkv * vs_stride_h +
-                                      static_cast<int>((kb_base + ct * BK) / 32)];
-            const __half rvs_h = __float2half_rn(rvs);
-#pragma unroll
-            for (int dt = 0; dt < DTiles; ++dt) {
-                const int d_row = dt * BK + m_row;  // v_tile 的 D 维行 (与 V_T 同)
-                const v16h* vp = reinterpret_cast<const v16h*>(
-                    reinterpret_cast<const char*>(v_tile) + (d_row * VTileStride + ct * BK) * 2);
-                const v16h v_frag_t = mul_v16h_scalar(*vp, rvs_h);
-                out_acc[dt] = sageattn_gfx11::wmma_f32_f16(v_frag_t, p_frag, out_acc[dt]);
-            }
-        }
-        }
-        } else {
-#pragma unroll
-        for (int ct = 0; ct < ColTiles; ++ct) {
-            float p_vals[8];
-#pragma unroll
-            for (int e = 0; e < 8; ++e) p_vals[e] = score_cache[ct][e];
-            const v16h p_frag = assemble_p_frag(p_vals, hw);
-#pragma unroll
-            for (int dt = 0; dt < DTiles; ++dt) {
-                const int d_col = dt * BK + m_row;
-                const char* v_base = reinterpret_cast<const char*>(v_tile) + ct * BK * VStride * 2;
-                const v16h v_frag = sageattn_gfx11::load_fp16_col_frag(v_base, d_col, VStride * 2);
-                out_acc[dt] = sageattn_gfx11::wmma_f32_f16(v_frag, p_frag, out_acc[dt]);
             }
         }
         }
@@ -1005,36 +729,6 @@ __device__ __forceinline__ void attn_kernel_impl_t(
                     *reinterpret_cast<uint4*>(&k_tile[n * KStride + d]) = k_prefetch[i];
                 }
             }
-    if (SAGEATTN_VT_GLOBAL) {
-    if (std::is_same<V_DTYPE, int8_t>::value) {
-#pragma unroll
-            for (int i = tid; i < VVecsPerTileVT; i += THREADS) {
-                const int d = i / (BLOCK_N / BK);
-                const int c16 = i % (BLOCK_N / BK);
-                *reinterpret_cast<v16h*>(
-                    reinterpret_cast<char*>(v_tile) + (d * VTileStride + c16 * BK) * 2) = v_prefetch_vt[i / THREADS];
-            }
-    }
-    }
-    if (!SAGEATTN_VT_GLOBAL) {
-            for (int i = 0; i < VPrefetchPerThread; ++i) {
-                const int vec = tid + i * THREADS;
-                if (vec < VVecsTotal) {
-                    const int n = vec / VVecsPerRow;
-                    const int d = (vec - n * VVecsPerRow) * 8;
-                    if constexpr (std::is_same<V_DTYPE, __half>::value) {
-                        *reinterpret_cast<uint4*>(reinterpret_cast<char*>(v_tile) + (n * VStride + d) * 2) = v_prefetch[i];
-                    } else {
-                        const V_DTYPE* vsrc = reinterpret_cast<const V_DTYPE*>(&v_prefetch[i]);
-                        __half* vdst = reinterpret_cast<__half*>(reinterpret_cast<char*>(v_tile) + (n * VStride + d) * 2);
-#pragma unroll
-                        for (int j = 0; j < 8; ++j) {
-                            vdst[j] = __float2half_rn(__bfloat162float(vsrc[j]));
-                        }
-                    }
-                }
-            }
-    }
             __syncthreads();
         }
     }
@@ -1108,9 +802,6 @@ __device__ __forceinline__ void attn_kernel_impl_32_t(
     void* __restrict__ output,
     const float* __restrict__ q_scale,
     const float* __restrict__ k_scale,
-    const float* __restrict__ v_scale,
-    const int64_t vs_stride_b,
-    const int64_t vs_stride_h,
     const int64_t batch_size,
     const int64_t qo_len,
     const int64_t kv_len,
@@ -1139,11 +830,8 @@ __device__ __forceinline__ void attn_kernel_impl_32_t(
     constexpr int DTiles = HeadDim / BK;
     constexpr int ColTiles = BLOCK_N / BK;
     constexpr int KStride = HeadDim + LDS_PAD;
-    constexpr int VStride = HeadDim + LDS_PAD;
 
     __shared__ int8_t k_tile[BLOCK_N * KStride];
-    // VT_GLOBAL=1 时 V 直接从全局 V_T 行读, LDS v_tile 完全不用 (见 impl_t 注释)
-    __shared__ __half v_tile[(SAGEATTN_VT_GLOBAL) ? 1 : (BLOCK_N * VStride)];
 
     const int tid = threadIdx.x;
     const int lane = tid & 31;
@@ -1206,16 +894,10 @@ __device__ __forceinline__ void attn_kernel_impl_32_t(
     // V_T n 维 (core.py padding 到 64 倍数), 见 attn_kernel_impl_t 说明
     const int64_t v_t_n = ((kv_len + 63) / 64) * 64;
     constexpr int KVecsPerRow = HeadDim / 16;
-    constexpr int VVecsPerRow = HeadDim / 8;
     constexpr int KVecsTotal = BLOCK_N * KVecsPerRow;
-    constexpr int VVecsTotal = BLOCK_N * VVecsPerRow;
     constexpr int KPrefetchPerThread = (KVecsTotal + THREADS - 1) / THREADS;
-    constexpr int VPrefetchPerThread = (VVecsTotal + THREADS - 1) / THREADS;
 
     uint4 k_prefetch[KPrefetchPerThread];
-    // VT_GLOBAL=1 时 V 从全局 V_T 行读 (无 LDS), v_prefetch 完全不用:
-    // 缩为 1 元素省 (VPrefetchPerThread-1)*4 个 VGPR (编译期常量三元)
-    uint4 v_prefetch[(SAGEATTN_VT_GLOBAL) ? 1 : VPrefetchPerThread];
 
     for (int i = tid; i < KVecsTotal; i += THREADS) {
         const int n = i / KVecsPerRow;
@@ -1231,31 +913,7 @@ __device__ __forceinline__ void attn_kernel_impl_32_t(
             *reinterpret_cast<uint4*>(&k_tile[n * KStride + d]) = make_uint4(0, 0, 0, 0);
         }
     }
-    if (!SAGEATTN_VT_GLOBAL) {
-    for (int i = tid; i < VVecsTotal; i += THREADS) {
-        const int n = i / VVecsPerRow;
-        const int d = (i - n * VVecsPerRow) * 8;
-        const int64_t v_idx = n;
-        if (v_idx < kv_len) {
-            const int64_t v_off = (tensor_layout == kHND) ?
-                (b * v_stride_b + hkv * v_stride_h + v_idx * v_stride_n + d) :
-                (b * v_stride_b + v_idx * v_stride_n + hkv * v_stride_h + d);
-            if constexpr (std::is_same<V_DTYPE, __half>::value) {
-                *reinterpret_cast<uint4*>(reinterpret_cast<char*>(v_tile) + (n * VStride + d) * 2) =
-                    *reinterpret_cast<const uint4*>(v + v_off);
-            } else {
-                const V_DTYPE* vsrc = v + v_off;
-                __half* vdst = reinterpret_cast<__half*>(reinterpret_cast<char*>(v_tile) + (n * VStride + d) * 2);
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    vdst[j] = __float2half_rn(__bfloat162float(vsrc[j]));
-                }
-            }
-        } else {
-            *reinterpret_cast<uint4*>(reinterpret_cast<char*>(v_tile) + (n * VStride + d) * 2) = make_uint4(0, 0, 0, 0);
-        }
-    }
-    }
+    // V 直接从全局 V_T 行读 (无 LDS 暂存)
     __syncthreads();
 
             const int hw = lane >> 4;
@@ -1283,25 +941,6 @@ for (int64_t kb_base = 0; kb_base < kv_limit; kb_base += BLOCK_N) {
                     }
                 }
             }
-    if (!SAGEATTN_VT_GLOBAL) {
-#pragma unroll
-            for (int i = 0; i < VPrefetchPerThread; ++i) {
-                const int vec = tid + i * THREADS;
-                if (vec < VVecsTotal) {
-                    const int n = vec / VVecsPerRow;
-                    const int d = (vec - n * VVecsPerRow) * 8;
-                    const int64_t v_idx = next_base + n;
-                    if (v_idx < kv_len) {
-                        const int64_t v_off = (tensor_layout == kHND) ?
-                            (b * v_stride_b + hkv * v_stride_h + v_idx * v_stride_n + d) :
-                            (b * v_stride_b + v_idx * v_stride_n + hkv * v_stride_h + d);
-                        v_prefetch[i] = *reinterpret_cast<const uint4*>(v + v_off);
-                    } else {
-                        v_prefetch[i] = make_uint4(0, 0, 0, 0);
-                    }
-                }
-            }
-    }
         }
         float score_cache[2][ColTiles][8];
 
@@ -1380,41 +1019,10 @@ for (int64_t kb_base = 0; kb_base < kv_limit; kb_base += BLOCK_N) {
         }
 
         // ---- P fragment 寄存器组装 + PV ----
-        // SAGEATTN_VT_GLOBAL=1: V 已转置为 V_T [B,H,D,N], 用 out = P @ V (B operand 行读 b128)
-        // SAGEATTN_VT_GLOBAL=0: 原转置 PV (out^T = V^T @ P^T, LDS v_frag 列读)
-        // 注意: 用运行时 if (编译器 DCE), 不能用 #if/if constexpr (模板体内会触发 hipcc 解析 bug)
-        if (blockIdx.x == 31 && tid == 0 && (row_l[0] != row_l[0] || row_l[1] != row_l[1])) {
-            printf("DBG rowl NaN kb=%d rl=%f/%f rm=%f/%f oa0=%f oa1=%f oa2=%f oa3=%f\n",
-                   (int)kb_base, row_l[0], row_l[1], row_m[0], row_m[1],
-                   out_acc[0][0][0], out_acc[0][0][1], out_acc[0][0][2], out_acc[0][0][3]);
-        }
+        // V 已转置为 V_T [B,H,D,N], 用 out = P @ V (B operand 行读 b128):
+        // A = V^T (V_T 行读), B = P^T (p_frag)
         // ---- PV x2 子块 (2 个独立 WMMA, ILP 提升) ----
-        if (SAGEATTN_VT_GLOBAL) {
-        // out^T = V^T @ P^T: A = V^T (V_T 行读), B = P^T (p_frag)
-        if (std::is_same<V_DTYPE, int8_t>::value) {
-        const int8_t* vt8 = reinterpret_cast<const int8_t*>(v);
-#pragma unroll
-        for (int s = 0; s < 2; ++s) {
-#pragma unroll
-            for (int ct = 0; ct < ColTiles; ++ct) {
-                float p_vals[8];
-#pragma unroll
-                for (int e = 0; e < 8; ++e) p_vals[e] = score_cache[s][ct][e];
-                const v16h p_frag = assemble_p_frag(p_vals, hw);
-                // int8 V 反量化: 每 16-col 块 (V 量化粒度 32, 两 16-col 半共用同 scale)
-                const float rvs = v_scale[b * vs_stride_b + hkv * vs_stride_h +
-                                         static_cast<int>((kb_base + ct * BK) / 32)];
-#pragma unroll
-                for (int dt = 0; dt < DTiles; ++dt) {
-                    const int64_t vt_off =
-                        ((b * num_kv_heads + hkv) * HeadDim + (dt * BK + m_row)) * v_t_n + (kb_base + ct * BK);
-                    const v16h v_frag_t = convert_i8x32_f16_scaled(vt8 + vt_off, rvs);
-                    out_acc[s][dt] = sageattn_gfx11::wmma_f32_f16(v_frag_t, p_frag, out_acc[s][dt]);
-                }
-            }
-        }
-        } else {
-        // fp16/bf16 V_T: 直读全局 V_T 行 (32B), 与历史 D128 直读 PV 一致
+        // fp16 V_T: 直读全局 V_T 行 (32B), 与历史 D128 直读 PV 一致
         // 优化: V_T 读按 (dt,ct) 只加载一次 (s=0/1 共用同一 fragment), 提前于
         // assemble 发射以隐藏全局延迟
 #pragma unroll
@@ -1439,30 +1047,10 @@ for (int64_t kb_base = 0; kb_base < kv_limit; kb_base += BLOCK_N) {
                 }
             }
         }
-        }
-        } else {
-#pragma unroll
-        for (int s = 0; s < 2; ++s) {
-#pragma unroll
-            for (int ct = 0; ct < ColTiles; ++ct) {
-                float p_vals[8];
-#pragma unroll
-                for (int e = 0; e < 8; ++e) p_vals[e] = score_cache[s][ct][e];
-                const v16h p_frag = assemble_p_frag(p_vals, hw);
-#pragma unroll
-                for (int dt = 0; dt < DTiles; ++dt) {
-                    const int d_col = dt * BK + m_row;
-                    const char* v_base = reinterpret_cast<const char*>(v_tile) + ct * BK * VStride * 2;
-                    const v16h v_frag = sageattn_gfx11::load_fp16_col_frag(v_base, d_col, VStride * 2);
-                    out_acc[s][dt] = sageattn_gfx11::wmma_f32_f16(v_frag, p_frag, out_acc[s][dt]);
-                }
-            }
-        }
-        }
 
         if (has_next) {
             // 写前 barrier: 确保所有 warp 完成当前 tile 的 QK/PV 读,
-            // 否则快 warp 覆盖慢 warp 正在读的 k_tile/v_tile (race)
+            // 否则快 warp 覆盖慢 warp 正在读的 k_tile (race)
             __syncthreads();
             for (int i = 0; i < KPrefetchPerThread; ++i) {
                 const int vec = tid + i * THREADS;
@@ -1472,25 +1060,6 @@ for (int64_t kb_base = 0; kb_base < kv_limit; kb_base += BLOCK_N) {
                     *reinterpret_cast<uint4*>(&k_tile[n * KStride + d]) = k_prefetch[i];
                 }
             }
-    if (!SAGEATTN_VT_GLOBAL) {
-            for (int i = 0; i < VPrefetchPerThread; ++i) {
-                const int vec = tid + i * THREADS;
-                if (vec < VVecsTotal) {
-                    const int n = vec / VVecsPerRow;
-                    const int d = (vec - n * VVecsPerRow) * 8;
-                    if constexpr (std::is_same<V_DTYPE, __half>::value) {
-                        *reinterpret_cast<uint4*>(reinterpret_cast<char*>(v_tile) + (n * VStride + d) * 2) = v_prefetch[i];
-                    } else {
-                        const V_DTYPE* vsrc = reinterpret_cast<const V_DTYPE*>(&v_prefetch[i]);
-                        __half* vdst = reinterpret_cast<__half*>(reinterpret_cast<char*>(v_tile) + (n * VStride + d) * 2);
-#pragma unroll
-                        for (int j = 0; j < 8; ++j) {
-                            vdst[j] = __float2half_rn(__bfloat162float(vsrc[j]));
-                        }
-                    }
-                }
-            }
-    }
             __syncthreads();
         }    }
 
@@ -1568,9 +1137,6 @@ void attn_kernel_wpe1_32_t(
     void* __restrict__ output,
     const float* __restrict__ q_scale,
     const float* __restrict__ k_scale,
-    const float* __restrict__ v_scale,
-    const int64_t vs_stride_b,
-    const int64_t vs_stride_h,
     const int64_t batch_size,
     const int64_t qo_len,
     const int64_t kv_len,
@@ -1594,7 +1160,7 @@ void attn_kernel_wpe1_32_t(
     const int64_t ks_stride_h,
     const int tensor_layout) {
     attn_kernel_impl_32_t<HeadDim, IsCausal, BLOCK_M, BLOCK_N, V_DTYPE, OUT_DTYPE>(
-        q, k, v, output, q_scale, k_scale, v_scale, vs_stride_b, vs_stride_h,
+        q, k, v, output, q_scale, k_scale,
         batch_size, qo_len, kv_len, num_qo_heads, num_kv_heads,
         q_stride_b, q_stride_n, q_stride_h,
         k_stride_b, k_stride_n, k_stride_h,
@@ -1615,9 +1181,6 @@ void attn_kernel_wpe4_32_t(
     void* __restrict__ output,
     const float* __restrict__ q_scale,
     const float* __restrict__ k_scale,
-    const float* __restrict__ v_scale,
-    const int64_t vs_stride_b,
-    const int64_t vs_stride_h,
     const int64_t batch_size,
     const int64_t qo_len,
     const int64_t kv_len,
@@ -1641,7 +1204,7 @@ void attn_kernel_wpe4_32_t(
     const int64_t ks_stride_h,
     const int tensor_layout) {
     attn_kernel_impl_32_t<HeadDim, IsCausal, BLOCK_M, BLOCK_N, V_DTYPE, OUT_DTYPE>(
-        q, k, v, output, q_scale, k_scale, v_scale, vs_stride_b, vs_stride_h,
+        q, k, v, output, q_scale, k_scale,
         batch_size, qo_len, kv_len, num_qo_heads, num_kv_heads,
         q_stride_b, q_stride_n, q_stride_h,
         k_stride_b, k_stride_n, k_stride_h,
@@ -1661,9 +1224,6 @@ void attn_kernel_wpe1_t(
     void* __restrict__ output,
     const float* __restrict__ q_scale,
     const float* __restrict__ k_scale,
-    const float* __restrict__ v_scale,
-    const int64_t vs_stride_b,
-    const int64_t vs_stride_h,
     const int64_t batch_size,
     const int64_t qo_len,
     const int64_t kv_len,
@@ -1687,7 +1247,7 @@ void attn_kernel_wpe1_t(
     const int64_t ks_stride_h,
     const int tensor_layout) {
     attn_kernel_impl_t<HeadDim, IsCausal, BLOCK_M, BLOCK_N, V_DTYPE, OUT_DTYPE>(
-        q, k, v, output, q_scale, k_scale, v_scale, vs_stride_b, vs_stride_h,
+        q, k, v, output, q_scale, k_scale,
         batch_size, qo_len, kv_len, num_qo_heads, num_kv_heads,
         q_stride_b, q_stride_n, q_stride_h,
         k_stride_b, k_stride_n, k_stride_h,
@@ -1708,9 +1268,6 @@ void attn_kernel_wpe2_t(
     void* __restrict__ output,
     const float* __restrict__ q_scale,
     const float* __restrict__ k_scale,
-    const float* __restrict__ v_scale,
-    const int64_t vs_stride_b,
-    const int64_t vs_stride_h,
     const int64_t batch_size,
     const int64_t qo_len,
     const int64_t kv_len,
@@ -1734,7 +1291,7 @@ void attn_kernel_wpe2_t(
     const int64_t ks_stride_h,
     const int tensor_layout) {
     attn_kernel_impl_t<HeadDim, IsCausal, BLOCK_M, BLOCK_N, V_DTYPE, OUT_DTYPE>(
-        q, k, v, output, q_scale, k_scale, v_scale, vs_stride_b, vs_stride_h,
+        q, k, v, output, q_scale, k_scale,
         batch_size, qo_len, kv_len, num_qo_heads, num_kv_heads,
         q_stride_b, q_stride_n, q_stride_h,
         k_stride_b, k_stride_n, k_stride_h,
@@ -1755,9 +1312,6 @@ void attn_kernel_wpe4_t(
     void* __restrict__ output,
     const float* __restrict__ q_scale,
     const float* __restrict__ k_scale,
-    const float* __restrict__ v_scale,
-    const int64_t vs_stride_b,
-    const int64_t vs_stride_h,
     const int64_t batch_size,
     const int64_t qo_len,
     const int64_t kv_len,
@@ -1781,7 +1335,7 @@ void attn_kernel_wpe4_t(
     const int64_t ks_stride_h,
     const int tensor_layout) {
     attn_kernel_impl_t<HeadDim, IsCausal, BLOCK_M, BLOCK_N, V_DTYPE, OUT_DTYPE>(
-        q, k, v, output, q_scale, k_scale, v_scale, vs_stride_b, vs_stride_h,
+        q, k, v, output, q_scale, k_scale,
         batch_size, qo_len, kv_len, num_qo_heads, num_kv_heads,
         q_stride_b, q_stride_n, q_stride_h,
         k_stride_b, k_stride_n, k_stride_h,
@@ -1826,13 +1380,11 @@ __device__ __forceinline__ void direct_attn_kernel_impl_t(
     constexpr int DTiles = HeadDim / BK;
     constexpr int ColTiles = BLOCK_N / BK;
     constexpr int KStride = HeadDim + LDS_PAD;
-    constexpr int VStride = HeadDim + LDS_PAD;
 
     __shared__ QK_DTYPE k_tile[BLOCK_N * KStride];
-    // VT_GLOBAL=1 时 V 直接从全局 V_T 行读 (LDS v_tile 缓存经实测为负优化:
+    // V 直接从全局 V_T 行读 (LDS v_tile 缓存经实测为负优化:
     // D=64 短序列 kv-tile 少, 原 PV 冗余读多命中 L2, V 拷贝+barrier 是纯开销,
     // SDXL10 +24% 慢; 与 VAE (D=128 超长, L2 带宽饱和) 相反)
-    __shared__ __half v_tile[(SAGEATTN_VT_GLOBAL) ? 1 : (BLOCK_N * VStride)];
 
     const int tid = threadIdx.x;
     const int lane = tid & 31;
@@ -1881,16 +1433,10 @@ __device__ __forceinline__ void direct_attn_kernel_impl_t(
     // V_T n 维 (core.py padding 到 64 倍数), 见 attn_kernel_impl_t 说明
     const int64_t v_t_n = ((kv_len + 63) / 64) * 64;
     constexpr int KVecsPerRow = HeadDim / 8;
-    constexpr int VVecsPerRow = HeadDim / 8;
     constexpr int KVecsTotal = BLOCK_N * KVecsPerRow;
-    constexpr int VVecsTotal = BLOCK_N * VVecsPerRow;
     constexpr int KPrefetchPerThread = (KVecsTotal + THREADS - 1) / THREADS;
-    constexpr int VPrefetchPerThread = (VVecsTotal + THREADS - 1) / THREADS;
 
     uint4 k_prefetch[KPrefetchPerThread];
-    // VT_GLOBAL=1 时 V 从全局 V_T 行读 (无 LDS), v_prefetch 完全不用:
-    // 缩为 1 元素省 (VPrefetchPerThread-1)*4 个 VGPR (编译期常量三元)
-    uint4 v_prefetch[(SAGEATTN_VT_GLOBAL) ? 1 : VPrefetchPerThread];
 
     for (int i = tid; i < KVecsTotal; i += THREADS) {
         const int n = i / KVecsPerRow;
@@ -1904,29 +1450,6 @@ __device__ __forceinline__ void direct_attn_kernel_impl_t(
                 *reinterpret_cast<const uint4*>(k + k_off);
         } else {
             *reinterpret_cast<uint4*>(&k_tile[n * KStride + d]) = make_uint4(0, 0, 0, 0);
-        }
-    }
-    for (int i = tid; i < VVecsTotal; i += THREADS) {
-        const int n = i / VVecsPerRow;
-        const int d = (i - n * VVecsPerRow) * 8;
-        const int64_t v_idx = n;
-        if (v_idx < kv_len) {
-            const int64_t v_off = (tensor_layout == kHND) ?
-                (b * v_stride_b + hkv * v_stride_h + v_idx * v_stride_n + d) :
-                (b * v_stride_b + v_idx * v_stride_n + hkv * v_stride_h + d);
-            if constexpr (std::is_same<V_DTYPE, __half>::value) {
-                *reinterpret_cast<uint4*>(reinterpret_cast<char*>(v_tile) + (n * VStride + d) * 2) =
-                    *reinterpret_cast<const uint4*>(v + v_off);
-            } else {
-                const V_DTYPE* vsrc = v + v_off;
-                __half* vdst = reinterpret_cast<__half*>(reinterpret_cast<char*>(v_tile) + (n * VStride + d) * 2);
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    vdst[j] = __float2half_rn(__bfloat162float(vsrc[j]));
-                }
-            }
-        } else {
-            *reinterpret_cast<uint4*>(reinterpret_cast<char*>(v_tile) + (n * VStride + d) * 2) = make_uint4(0, 0, 0, 0);
         }
     }
     __syncthreads();
@@ -1956,25 +1479,6 @@ for (int64_t kb_base = 0; kb_base < kv_limit; kb_base += BLOCK_N) {
                     }
                 }
             }
-    if (!SAGEATTN_VT_GLOBAL) {
-#pragma unroll
-            for (int i = 0; i < VPrefetchPerThread; ++i) {
-                const int vec = tid + i * THREADS;
-                if (vec < VVecsTotal) {
-                    const int n = vec / VVecsPerRow;
-                    const int d = (vec - n * VVecsPerRow) * 8;
-                    const int64_t v_idx = next_base + n;
-                    if (v_idx < kv_len) {
-                        const int64_t v_off = (tensor_layout == kHND) ?
-                            (b * v_stride_b + hkv * v_stride_h + v_idx * v_stride_n + d) :
-                            (b * v_stride_b + v_idx * v_stride_n + hkv * v_stride_h + d);
-                        v_prefetch[i] = *reinterpret_cast<const uint4*>(v + v_off);
-                    } else {
-                        v_prefetch[i] = make_uint4(0, 0, 0, 0);
-                    }
-                }
-            }
-    }
         }
 
         float score_cache[ColTiles][8];
@@ -2046,8 +1550,7 @@ for (int64_t kb_base = 0; kb_base < kv_limit; kb_base += BLOCK_N) {
         row_l += partial_sm + permlanex16(partial_sm);
 
         // ---- P fragment 寄存器组装 + PV ----
-        // SAGEATTN_VT_GLOBAL=1: V 已转置为 V_T, 用 out = P @ V (B operand 行读 b128)
-        if (SAGEATTN_VT_GLOBAL) {
+        // V 已转置为 V_T, 用 out = P @ V (B operand 行读 b128):
         // out^T = V^T @ P^T: A = V^T (V_T 行读), B = P^T (p_frag), C = out^T (匹配写回)
 #pragma unroll
         for (int ct = 0; ct < ColTiles; ++ct) {
@@ -2063,25 +1566,9 @@ for (int64_t kb_base = 0; kb_base < kv_limit; kb_base += BLOCK_N) {
                 out_acc[dt] = sageattn_gfx11::wmma_f32_f16(v_frag_t, p_frag, out_acc[dt]);
             }
         }
-        } else {
-#pragma unroll
-        for (int ct = 0; ct < ColTiles; ++ct) {
-            float p_vals[8];
-#pragma unroll
-            for (int e = 0; e < 8; ++e) p_vals[e] = score_cache[ct][e];
-            const v16h p_frag = assemble_p_frag(p_vals, hw);
-#pragma unroll
-            for (int dt = 0; dt < DTiles; ++dt) {
-                const int d_col = dt * BK + m_row;
-                const char* v_base = reinterpret_cast<const char*>(v_tile) + ct * BK * VStride * 2;
-                const v16h v_frag = sageattn_gfx11::load_fp16_col_frag(v_base, d_col, VStride * 2);
-                out_acc[dt] = sageattn_gfx11::wmma_f32_f16(v_frag, p_frag, out_acc[dt]);
-            }
-        }
-        }
 
         if (has_next) {
-            // 写前 barrier: 防止快 warp 覆盖慢 warp 正在读的 k_tile/v_tile
+            // 写前 barrier: 防止快 warp 覆盖慢 warp 正在读的 k_tile
             __syncthreads();
             for (int i = 0; i < KPrefetchPerThread; ++i) {
                 const int vec = tid + i * THREADS;
@@ -2091,25 +1578,6 @@ for (int64_t kb_base = 0; kb_base < kv_limit; kb_base += BLOCK_N) {
                     *reinterpret_cast<uint4*>(&k_tile[n * KStride + d]) = k_prefetch[i];
                 }
             }
-    if (!SAGEATTN_VT_GLOBAL) {
-            for (int i = 0; i < VPrefetchPerThread; ++i) {
-                const int vec = tid + i * THREADS;
-                if (vec < VVecsTotal) {
-                    const int n = vec / VVecsPerRow;
-                    const int d = (vec - n * VVecsPerRow) * 8;
-                    if constexpr (std::is_same<V_DTYPE, __half>::value) {
-                        *reinterpret_cast<uint4*>(reinterpret_cast<char*>(v_tile) + (n * VStride + d) * 2) = v_prefetch[i];
-                    } else {
-                        const V_DTYPE* vsrc = reinterpret_cast<const V_DTYPE*>(&v_prefetch[i]);
-                        __half* vdst = reinterpret_cast<__half*>(reinterpret_cast<char*>(v_tile) + (n * VStride + d) * 2);
-#pragma unroll
-                        for (int j = 0; j < 8; ++j) {
-                            vdst[j] = __float2half_rn(__bfloat162float(vsrc[j]));
-                        }
-                    }
-                }
-            }
-    }
             __syncthreads();
         }
     }
@@ -2263,52 +1731,6 @@ Tensor v_transpose_gfx110x(Tensor value, Tensor value_t, int64_t tensor_layout) 
             static_cast<int>(tensor_layout));
     }
     return value_t;
-}
-
-// V [B,N,H,D] -> V_T_i8 [B,H,D,N] int8 + fp32 tile scales [B,H,ceil(seq/32)]
-// (gfx110x int8 path 单次的量化转置 prepass; 输入支持 fp16/bf16, 输出 int8 V_T)
-Tensor v_quant_transpose_gfx110x(Tensor value, Tensor value_t_i8, Tensor v_scale_t,
-                                 int64_t tensor_layout) {
-    const int64_t batch = value.size(0);
-    const int64_t heads = (tensor_layout == kHND) ? value.size(1) : value.size(2);
-    const int64_t seq_len = (tensor_layout == kHND) ? value.size(2) : value.size(1);
-    const int64_t head_dim = value.size(3);
-    const int64_t v_stride_b = value.stride(0);
-    const int64_t v_stride_n = (tensor_layout == kHND) ? value.stride(2) : value.stride(1);
-    const int64_t v_stride_h = (tensor_layout == kHND) ? value.stride(1) : value.stride(2);
-    const hipStream_t stream = current_hip_stream(value);
-    const int64_t v_t_n = ((seq_len + 63) / 64) * 64;
-    const int64_t ntiles = v_t_n / 32;
-    const int64_t total_tiles = batch * heads * ntiles;
-    dim3 block(256);
-    int64_t grid_cap;
-    const char* vt_grid_env = getenv("SAGEATTN_VT_GRID");
-    if (vt_grid_env && atoi(vt_grid_env) > 0) {
-        grid_cap = atoi(vt_grid_env);
-    } else if (total_tiles <= 4096) {
-        grid_cap = 192;
-    } else {
-        grid_cap = std::min<int64_t>(std::max<int64_t>(total_tiles / 10, 128), 1536);
-    }
-    dim3 grid(static_cast<unsigned>(std::min(total_tiles, grid_cap)));
-    if (value.scalar_type() == ScalarType::BFloat16) {
-        v_quant_transpose_kernel<__hip_bfloat16><<<grid, block, 0, stream>>>(
-            reinterpret_cast<const __hip_bfloat16*>(value.data_ptr()),
-            reinterpret_cast<int8_t*>(value_t_i8.data_ptr()),
-            reinterpret_cast<float*>(v_scale_t.data_ptr()),
-            batch, seq_len, heads, head_dim,
-            v_stride_b, v_stride_n, v_stride_h,
-            static_cast<int>(tensor_layout));
-    } else {
-        v_quant_transpose_kernel<__half><<<grid, block, 0, stream>>>(
-            reinterpret_cast<const __half*>(value.data_ptr()),
-            reinterpret_cast<int8_t*>(value_t_i8.data_ptr()),
-            reinterpret_cast<float*>(v_scale_t.data_ptr()),
-            batch, seq_len, heads, head_dim,
-            v_stride_b, v_stride_n, v_stride_h,
-            static_cast<int>(tensor_layout));
-    }
-    return value_t_i8;
 }
 
 Tensor mean_seq_gfx110x(Tensor input, int64_t tensor_layout) {
@@ -2485,8 +1907,8 @@ Tensor qk_int8_sv_bf16_attn_gfx110x_t(
     const int64_t qs_stride_h = q_scale.stride(1);
     const int64_t ks_stride_b = k_scale.stride(0);
     const int64_t ks_stride_h = k_scale.stride(1);
-    const int64_t vs_stride_b = v_scale.stride(0);
-    const int64_t vs_stride_h = v_scale.stride(1);
+    // v_scale 保留在 op 签名中 (与 gfx103x schema 一致), kernel 已不读取 (int8-V 实验路径已删除)
+    (void)v_scale;
 
     // 实验: SAGEATTN_INT8_WPE 选择 launch wrapper (1=wpe1 默认, 2=wpe2, 4=wpe4)
     const int wpe_sel = getenv("SAGEATTN_INT8_WPE") ? atoi(getenv("SAGEATTN_INT8_WPE")) : 1;
@@ -2512,7 +1934,6 @@ Tensor qk_int8_sv_bf16_attn_gfx110x_t(
     if (bm128_sel == 1) use_bm128_d128 = true;
     else if (bm128_sel == 0) use_bm128_d128 = false;
     else use_bm128_d128 = (kv512 && kv_len >= bm128_thr);
-    constexpr int BLOCK_M_32 = 128;
 
     #define LAUNCH_ATTN_T(HD, CAUSAL, BM, BN, VTYPE, OTYPE, WPE) \
         do { \
@@ -2526,7 +1947,6 @@ Tensor qk_int8_sv_bf16_attn_gfx110x_t(
                 output.data_ptr(), \
                 reinterpret_cast<const float*>(q_scale.data_ptr()), \
                 reinterpret_cast<const float*>(k_scale.data_ptr()), \
-                reinterpret_cast<const float*>(v_scale.data_ptr()), vs_stride_b, vs_stride_h, \
                 batch, qo_len, kv_len, q_heads, kv_heads, \
                 q_stride_b, q_stride_n, q_stride_h, \
                 k_stride_b, k_stride_n, k_stride_h, \
@@ -2542,7 +1962,6 @@ Tensor qk_int8_sv_bf16_attn_gfx110x_t(
                 output.data_ptr(), \
                 reinterpret_cast<const float*>(q_scale.data_ptr()), \
                 reinterpret_cast<const float*>(k_scale.data_ptr()), \
-                reinterpret_cast<const float*>(v_scale.data_ptr()), vs_stride_b, vs_stride_h, \
                 batch, qo_len, kv_len, q_heads, kv_heads, \
                 q_stride_b, q_stride_n, q_stride_h, \
                 k_stride_b, k_stride_n, k_stride_h, \
@@ -2558,7 +1977,6 @@ Tensor qk_int8_sv_bf16_attn_gfx110x_t(
                 output.data_ptr(), \
                 reinterpret_cast<const float*>(q_scale.data_ptr()), \
                 reinterpret_cast<const float*>(k_scale.data_ptr()), \
-                reinterpret_cast<const float*>(v_scale.data_ptr()), vs_stride_b, vs_stride_h, \
                 batch, qo_len, kv_len, q_heads, kv_heads, \
                 q_stride_b, q_stride_n, q_stride_h, \
                 k_stride_b, k_stride_n, k_stride_h, \
@@ -2567,27 +1985,6 @@ Tensor qk_int8_sv_bf16_attn_gfx110x_t(
                 qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
                 static_cast<int>(tensor_layout)); \
             } \
-        } while(0)
-
-    #define LAUNCH_ATTN_WPE2_T(HD, CAUSAL, BM, BN, VTYPE, OTYPE) \
-        do { \
-            dim3 block(BM / 16 * 32); \
-            dim3 grid((qo_len + BM - 1) / BM, q_heads, batch); \
-            attn_kernel_wpe2_t<HD, CAUSAL, BM, BN, VTYPE, OTYPE><<<grid, block, 0, stream>>>( \
-                reinterpret_cast<const int8_t*>(query.data_ptr()), \
-                reinterpret_cast<const int8_t*>(key.data_ptr()), \
-                reinterpret_cast<const VTYPE*>(value.data_ptr()), \
-                output.data_ptr(), \
-                reinterpret_cast<const float*>(q_scale.data_ptr()), \
-                reinterpret_cast<const float*>(k_scale.data_ptr()), \
-                reinterpret_cast<const float*>(v_scale.data_ptr()), vs_stride_b, vs_stride_h, \
-                batch, qo_len, kv_len, q_heads, kv_heads, \
-                q_stride_b, q_stride_n, q_stride_h, \
-                k_stride_b, k_stride_n, k_stride_h, \
-                v_stride_b, v_stride_n, v_stride_h, \
-                o_stride_b, o_stride_n, o_stride_h, \
-                qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h, \
-                static_cast<int>(tensor_layout)); \
         } while(0)
 
     #define LAUNCH_ATTN_T32_WPE1(HD, CAUSAL, BM, BN, VTYPE, OTYPE) \
@@ -2599,7 +1996,6 @@ Tensor qk_int8_sv_bf16_attn_gfx110x_t(
                 output.data_ptr(), \
                 reinterpret_cast<const float*>(q_scale.data_ptr()), \
                 reinterpret_cast<const float*>(k_scale.data_ptr()), \
-                reinterpret_cast<const float*>(v_scale.data_ptr()), vs_stride_b, vs_stride_h, \
                 batch, qo_len, kv_len, q_heads, kv_heads, \
                 q_stride_b, q_stride_n, q_stride_h, \
                 k_stride_b, k_stride_n, k_stride_h, \
@@ -2619,7 +2015,6 @@ Tensor qk_int8_sv_bf16_attn_gfx110x_t(
                 output.data_ptr(), \
                 reinterpret_cast<const float*>(q_scale.data_ptr()), \
                 reinterpret_cast<const float*>(k_scale.data_ptr()), \
-                reinterpret_cast<const float*>(v_scale.data_ptr()), vs_stride_b, vs_stride_h, \
                 batch, qo_len, kv_len, q_heads, kv_heads, \
                 q_stride_b, q_stride_n, q_stride_h, \
                 k_stride_b, k_stride_n, k_stride_h, \
@@ -2634,11 +2029,8 @@ Tensor qk_int8_sv_bf16_attn_gfx110x_t(
     // 实验: D=64 self 32w kernel 的 BM (SAGEATTN_D64_32W_BM 64/128, 默认 128)
     const int d64_bm = getenv("SAGEATTN_D64_32W_BM") ? atoi(getenv("SAGEATTN_D64_32W_BM")) : 128;
 
-    // V 输入与输出 dtype 分离:
-    //   fp16 输入: V=__half (uint4 拷贝), OUT=__half (现状)
-    //   bf16 输入(方案B): V=__half (core 预转 fp16, 带宽受限高效), OUT=__hip_bfloat16 (kernel 直接写 bf16)
-    //   bf16 直通(备选): V=__hip_bfloat16 (kernel 内转换, 实测 1.6-5.5% 开销)
-    const bool v_is_bf16 = (value.scalar_type() == ScalarType::BFloat16);
+    // V 输入与输出 dtype 分离 (V 恒为 fp16 V_T, core.py 经 v_transpose 预转):
+    //   fp16 输入: OUT=__half; bf16 输入: OUT=__hip_bfloat16 (kernel 直接写 bf16)
     const bool out_is_bf16 = (output.scalar_type() == ScalarType::BFloat16);
 
     #define LAUNCH_ATTN_ALL(VT, OT) \
@@ -2715,17 +2107,10 @@ Tensor qk_int8_sv_bf16_attn_gfx110x_t(
             } \
         } while(0)
 
-    const bool v_is_i8 = (value.scalar_type() == ScalarType::Char);
-
-    if (v_is_i8) {
-        if (out_is_bf16) { LAUNCH_ATTN_ALL(int8_t, __hip_bfloat16); }
-        else { LAUNCH_ATTN_ALL(int8_t, __half); }
-    } else if (v_is_bf16) { LAUNCH_ATTN_ALL(__hip_bfloat16, __hip_bfloat16); }
-    else if (out_is_bf16) { LAUNCH_ATTN_ALL(__half, __hip_bfloat16); }
+    if (out_is_bf16) { LAUNCH_ATTN_ALL(__half, __hip_bfloat16); }
     else { LAUNCH_ATTN_ALL(__half, __half); }
     #undef LAUNCH_ATTN_ALL
     #undef LAUNCH_ATTN_T
-    #undef LAUNCH_ATTN_WPE2_T
 
     return output;
 }
