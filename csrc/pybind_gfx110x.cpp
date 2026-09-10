@@ -18,7 +18,7 @@ PyMODINIT_FUNC PyInit__qattn_gfx110x(void)
 STABLE_TORCH_LIBRARY(sageattention, m) {
     m.def("qk_int8_sv_bf16_attn_t("
             "Tensor query, Tensor key, Tensor value, Tensor(a!) output, "
-            "Tensor q_scale, Tensor k_scale, int tensor_layout, "
+            "Tensor q_scale, Tensor k_scale, Tensor v_scale, int tensor_layout, "
             "int is_causal, float sm_scale, Tensor q_fp"
           ") -> Tensor");
     m.def("fp16_attn_t("
@@ -35,6 +35,8 @@ STABLE_TORCH_LIBRARY(sageattention, m) {
           ") -> Tensor[]");
     m.def("mean_seq(Tensor input, int tensor_layout) -> Tensor");
     m.def("v_transpose(Tensor value, Tensor(a!) value_t, int tensor_layout) -> Tensor");
+    m.def("v_quant_transpose(Tensor value, Tensor(a!) value_t_i8, Tensor(a!) v_scale_t, "
+            "int tensor_layout) -> Tensor");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(sageattention, CUDA, m) {
@@ -44,4 +46,5 @@ STABLE_TORCH_LIBRARY_IMPL(sageattention, CUDA, m) {
     m.impl("quant_qk_int8", TORCH_BOX(quant_qk_int8_gfx110x));
     m.impl("mean_seq", TORCH_BOX(mean_seq_gfx110x));
     m.impl("v_transpose", TORCH_BOX(v_transpose_gfx110x));
+    m.impl("v_quant_transpose", TORCH_BOX(v_quant_transpose_gfx110x));
 }

@@ -16,6 +16,7 @@ Tensor qk_int8_sv_bf16_attn_gfx110x_t(
     Tensor output,
     Tensor q_scale,
     Tensor k_scale,
+    Tensor v_scale,
     int64_t tensor_layout,
     int64_t is_causal,
     double sm_scale,
@@ -55,3 +56,5 @@ Tensor mean_seq_gfx110x(Tensor input, int64_t tensor_layout);
 
 // V [B,N,H,D] -> V_T [B,H,D,N] (contiguous), 供无 LDS PV 模式
 Tensor v_transpose_gfx110x(Tensor value, Tensor value_t, int64_t tensor_layout);
+Tensor v_quant_transpose_gfx110x(Tensor value, Tensor value_t_i8, Tensor v_scale_t,
+                                 int64_t tensor_layout);

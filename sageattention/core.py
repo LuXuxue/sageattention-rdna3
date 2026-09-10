@@ -14,6 +14,7 @@ _qattn_ops = None
 GFX_NATIVE_ENABLED = False
 GFX_ARCH_LOADED = None  # 记录实际加载的扩展 (gfx110x / gfx103x)
 _import_error = None
+_prepass_vt_stream = None  # 侧流: v_transpose 与 quant prepass 重叠执行 (gfx110x int8 path)
 
 def _detect_gfx_arch():
     """Return 'gfx110x' (RDNA3) or 'gfx103x' (RDNA2) for current HIP device, or None."""
@@ -228,20 +229,51 @@ def sageattn(
             elif v.dtype != torch.float16:
                 v_for_attn = v.to(torch.float16)
         else:
-            # gfx110x: global V transpose [B,H,D,N], n padded to 64-multiple
-            # (matches kernel's v_t_n stride; prevents 32B row-read OOB -> NaN).
-            if v.dtype != torch.float16:
-                v_for_attn16 = v.to(torch.float16)
-            else:
-                v_for_attn16 = v
+            # gfx110x: V 预处理选路。SAGEATTN_INT8_V=1 -> 量化转置 int8 (4KB/tile, 特征实验性);
+            # 默认 0 -> fp16 V_T 快路径 (wmma/L2 带宽友好; 780M 实测 int8-V 全线反而 +11~61% 变慢,
+            # LDS round-trip / 16B in-loop 读是结构代价, 无 DRAM 收益).
             kv_heads_n = k.size(1) if tensor_layout == "HND" else k.size(2)
             padded_n = ((kv_len_actual + 63) // 64) * 64
-            v_t = torch.empty(
-                q.size(0), kv_heads_n, headdim, padded_n,
-                device=q.device, dtype=torch.float16
-            )
-            ops.v_transpose(v_for_attn16, v_t, layout_code)
-            v_for_attn = v_t
+            n_tiles32 = (kv_len_actual + 31) // 32
+            if os.getenv("SAGEATTN_INT8_V", "0") != "0":
+                v_for_attn16 = v
+                v_t = torch.empty(
+                    q.size(0), kv_heads_n, headdim, padded_n,
+                    device=q.device, dtype=torch.int8
+                )
+                v_scale_t = torch.empty(
+                    q.size(0), kv_heads_n, n_tiles32,
+                    device=q.device, dtype=torch.float32
+                )
+                global _prepass_vt_stream
+                if _prepass_vt_stream is None:
+                    _prepass_vt_stream = torch.cuda.Stream()
+                if os.getenv("SAGEATTN_VT_OVERLAP", "1") == "0":
+                    ops.v_quant_transpose(v_for_attn16, v_t, v_scale_t, layout_code)
+                else:
+                    # 侧流读取的 v 由主流产生: 必须先让侧流等待主流已入队的 v 生产者,
+                    # 否则侧流与主流的 v 写入竞争 -> 时好时坏的 UB (NaN / 大误差)。
+                    _prepass_vt_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(_prepass_vt_stream):
+                        ops.v_quant_transpose(v_for_attn16, v_t, v_scale_t, layout_code)
+                v_for_attn = v_t
+            else:
+                # fp16 V 快路径 (与历史 qk_int8_sv fp16-V 一致): bf16 输入由 v_transpose 内部转 fp16
+                # (直接传 bf16, 省 .to(fp16) 独立 cast kernel ~0.5ms 临界路径开销)
+                # 注: 侧流重叠 (SAGEATTN_VT_OVERLAP=1) 实测负收益 (780M stream sync 延迟 > 节省), 故串行
+                # 注: native-V 单遍 (in-kernel 转置, SAGEATTN_VT_NATIVE) 实测净亏损 10-17%, 已弃
+                v_for_attn16 = v
+                v_t = torch.empty(
+                    q.size(0), kv_heads_n, headdim, padded_n,
+                    device=q.device, dtype=torch.float16
+                )
+                ops.v_transpose(v_for_attn16, v_t, layout_code)
+                v_for_attn = v_t
+                # v_scale 占位 (kernel VTYPE!=int8 时不读取), 仅满足 pybind 签名
+                v_scale_t = torch.empty(
+                    q.size(0), kv_heads_n, n_tiles32,
+                    device=q.device, dtype=torch.float32
+                )
         o_int8 = o
 
         # smooth_k: K 减 mean 后再量化, 仅当 K 有显著非零 DC 偏置时有价值, 默认 False
@@ -250,29 +282,16 @@ def sageattn(
             k_mean = ops.mean_seq(k, layout_code)
         else:
             k_mean = torch.empty(0, device=q.device, dtype=q.dtype)
-        # v10 INQ (in-kernel Q int8 quant): for small kv the q8 prepass round-trip
-        # dominates end-to-end time, so the main kernel quantizes Q itself from the
-        # fp16/bf16 source and the prepass skips Q entirely. Gate must match the
-        # .cu dispatch (v10 on & !causal & kv<=1024 & !IPV).
-        v10_on = True
-        ipv_on = False
-        inq_wanted = (kv_len_actual <= 1024)
-        q_skip_inq = bool(
-            headdim in (64, 128) and not is_causal and v10_on and not ipv_on and inq_wanted
-            and q.is_contiguous()
-        )
-        q_for_inq = q
-        if q_skip_inq:
-            if tensor_layout == "NHD":
-                b_, s_, h_, d_ = q.shape
-                q_for_inq = q.as_strided((b_, h_, s_, d_), (s_ * h_ * d_, d_, h_ * d_, 1))
         q_int8, q_scale, k_int8, k_scale = ops.quant_qk_int8(
-            q, k, k_mean, layout_code, sm_scale, int(q_skip_inq)
+            q, k, k_mean, layout_code, sm_scale, 0
         )
+        # 侧流 vt 完成后主流才能读 v_t: 使主流 (含之后的 attn kernel) 等待侧流事件
+        if _prepass_vt_stream is not None:
+            torch.cuda.current_stream().wait_stream(_prepass_vt_stream)
         ops.qk_int8_sv_bf16_attn_t(
             q_int8, k_int8, v_for_attn, o_int8,
-            q_scale, k_scale,
-            layout_code, int(is_causal), sm_scale, q_for_inq
+            q_scale, k_scale, v_scale_t,
+            layout_code, int(is_causal), sm_scale, torch.empty(0, device=q.device, dtype=q.dtype)
         )
 
     if input_dtype == torch.float32:
