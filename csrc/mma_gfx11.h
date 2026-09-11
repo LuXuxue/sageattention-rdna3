@@ -22,7 +22,6 @@ __device__ __forceinline__ float fast_exp2(float x) {
     return exp2f(x);
 }
 
-// fp16 位模式 -> _Float16 (v16h 元素类型), 避免依赖 __half<->_Float16 隐式转换
 __device__ __forceinline__ _Float16 f16_from_bits(unsigned bits) {
     _Float16 r;
     __builtin_memcpy(&r, &bits, sizeof(_Float16));
@@ -30,7 +29,6 @@ __device__ __forceinline__ _Float16 f16_from_bits(unsigned bits) {
 }
 
 // v_permlanex16_b32: XOR-16 跨半波交换 (lane L <-> lane L^16)
-// 已在 gfx1103 上验证: s=0x76543210 + op_sel:[1,0] 产生精确的 XOR-16 映射
 __device__ __forceinline__ float permlanex16(float src) {
     float result;
     asm volatile("v_permlanex16_b32 %0, %1, %2, %3 op_sel:[1,0]"
@@ -72,19 +70,9 @@ __device__ __forceinline__ v8f wmma_f32_f16(v16h a, v16h b, v8f c) {
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
 }
 
-// ===== 转置布局 (Triton 风格) helpers =====
-// 转置 QK: qk^T = k @ q^T (WMMA operand 交换)。输出布局:
-//   lane L 持有 qk 行 (L&15) 的列 {ct*16 + 2e + (L>>4)}, e=0..7
-//   即: lane 0-15 持有偶数列, lane 16-31 持有奇数列 (同一行!)
-// 转置 PV: out^T = V^T @ P^T。输出布局:
-//   lane L 持有 out 行 (L&15) 的 D 列 {dt*16 + 2e + (L>>4)}
-
-// 组装 P B-fragment: 生成 P 行 (L&15) 的完整 16 列 (WMMA B operand = P^T 的列 L&15)
-// p_vals[e] = P[L&15][2e+hw] (本 lane 的 8 个值)
-// 通过 permlanex16 与 lane^16 交换, 获得同行的奇/偶列
-// v2: 用 8 个 cndmask (u32 粒度) 替代 16 个 per-half cndmask
+// 组装 P B-fragment: 生成 P 行 (L&15) 的完整 16 列 (WMMA B operand = P^T 的列 L&15)。
+// p_vals[e] = P[L&15][2e+hw] (本 lane 的 8 个值), 通过 permlanex16 与 lane^16 交换得奇/偶列。
 __device__ __forceinline__ v16h assemble_p_frag(const float p_vals[8], int hw) {
-    // float -> fp16 打包成 32-bit 对: pack[k] = {p[2k], p[2k+1]} (列 {4k+hw, 4k+2+hw})
     unsigned pack[4];
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
@@ -93,24 +81,15 @@ __device__ __forceinline__ v16h assemble_p_frag(const float p_vals[8], int hw) {
         pack[k] = (static_cast<unsigned>(__half_as_ushort(hi)) << 16) |
                   static_cast<unsigned>(__half_as_ushort(lo));
     }
-    // 与 lane^16 交换打包对
     unsigned cross[4];
 #pragma unroll
     for (int k = 0; k < 4; ++k) cross[k] = permlanex16_u32(pack[k]);
-
-    // hw=0 (偶列): even=pack, odd=cross; hw=1 (奇列): even=cross, odd=pack
-    // 用 u32 粒度 cndmask: 8 次选择
     unsigned even[4], odd[4];
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
         even[k] = (hw == 0) ? pack[k] : cross[k];
         odd[k] = (hw == 0) ? cross[k] : pack[k];
     }
-
-    // 交错: b[4k]   = even[k] lo (偶列 4k)
-    //       b[4k+1] = odd[k]  lo (奇列 4k+1)
-    //       b[4k+2] = even[k] hi (偶列 4k+2)
-    //       b[4k+3] = odd[k]  hi (奇列 4k+3)
     v16h b;
 #pragma unroll
     for (int k = 0; k < 4; ++k) {

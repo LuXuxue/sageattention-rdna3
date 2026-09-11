@@ -2,17 +2,16 @@ import torch
 import os
 from typing import Any, Optional, Tuple, Union
 
-
 # Backend selection via environment variable:
-#   SAGEATTN_BACKEND=triton            - Triton autotune kernel
-#   SAGEATTN_BACKEND=native            - HIP native WMMA kernel
+#   SAGEATTN_BACKEND=triton - Triton autotune kernel
+#   SAGEATTN_BACKEND=native - HIP native WMMA kernel
 _BACKEND = os.getenv("SAGEATTN_BACKEND", "native").lower()
 
-# 运行时懒加载 native extension: 按当前 HIP 设备的 gfx arch 选择 _qattn_gfx110x (RDNA3) 或 _qattn_gfx103x (RDNA2)
-# 避免 import 时硬编码单架构; 同进程只加载匹配设备的一个 pyd, torch.ops.sageattention 注册不冲突
+# 按当前 HIP 设备的 gfx arch 懒加载 _qattn_gfx110x (RDNA3) 或 _qattn_gfx103x (RDNA2)。
+# 同进程只加载匹配设备的一个 pyd; 两扩展注册到同一 torch.ops.sageattention 库, 故 schema 必须一致。
 _qattn_ops = None
 GFX_NATIVE_ENABLED = False
-GFX_ARCH_LOADED = None  # 记录实际加载的扩展 (gfx110x / gfx103x)
+GFX_ARCH_LOADED = None
 _import_error = None
 
 def _detect_gfx_arch():
@@ -22,7 +21,7 @@ def _detect_gfx_arch():
             return None
         dev = torch.cuda.current_device()
         prop = torch.cuda.get_device_properties(dev)
-        # 优先 gcnArchName (ROCm HIP 返回 "gfx1103" 等); 回退 major 整型
+        # 优先 gcnArchName (ROCm HIP 返回 "gfx1103" 等); 回退 prop.major 整型
         name = getattr(prop, 'gcnArchName', None) or getattr(prop, 'name', '')
         if isinstance(name, str) and name.startswith('gfx'):
             if name.startswith('gfx11'):
@@ -30,7 +29,6 @@ def _detect_gfx_arch():
             if name.startswith('gfx103'):
                 return 'gfx103x'
             return None
-        # 回退: prop.major 是 gfx major (gfx1103 -> 11)
         mj = getattr(prop, 'major', None)
         if mj == 11:
             return 'gfx110x'
@@ -123,10 +121,8 @@ def sageattn(
 
     ops = _get_native_ops()
 
-    # native 写回为 16B 向量写: o_off = b*stride_b + n*stride_n + h*stride_h + d, d 恒为 8 倍数,
-    # 故 q 的 stride_b/n/h 均需为 8 倍数 (o=empty_like(q) 继承 stride)。
-    # contiguous 输入恒满足; 非 contiguous 的 q (permute/slice) 会导致未对齐 16B 写 (UB)。
-    # 注意: 该断言只约束 q (决定 o 的布局), k/v 仅需 head_dim stride==1 (上面已断言)。
+    # 写回为 16B 向量写 (d 恒为 8 倍数), 故 q 的 stride_b/n/h 均须为 8 倍数 (o=empty_like(q) 继承 stride)。
+    # 非 contiguous 的 q (permute/slice) 会导致未对齐 16B 写 (UB)。k/v 仅需 head_dim stride==1 (上面已断言)。
     assert q.stride(0) % 8 == 0 and q.stride(1) % 8 == 0 and q.stride(2) % 8 == 0, (
         "native backend requires q strides that are multiples of 8 halfs "
         "(16B aligned write-back). "
@@ -135,12 +131,10 @@ def sageattn(
 
     layout_code = 1 if tensor_layout == "HND" else 0
 
-    # 实验参数: bm_sel 控制 direct kernel 的 BM (0=默认, 1=32, 2=128)
+    # bm_sel 控制 direct kernel 的 BM (0=默认, 1=32, 2=128), 仅 gfx1103 使用。
     bm_sel = int(kwargs.get("bm_sel", 0) or os.getenv("SAGEATTN_BM_SEL", "0"))
 
     o = torch.empty_like(q)
-    # 注: 写回为 16B 向量写, 要求 o 的 head_dim 维连续 (stride 1) 且 o_off 8-half 对齐;
-    #     empty_like(q) 恒 contiguous 满足 (core 断言 q.stride(-1)==1)
 
     if tensor_layout == "HND":
         kv_len_actual = k.size(2)
@@ -149,21 +143,10 @@ def sageattn(
         kv_len_actual = k.size(1)
         q_len = q.size(1)
 
-    # gfx1035 (RDNA2 iGPU) dispatch policy (scanned 2026-09):
-    #   - int8 v10 (with INQ for non-causal kv<=1024) is the only path used by default.
-    #   - direct (V_T + fp16/bf16_attn_t) is 4-65x slower than int8 at every cross/self
-    #     shape measured (D64 HND q512/kv2048 direct=49.8ms vs int8=1.15ms; NHD same;
-    #     D128 cross similar 4.7-6.5x losses). Even the historical "small kv wins"
-    #     claim (kv<=6144/4096) does not hold on the current direct kernel.
-    #   - Causal direct is also 6-8x slower (core's own known issue).
-    #   - Therefore on gfx1035 the cross thresholds are forced to 0 (always int8) and
-    #     the direct path is no longer reachable from default dispatch.
-    #   - For gfx1103 (RDNA3) the existing direct/int8 balance is preserved.
+    # gfx1035 (RDNA2) 恒走 int8 (direct 在所有形状下 4-65x 慢于 int8); gfx1103 保持 direct/int8 平衡。
     arch = getattr(torch.cuda.get_device_properties(torch.cuda.current_device()), 'gcnArchName', None)
     is_gfx103 = isinstance(arch, str) and arch.startswith('gfx103')
     if headdim == 64:
-        # gfx1103 (RDNA3) keeps the historical cross thresholds; gfx1035 always int8
-        # (扫描 2026-09: direct 在所有 cross/self/causal 形状下 4-65x 慢于 int8)。
         if is_gfx103:
             use_direct = False
         else:
@@ -186,11 +169,9 @@ def sageattn(
                 use_direct = (kv_len_actual <= thr_d128)
 
     if use_direct:
-        # V 直接交给 v_transpose: bf16 输入由 kernel 内部转 fp16 (省 v.to(fp16) 独立 kernel)
+        # V 直接交给 v_transpose: bf16 由 kernel 内部转 fp16 (省独立 cast kernel)。
+        # V_T [B,H,D,N] 的 n 维 padding 到 64 倍数并填 0, 防 attn kernel 的 v_frag_t 32B 直读越界。
         v_attn = v
-        # V 全局转置 (V_T [B,H,D,N]) + out = P @ V: 需配套 -DSAGEATTN_VT_GLOBAL=1 编译 (setup.py 默认)
-        # 注意: V_T 的 n 维 padding 到 64 的倍数 (防 attn kernel 的 v_frag_t 32B 直读越界,
-        # kv_len 非 64 倍数时最后 kv-tile 越界读未初始化内存 -> NaN; padding 区由 v_transpose 填 0)
         kv_heads_n = k.size(1) if tensor_layout == "HND" else k.size(2)
         padded_n = ((kv_len_actual + 63) // 64) * 64
         v_t = torch.empty(
@@ -210,12 +191,8 @@ def sageattn(
                 layout_code, int(is_causal), sm_scale, bm_sel
             )
     else:
-        # int8 path. RDNA2 (gfx103x v8/v10 main kernels) read native [B,H,N,D] V
-        # directly (no V_T transpose); NHD input V is exposed as a zero-copy HND
-        # view via as_strided. RDNA3 (gfx110x) main kernels are compiled with
-        # -DSAGEATTN_VT_GLOBAL=1 and read V_T [B,H,D,N] (padded n to 64), so for
-        # gfx1103 we must globally transpose V just like the direct path does.
-        v_native = is_gfx103  # gfx110x int8 kernels require V_T; gfx103x use native
+        # int8 路径: gfx103x 直接读 native [B,H,N,D] V; gfx110x 内核读 V_T [B,H,D,N], 需全局转置。
+        v_native = is_gfx103
         kv_heads_n = k.size(1) if tensor_layout == "HND" else k.size(2)
         if v_native:
             v_for_attn = v
@@ -234,9 +211,7 @@ def sageattn(
                 device=q.device, dtype=torch.float32
             )
         else:
-            # gfx110x: fp16 V_T 快路径 (wmma/L2 带宽友好; 实测 int8-V 全线反而 +11~61% 变慢,
-            # LDS round-trip / 16B in-loop 读是结构代价, 无 DRAM 收益, 已弃)。
-            # bf16 输入由 v_transpose 内部转 fp16 (直接传 bf16, 省 .to(fp16) 独立 cast kernel ~0.5ms 临界路径开销)
+            # gfx110x: bf16 输入由 v_transpose 内部转 fp16, 直接传 bf16 (省 .to(fp16) cast kernel)。
             padded_n = ((kv_len_actual + 63) // 64) * 64
             v_t = torch.empty(
                 q.size(0), kv_heads_n, headdim, padded_n,
@@ -251,17 +226,15 @@ def sageattn(
             )
         o_int8 = o
 
-        # smooth_k: K 减 mean 后再量化, 仅当 K 有显著非零 DC 偏置时有价值, 默认 False
+        # smooth_k: K 减 mean 后再量化, 默认 False。
         smooth_k = kwargs.get("smooth_k", False)
         if smooth_k:
             k_mean = ops.mean_seq(k, layout_code)
         else:
             k_mean = torch.empty(0, device=q.device, dtype=q.dtype)
-        # v10 INQ (in-kernel Q int8 quant): 小 kv 时 prepass 的 Q 量化 round-trip
-        # 主导端到端时间, 主 kernel 直接从 fp16/bf16 源在核内量化 Q, prepass 跳过 Q。
-        # 此路径仅 gfx103x 支持 (gfx110x 主 kernel 忽略 q_fp, 必须用 prepass 的 q_int8)。
-        # 注意: 若对 gfx103x 去掉 INQ (skip_q=0 + 空 q_fp), 非因果小 kv 的精度会从 ~1%
-        # 恶化到 >70% 相对误差 (commit 484fdce 的回归, 本修复已恢复)。
+        # v10 INQ (in-kernel Q int8 quant): 小 kv 时 prepass 的 Q 量化 round-trip 主导端到端时间,
+        # 主 kernel 从 fp16/bf16 源在核内量化 Q, prepass 跳过 Q。仅 gfx103x 支持
+        # (gfx110x 主 kernel 忽略 q_fp, 必须用 prepass 的 q_int8)。去掉 INQ 会恶化非因果小 kv 精度。
         q_skip_inq = False
         q_fp = q
         if is_gfx103:
@@ -278,7 +251,7 @@ def sageattn(
         q_int8, q_scale, k_int8, k_scale = ops.quant_qk_int8(
             q, k, k_mean, layout_code, sm_scale, int(q_skip_inq)
         )
-        # qk_int8_sv_bf16_attn_t 签名含 v_scale (gfx103x/gfx110x 扩展均已按此签名重建)。
+        # 签名含 v_scale 与 q_fp, 两扩展均按此签名重建 (schema 一致)。
         ops.qk_int8_sv_bf16_attn_t(
             q_int8, k_int8, v_for_attn, o_int8,
             q_scale, k_scale, v_scale_t,
@@ -290,7 +263,7 @@ def sageattn(
         o = o.to(torch.float32)
 
     if return_lse:
-        # LSE not computed by this kernel; return zeros as placeholder
+        # LSE 未由本 kernel 计算, 返回全零占位
         seq_dim = 2 if tensor_layout == "HND" else 1
         seq_len = q.size(seq_dim)
         lse = torch.zeros(
